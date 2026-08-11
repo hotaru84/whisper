@@ -1,0 +1,34 @@
+# Build settings for the native whisper.cpp backend on Windows.
+#
+# Builds must go through scripts/win-build-env.bat (the npm scripts already do),
+# which puts the MSVC toolchain and Ninja on PATH. Running cargo directly will
+# fail at the CMake step with a missing compiler or missing ninja.exe.
+
+[build]
+# The nested vulkan-shaders-gen build that ggml spawns lands paths like
+#   <target>/release/build/whisper-rs-sys-<hash>/out/build/ggml/src/ggml-vulkan/
+#   vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build/CMakeFiles/
+#   CMakeScratch/TryCompile-xxxxxx/CMakeFiles/cmTC_xxxxxx.dir/vc140.pdb
+# which blows past Windows' 260-character MAX_PATH from a normal repo location.
+# cl.exe then dies with "fatal error C1041: cannot open program database", even
+# though CMake already passes /FS. Keeping the target dir short is the fix.
+target-dir = "C:/wsbuild"
+
+[env]
+# Two separate reasons this must be set, both load-bearing:
+#
+# 1. Ninja specifically. ggml builds `vulkan-shaders-gen` as a nested CMake
+#    ExternalProject and, when not cross-compiling, hands it no compiler
+#    settings. Under the Visual Studio generator that nested configure fails with
+#    "No CMAKE_C_COMPILER could be found"; Ninja resolves cl.exe from PATH, which
+#    scripts/win-build-env.bat has set up via vcvars64.
+#
+# 2. Setting *any* generator at all. The `cmake` crate strips every -O/O flag
+#    from the compiler args ("let cmake deal with optimization/debuginfo") and
+#    then, only when no generator is given and the target is MSVC, overwrites
+#    CMAKE_CXX_FLAGS_RELEASE with those stripped flags. That wipes out CMake's
+#    own /O2 /Ob2 /DNDEBUG defaults, leaving an empty <Optimization> and MSVC's
+#    /Od default, i.e. whisper.cpp compiled with optimization disabled. Measured
+#    cost when this happened: the encoder took 223s per 30s window instead of
+#    27s. Naming a generator makes the crate skip that override.
+CMAKE_GENERATOR = "Ninja"
