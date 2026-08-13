@@ -25,10 +25,18 @@ export function RecordButton() {
     <Button
       type="button"
       size="lg"
-      variant={recordingStatus === "recording" ? "destructive" : "primary"}
+      variant={recordingStatus === "recording" ? "destructive" : "default"}
       disabled={disabled}
       onClick={handleClick}
-      className="h-16 w-16 rounded-full p-0"
+      // The destructive variant is deliberately subtle (a tinted background,
+      // for things like delete buttons) -- the record button is the app's one
+      // central action and gets a bold, unmistakable fill instead, using the
+      // same --signal red the rest of the app reserves for "recording".
+      className={
+        recordingStatus === "recording"
+          ? "h-16 w-16 rounded-full bg-signal p-0 text-white hover:bg-signal/90"
+          : "h-16 w-16 rounded-full p-0"
+      }
       aria-label={recordingStatus === "recording" ? "録音を停止" : "録音を開始"}
     >
       {busy ? (

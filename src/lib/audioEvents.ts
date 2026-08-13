@@ -17,7 +17,7 @@ const LABELS_JA: Record<string, string> = {
   Speech: "発話",
   Conversation: "会話",
   "Male speech, man speaking": "発話（男性）",
-  "Female speech, woman speaking": "発話（女性)",
+  "Female speech, woman speaking": "発話（女性）",
   "Child speech, kid speaking": "発話（子供）",
   Music: "音楽",
   Laughter: "笑い声",

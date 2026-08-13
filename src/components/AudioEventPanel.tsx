@@ -23,24 +23,22 @@ export function AudioEventPanel() {
   if (!audioEventSettings.enabled || audioEvents.length === 0) return null;
 
   return (
-    <div className="flex w-full flex-col gap-2 rounded-lg border border-neutral-200 p-4">
-      <h2 className="text-sm font-semibold text-neutral-700">音響イベント</h2>
+    <div className="flex w-full flex-col gap-2 rounded-lg border border-border p-4">
+      <h2 className="text-sm font-semibold text-foreground">音響イベント</h2>
       <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto text-sm">
         {audioEvents.map((e, i) => {
           const noisy = isNoiseOrMusicEvent(e.name);
           return (
             // Events are not stably identified across renders (no id from the
             // backend), and this list is append-only, so position is a safe key.
-            <li key={i} className="flex items-center gap-2 text-neutral-700">
-              <span className="w-24 shrink-0 font-mono text-xs text-neutral-400">
+            <li key={i} className="flex items-center gap-2 text-foreground">
+              <span className="w-24 shrink-0 font-mono text-xs text-muted-foreground">
                 {formatTimestamp(e.start)}–{formatTimestamp(e.end)}
               </span>
               <span>{audioEventLabelJa(e.name)}</span>
-              <span className="text-xs text-neutral-400">{Math.round(e.prob * 100)}%</span>
+              <span className="font-mono text-xs text-muted-foreground">{Math.round(e.prob * 100)}%</span>
               {noisy && (
-                <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700">
-                  聞き直し推奨
-                </span>
+                <span className="rounded bg-amber/15 px-1.5 py-0.5 text-xs text-amber">聞き直し推奨</span>
               )}
             </li>
           );

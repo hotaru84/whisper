@@ -19,6 +19,8 @@ import type {
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
 import { nonBlankChunks, segmentsFromResult } from "../lib/transcript";
+import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording } from "../lib/history";
+import type { RecordingHistoryMeta } from "../lib/history";
 import {
   startPcmRecording,
   decodeAudioToPcm16k,
@@ -222,6 +224,14 @@ interface AppState {
    * does across recordings (see `refineRecording`).
    */
   audioEvents: AudioEvent[];
+  /** Past recordings, newest first, for the history sidebar. Populated on
+   * startup and refreshed after every save (see `refineRecording`) or
+   * delete. Metadata only -- opening one reads its full content on demand
+   * via `loadHistoryEntry`, see `lib/history.ts`. */
+  recordingHistory: RecordingHistoryMeta[];
+  /** The history entry currently shown in `segments`/`audioEvents`, if any.
+   * `null` means the live/current session, not "no recordings exist". */
+  selectedHistoryId: string | null;
   errorMessage: string | null;
   /**
    * Why the second pass did not happen, when the live transcript is still good.
@@ -260,6 +270,9 @@ interface AppState {
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
+  refreshRecordingHistory: () => Promise<void>;
+  loadHistoryEntry: (id: string) => Promise<void>;
+  deleteHistoryEntry: (id: string) => Promise<void>;
   clearTranscript: () => void;
   reset: () => void;
 }
@@ -282,6 +295,15 @@ let segmentsBeforeRecording = 0;
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The filename stem `capture.rs` uses for both the WAV and (once
+ * `history.ts` writes it) its sidecar JSON, extracted from the full path
+ * `capture.finish()` returns. Handles both path separator styles since the
+ * Rust side reports a native (backslash, on Windows) path. */
+function idFromWavPath(path: string): string {
+  const base = path.split(/[/\\]/).pop() ?? path;
+  return base.replace(/\.wav$/i, "");
 }
 
 // Appends a streaming segment (offset relative to the current recording) onto the
@@ -327,8 +349,11 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
   const baseSec = recordingBaseSec;
 
   let path: string;
+  let recordingDurationSec: number;
   try {
-    path = (await capture.finish()).path;
+    const info = await capture.finish();
+    path = info.path;
+    recordingDurationSec = info.durationSec;
   } catch (err) {
     useAppStore.setState({
       refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
@@ -408,6 +433,36 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
       useAppStore.setState((s) => ({
         segments: [...s.segments.slice(0, keptSegments), ...refined],
       }));
+
+      // Persisted on the recording's own 0-based timeline (not the session's
+      // global one) and with freshly sequential ids, so a history entry looks
+      // identical whether it was the first or the fifth recording of its
+      // original session -- see history.ts's module doc.
+      const localSegments = refined.map((s, i) => ({
+        ...s,
+        id: i + 1,
+        startOffsetSec: s.startOffsetSec - baseSec,
+      }));
+      try {
+        await saveRecordingHistory(idFromWavPath(path), {
+          durationSec: recordingDurationSec,
+          language: useAppStore.getState().settings.language,
+          usedDiarize: diarizeSettings.enabled,
+          usedVad: useAppStore.getState().vadSettings.enabled,
+          usedAudioEvents: audioEventSettings.enabled,
+          segments: localSegments,
+          audioEvents: newEvents,
+        });
+        void useAppStore.getState().refreshRecordingHistory();
+      } catch (err) {
+        // The transcript on screen (and its place in this session) is
+        // unaffected -- only future browsing of it from the history sidebar
+        // is lost, which is a much smaller loss than any other failure path
+        // in this function.
+        useAppStore.setState({
+          refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+        });
+      }
     }
   } catch (err) {
     useAppStore.setState({
@@ -424,6 +479,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   modelDevice: null,
   segments: [],
   audioEvents: [],
+  recordingHistory: [],
+  selectedHistoryId: null,
   errorMessage: null,
   refineNotice: null,
   refineProgress: null,
@@ -474,6 +531,58 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setAppAudioTarget: (processId) => set({ appAudioTargetPid: processId }),
+
+  refreshRecordingHistory: async () => {
+    try {
+      const recordingHistory = await listRecordings();
+      set({ recordingHistory });
+    } catch (err) {
+      // Best-effort, like the other list refreshes -- the sidebar just stays
+      // at whatever it last had.
+      console.warn("[history] failed to list recordings:", err);
+    }
+  },
+
+  loadHistoryEntry: async (id) => {
+    try {
+      const entry = await loadRecording(id);
+      // Mirrors clearTranscript's counter reset: this replaces what's on
+      // screen the same way starting fresh does, except the fresh state is
+      // the loaded history entry instead of an empty transcript. Continuing
+      // ids/timeline from the loaded entry (rather than resetting to zero)
+      // means a recording started right after viewing history appends after
+      // it instead of risking an id collision with it.
+      nextSegmentId = entry.segments.length + 1;
+      timelineBaseSec = entry.durationSec;
+      recordingBaseSec = entry.durationSec;
+      segmentsBeforeRecording = entry.segments.length;
+      set({
+        segments: entry.segments,
+        audioEvents: entry.audioEvents,
+        selectedHistoryId: id,
+        recordingStatus: "done",
+        refineNotice: null,
+      });
+    } catch (err) {
+      set({ errorMessage: toErrorMessage(err) });
+    }
+  },
+
+  deleteHistoryEntry: async (id) => {
+    try {
+      await deleteRecording(id);
+      set((s) => ({
+        recordingHistory: s.recordingHistory.filter((r) => r.id !== id),
+        // Deleting the entry currently being viewed leaves its content on
+        // screen (nothing forces the user back to a blank state), but it no
+        // longer corresponds to anything on disk -- clear the selection so a
+        // later reload doesn't try to fetch a file that is gone.
+        selectedHistoryId: s.selectedHistoryId === id ? null : s.selectedHistoryId,
+      }));
+    } catch (err) {
+      set({ errorMessage: toErrorMessage(err) });
+    }
+  },
 
   startRecording: async () => {
     try {
@@ -548,11 +657,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         appAudioNotice,
       ].filter((n): n is string => n !== null);
       // Existing segments are kept: a new recording appends to the transcript.
+      // Once real new content starts accumulating, this is no longer "viewing
+      // a history entry" even if it started from one -- see loadHistoryEntry.
       set({
         recordingStatus: "recording",
         errorMessage: null,
         refineNotice: notices.length > 0 ? notices.join(" ") : null,
         levelMeter,
+        selectedHistoryId: null,
       });
     } catch (err) {
       activeRecorder = null;
@@ -644,6 +756,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       segments: [],
       audioEvents: [],
+      selectedHistoryId: null,
       recordingStatus: "idle",
       errorMessage: null,
       refineNotice: null,

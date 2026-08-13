@@ -1,1 +1,162 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "./fonts.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Token system: "precision instrument, not a dashboard" -- see the design
+ * plan for the full rationale. Six named colors (paper/ink/graphite/signal/
+ * trace/amber) carry the app's identity; everything else below is shadcn's
+ * standard variable set, mapped onto them so generated components need no
+ * per-component color edits.
+ *
+ * Typography is two deliberately different fonts: --font-sans pins the real
+ * Windows Japanese UI fonts (most of this app's copy is Japanese, and a
+ * custom Latin webfont has zero effect on those glyphs), --font-mono is the
+ * one self-hosted font, reserved for numerals/timestamps/thresholds -- the
+ * app's own "precision" vocabulary (see fonts.css).
+ */
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: "Yu Gothic UI", "Meiryo UI", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --color-signal: var(--signal);
+    --color-trace: var(--trace);
+    --color-amber: var(--amber);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    /* The six named tokens -- see the module doc comment above. */
+    --paper: #F0F2EF;
+    --ink: #1B1D1B;
+    --graphite: #878C86;
+    --signal: #DE3B2B;
+    --trace: #4C9A6A;
+    --amber: #C68A2E;
+
+    --background: var(--paper);
+    --foreground: var(--ink);
+    --card: #F5F6F4;
+    --card-foreground: var(--ink);
+    --popover: #F5F6F4;
+    --popover-foreground: var(--ink);
+    --primary: var(--ink);
+    --primary-foreground: var(--paper);
+    --secondary: #E4E6E2;
+    --secondary-foreground: var(--ink);
+    --muted: #E7E9E5;
+    --muted-foreground: #6B706A;
+    --accent: #E4E6E2;
+    --accent-foreground: var(--ink);
+    --destructive: var(--signal);
+    --border: #D7DAD5;
+    --input: #D7DAD5;
+    --ring: var(--ink);
+    --chart-1: #B9BCB6;
+    --chart-2: #9CA098;
+    --chart-3: #7D8278;
+    --chart-4: #5F645A;
+    --chart-5: #40443C;
+    --radius: 0.5rem;
+    --sidebar: #EBEDE9;
+    --sidebar-foreground: var(--ink);
+    --sidebar-primary: var(--ink);
+    --sidebar-primary-foreground: var(--paper);
+    --sidebar-accent: #DFE2DC;
+    --sidebar-accent-foreground: var(--ink);
+    --sidebar-border: #D7DAD5;
+    --sidebar-ring: var(--ink);
+}
+
+.dark {
+    --paper: #1A1C1A;
+    --ink: #EDEFEC;
+    --graphite: #9CA098;
+    --signal: #FF5A45;
+    --trace: #5FBF85;
+    --amber: #E0A23F;
+
+    --background: var(--paper);
+    --foreground: var(--ink);
+    --card: #212320;
+    --card-foreground: var(--ink);
+    --popover: #212320;
+    --popover-foreground: var(--ink);
+    --primary: var(--ink);
+    --primary-foreground: var(--paper);
+    --secondary: #2B2E2A;
+    --secondary-foreground: var(--ink);
+    --muted: #262825;
+    --muted-foreground: var(--graphite);
+    --accent: #2B2E2A;
+    --accent-foreground: var(--ink);
+    --destructive: var(--signal);
+    --border: #33362F;
+    --input: #33362F;
+    --ring: var(--ink);
+    --chart-1: #4A4E45;
+    --chart-2: #62665C;
+    --chart-3: #7C8074;
+    --chart-4: #9CA098;
+    --chart-5: #C4C7BF;
+    --sidebar: #161715;
+    --sidebar-foreground: var(--ink);
+    --sidebar-primary: var(--ink);
+    --sidebar-primary-foreground: var(--paper);
+    --sidebar-accent: #262924;
+    --sidebar-accent-foreground: var(--ink);
+    --sidebar-border: #2E312B;
+    --sidebar-ring: var(--ink);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
