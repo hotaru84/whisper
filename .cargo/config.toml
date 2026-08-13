@@ -3,6 +3,13 @@
 # Builds must go through scripts/win-build-env.bat (the npm scripts already do),
 # which puts the MSVC toolchain and Ninja on PATH. Running cargo directly will
 # fail at the CMake step with a missing compiler or missing ninja.exe.
+#
+# This lives at the repo root rather than in src-tauri/ on purpose. Cargo resolves
+# config from the *current directory* upwards, not from the manifest, so a copy
+# under src-tauri/ is silently ignored by anything run from the repo root (e.g.
+# `cargo check --manifest-path src-tauri/Cargo.toml`). That path would quietly
+# drop CMAKE_GENERATOR and rebuild whisper.cpp with optimization disabled -- the
+# 8x slowdown described below. At the root it applies from both locations.
 
 [build]
 # The nested vulkan-shaders-gen build that ggml spawns lands paths like

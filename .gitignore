@@ -16,6 +16,13 @@ dist-ssr
 src-tauri/resources/models/*
 !src-tauri/resources/models/.gitkeep
 
+# Accuracy fixtures: recordings and their reference transcripts stay local.
+src-tauri/fixtures/*
+!src-tauri/fixtures/README.md
+
+# CER harness output
+cer-*.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

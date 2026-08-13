@@ -107,6 +107,109 @@ describe("StreamingTranscriber", () => {
     expect(spans[spans.length - 1][1]).toBeCloseTo(60, 0);
   });
 
+  // A single chunk that ends before the window does must not cost us the rest of
+  // the window. whisper.cpp abandons the tail of a chunk when a decode ends on a
+  // lone timestamp, and that audio has to get another pass rather than being
+  // silently dropped.
+  it("carries the untranscribed tail when a single chunk ends early", async () => {
+    const windows: number[] = []; // window length in seconds, per call
+    // Always reports speech over the first 8s of whatever it is given.
+    const endsEarly = (audio: Float32Array): Promise<TranscribeResult> => {
+      windows.push(audio.length / SR);
+      return Promise.resolve({ text: "x", chunks: [{ text: "x", timestamp: [0, 8] }] });
+    };
+    const segments: StreamingSegment[] = [];
+    const t = new StreamingTranscriber(endsEarly, (s) => segments.push(s));
+
+    await feed(t, 30);
+
+    // The floor is WINDOW_SEC - MAX_CARRY_SEC = 10s, so the 5s beyond the
+    // transcribed 8s is carried and the next window is longer than a bare window.
+    expect(windows.length).toBeGreaterThan(1);
+    expect(windows[1]).toBeGreaterThan(windows[0] - 1e-6);
+    expect(segments.length).toBeGreaterThan(0);
+
+    await t.finish();
+  });
+
+  // The carry must stay bounded: a model that always stops early must not make
+  // the cursor crawl and the transcriber re-run forever on nearly the same audio.
+  it("bounds the carry so an always-early model cannot stall the cursor", async () => {
+    let calls = 0;
+    const barelyAny = (audio: Float32Array): Promise<TranscribeResult> => {
+      calls++;
+      if (calls > 100) throw new Error("spin detected: cursor failed to advance");
+      void audio;
+      return Promise.resolve({ text: "x", chunks: [{ text: "x", timestamp: [0, 0.1] }] });
+    };
+    const t = new StreamingTranscriber(barelyAny, () => {});
+
+    await feed(t, 60);
+    await t.finish();
+
+    // 60s of audio advancing >= 10s per window is a handful of calls, not dozens.
+    expect(calls).toBeLessThanOrEqual(10);
+  });
+
+  // Silence must never reach the model. Handing whisper a window with no speech
+  // is how this app produces hallucinated stock phrases and "なぜなぜなぜ..."
+  // repetition loops, and the short ones evade whisper.cpp's own guard entirely.
+  it("never transcribes a silent window, and still advances past it", async () => {
+    let calls = 0;
+    const t = new StreamingTranscriber(
+      (audio) => {
+        calls++;
+        void audio;
+        return Promise.resolve({ text: "hallucination", chunks: [{ text: "hallucination", timestamp: [0, 1] }] });
+      },
+      () => {
+        throw new Error("a silent window must not emit a segment");
+      },
+    );
+
+    // Digital silence, fed the same way the recorder would.
+    let sample = 0;
+    const end = 60 * SR;
+    while (sample < end) {
+      const len = Math.min(FRAME, end - sample);
+      t.pushFrame(new Float32Array(len)); // all zeros
+      sample += len;
+      if (sample % SR < FRAME) await new Promise((r) => setTimeout(r, 0));
+    }
+    await t.finish();
+
+    expect(calls).toBe(0);
+  });
+
+  // The gate must not swallow quiet speech: it keys on a very low RMS, well under
+  // any real microphone's noise floor.
+  it("still transcribes quiet audio that is not silence", async () => {
+    let calls = 0;
+    const t = new StreamingTranscriber(
+      (audio) => {
+        calls++;
+        void audio;
+        return Promise.resolve({ text: "x", chunks: [{ text: "x", timestamp: [0, 1] }] });
+      },
+      () => {},
+    );
+
+    let sample = 0;
+    const end = 20 * SR;
+    while (sample < end) {
+      const len = Math.min(FRAME, end - sample);
+      const frame = new Float32Array(len);
+      // 0.01 RMS: quiet, but an order of magnitude above the gate.
+      for (let i = 0; i < len; i++) frame[i] = i % 2 === 0 ? 0.01 : -0.01;
+      t.pushFrame(frame);
+      sample += len;
+      if (sample % SR < FRAME) await new Promise((r) => setTimeout(r, 0));
+    }
+    await t.finish();
+
+    expect(calls).toBeGreaterThan(0);
+  });
+
   // Regression: silent windows (no speech chunks) are dropped without emitting,
   // and still advance (no spin, no lost accounting).
   it("drops silent windows without emitting and without spinning", async () => {

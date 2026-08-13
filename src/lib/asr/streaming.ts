@@ -1,11 +1,29 @@
 import type { TranscriptChunk } from "./types";
 import type { TranscribeResult } from "./client";
+import { isNearSilent } from "./diagnostics";
 import { WHISPER_SAMPLE_RATE as SR } from "../audio/resample";
 
-// Whisper always encodes a fixed 30s context, padding anything shorter with
-// silence, so a smaller window costs exactly the same as a 30s one while giving
-// the model less to work with. Match the native window instead of wasting it.
-const WINDOW_SEC = 30;
+// How much audio to accumulate before transcribing, which is also how long the
+// user waits before any text appears.
+//
+// Whisper always encodes a fixed 30s context and pads anything shorter with
+// silence, so a 15s window costs the same GPU time as a 30s one -- roughly 2s on
+// the Vulkan backend. Purely on throughput 30s would be the efficient choice,
+// but it means nothing shows up for the first half minute of a recording, and
+// short recordings produce nothing at all until stop. 15s halves that wait at
+// the cost of giving the model less surrounding context per pass; the
+// chunk-and-commit carry-over below still keeps sentences from being cut.
+const WINDOW_SEC = 15;
+
+// Upper bound on audio carried into the next window when whisper transcribes
+// less than the whole window.
+//
+// Without a bound, a window whose chunk ends early would advance by only that
+// much, and a model that keeps ending early would make the transcriber re-run on
+// almost the same audio indefinitely. With it, every window advances at least
+// WINDOW_SEC - MAX_CARRY_SEC, so throughput is capped at ~1.5x windows per unit
+// of audio -- comfortable at ~2s of GPU time per window.
+const MAX_CARRY_SEC = 5;
 
 /** A chunk of transcript emitted mid-recording, with its offset from recording start. */
 export interface StreamingSegment {
@@ -96,22 +114,51 @@ export class StreamingTranscriber {
 
     const audio = this.concatPending();
     const windowSec = windowLen / SR;
+
+    // Never hand whisper a window with no speech in it. Doing so is the main way
+    // this app produces garbage: the model invents a stock phrase or falls into a
+    // repetition loop ("なぜなぜなぜ..."), and whisper.cpp's own repetition guard
+    // cannot catch the short ones because it only evaluates sequences longer than
+    // 32 tokens. This bites hardest on the final flush after the user stops, where
+    // the leftover fragment is usually just the pause before they clicked.
+    if (isNearSilent(audio)) {
+      this.dropFromFront(windowLen);
+      this.committedSamples += windowLen;
+      return;
+    }
+
     const result = await this.transcribe(audio);
     const chunks = result.chunks ?? [];
 
-    // Decide how much to commit. On the final flush, or when the window can't be
-    // split (0 or 1 chunk), commit the whole window. Otherwise commit every chunk
-    // but the last and carry only the last chunk's audio.
+    // Decide how much to commit, and how far to advance the audio cursor.
     let committed: TranscriptChunk[];
     let commitSec: number;
     const head = chunks.slice(0, -1);
     const lastHeadEnd = head.length > 0 ? (head[head.length - 1].timestamp[1] ?? 0) : 0;
-    if (final || chunks.length <= 1 || lastHeadEnd <= 0) {
-      committed = chunks;
-      commitSec = windowSec; // drop the entire window
-    } else {
+
+    if (!final && head.length > 0 && lastHeadEnd > 0) {
+      // Normal path: commit every chunk but the last and carry the last chunk's
+      // audio, since it may be mid-sentence.
       committed = head;
       commitSec = lastHeadEnd;
+    } else {
+      // Nothing can be held back: the final flush, a single coarse chunk (common
+      // for continuous Japanese), or unusable timestamps. Commit what we have.
+      committed = chunks;
+      const lastEnd = chunks.length > 0 ? (chunks[chunks.length - 1].timestamp[1] ?? 0) : 0;
+      if (final || lastEnd <= 0) {
+        // Final flush drains everything; a window with no usable timestamp (e.g.
+        // pure silence, which yields no chunks) is dropped whole so it can't spin.
+        commitSec = windowSec;
+      } else {
+        // Advance only as far as whisper actually transcribed, rather than
+        // discarding the rest of the window. whisper.cpp deliberately abandons
+        // the tail of a chunk when a decode ends on a lone timestamp ("single
+        // timestamp ending - skip entire chunk"), and that audio deserves another
+        // pass with fresh context instead of being thrown away. Floored so a
+        // model that keeps stopping early cannot stall the cursor.
+        commitSec = Math.max(lastEnd, windowSec - MAX_CARRY_SEC);
+      }
     }
 
     if (committed.length > 0) {

@@ -8,7 +8,10 @@ export function RecordButton() {
   const startRecording = useAppStore((s) => s.startRecording);
   const stopRecording = useAppStore((s) => s.stopRecording);
 
-  const disabled = modelStatus !== "ready" || recordingStatus === "processing";
+  // Refining holds the model lock and rewrites the transcript, so starting the
+  // next recording has to wait for it.
+  const busy = recordingStatus === "processing" || recordingStatus === "refining";
+  const disabled = modelStatus !== "ready" || busy;
 
   const handleClick = () => {
     if (recordingStatus === "recording") {
@@ -28,7 +31,7 @@ export function RecordButton() {
       className="h-16 w-16 rounded-full p-0"
       aria-label={recordingStatus === "recording" ? "録音を停止" : "録音を開始"}
     >
-      {recordingStatus === "processing" ? (
+      {busy ? (
         <Loader2 className="h-6 w-6 animate-spin" />
       ) : recordingStatus === "recording" ? (
         <Square className="h-6 w-6" />

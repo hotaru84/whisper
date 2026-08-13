@@ -12,7 +12,9 @@ use std::time::Instant;
 use whisper_rs::{WhisperContext, WhisperContextParameters};
 
 const SAMPLE_RATE: usize = 16000;
-const WINDOW_SEC: usize = 25;
+/// Kept in step with `WINDOW_SEC` in `src/lib/asr/streaming.ts`, so the number
+/// this prints is the cost of one real streaming window.
+const WINDOW_SEC: usize = 15;
 
 fn main() {
     let model_path = "resources/models/whisper-large-v3-turbo/model.gguf";
