@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Moon, Sun, MonitorCog, Cpu, Zap } from "lucide-react";
+import { Moon, Sun, MonitorCog, Cpu, Zap, Mic, Cast } from "lucide-react";
 import { Button } from "./ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { SettingsDialog } from "./SettingsDialog";
 import { useAppStore } from "../store/appStore";
 import { useThemeStore, type ThemePreference } from "../store/themeStore";
@@ -16,6 +17,8 @@ const THEME_LABEL: Record<ThemePreference, string> = {
   light: "テーマ: ライト",
   dark: "テーマ: ダーク",
 };
+
+const NO_APP_TARGET = "__none__";
 
 function formatElapsed(totalSec: number): string {
   const h = Math.floor(totalSec / 3600);
@@ -46,6 +49,75 @@ function useElapsedRecordingSec(recordingStatus: string): number {
 }
 
 /**
+ * Mic device + app-audio target, front and center in the toolbar rather than
+ * behind the settings dialog: unlike the accuracy-pass knobs, these are
+ * switched often (a different mic per desk, a different call app per
+ * meeting) and benefit from being one click away instead of two. Opening the
+ * app-audio dropdown refreshes the list itself -- see `refreshAppAudioApps`'s
+ * doc comment on why only currently-active sessions are listable -- so there
+ * is no separate "更新" button to remember to press.
+ */
+function InputControls() {
+  const settings = useAppStore((s) => s.settings);
+  const updateSettings = useAppStore((s) => s.updateSettings);
+  const audioInputDevices = useAppStore((s) => s.audioInputDevices);
+  const appAudioApps = useAppStore((s) => s.appAudioApps);
+  const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
+  const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
+  const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
+
+  return (
+    <div className="flex items-center gap-1">
+      <Select
+        value={settings.inputDeviceId || "__default__"}
+        onValueChange={(v) => updateSettings({ inputDeviceId: v === "__default__" ? "" : v })}
+      >
+        <SelectTrigger size="sm" className="max-w-32 border-none shadow-none" aria-label="マイク">
+          <Mic className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__default__">既定のマイク</SelectItem>
+          {audioInputDevices.map((d) => (
+            <SelectItem key={d.deviceId} value={d.deviceId}>
+              {d.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <Select
+        value={appAudioTargetPid != null ? String(appAudioTargetPid) : NO_APP_TARGET}
+        onValueChange={(v) => setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))}
+        onOpenChange={(open) => {
+          if (open) void refreshAppAudioApps();
+        }}
+      >
+        <SelectTrigger size="sm" className="max-w-36 border-none shadow-none" aria-label="対象アプリ（相手の音声も録音）">
+          <Cast className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <SelectValue placeholder="対象アプリなし" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NO_APP_TARGET}>対象アプリなし（マイクのみ）</SelectItem>
+          {appAudioApps.map((a) => (
+            <SelectItem key={a.processId} value={String(a.processId)}>
+              <span className="flex items-center gap-1.5">
+                {a.icon ? (
+                  <img src={a.icon} alt="" className="h-4 w-4 shrink-0" />
+                ) : (
+                  <Cast className="h-4 w-4 shrink-0 text-muted-foreground" />
+                )}
+                {a.name}
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+/**
  * The one place "what is the app doing right now" lives, always visible
  * regardless of what's in the main content area (the live transcript, or a
  * history entry) -- see the design plan's layout rationale. Recording state,
@@ -63,8 +135,10 @@ export function StatusBar() {
   const elapsed = useElapsedRecordingSec(recordingStatus);
 
   return (
-    <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-3 text-sm">
+    <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-2 text-sm">
       <div className="flex items-center gap-3">
+        <InputControls />
+
         {recordingStatus === "recording" && (
           <span className="flex items-center gap-1.5 font-medium text-signal">
             <span className="h-2 w-2 animate-pulse rounded-full bg-signal motion-reduce:animate-none" aria-hidden="true" />

@@ -53,8 +53,21 @@ sherpa-onnx = { version = "1.13.5", default-features = false, features = ["share
 # WASAPI process-loopback capture for "app audio" (Teams/Zoom/etc).
 wasapi = "0.24.0"
 # Same major version wasapi itself depends on (kept in sync so Cargo unifies
-# them into one copy rather than compiling `windows` twice). Used directly
-# here only for QueryFullProcessImageNameW, to turn a session's PID into a
-# human-readable app name for the picker -- wasapi's own session API returns a
-# PID and an opaque session identifier, not a friendly name.
-windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation"] }
+# them into one copy rather than compiling `windows` twice). Used for
+# QueryFullProcessImageNameW (PID -> friendly app name) and, with the extra
+# Shell/Gdi features below, pulling each app's own small icon for the same
+# picker (SHGetFileInfoW -> HICON -> GetDIBits -> raw BGRA pixels).
+windows = { version = "0.62", features = [
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+] }
+# Encodes the extracted icon pixels as PNG; only the encoder half is needed,
+# so decoders for every other format are disabled.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Turns the encoded PNG bytes into a data: URI the frontend `<img>` can use
+# directly, with no extra Tauri command/round-trip just to fetch icons.
+base64 = "0.22"

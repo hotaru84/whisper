@@ -1,6 +1,12 @@
 import { useState } from "react";
-import { Copy, Download, Check, Trash2 } from "lucide-react";
+import { ChevronDown, Copy, Download, Check, Trash2, RotateCw } from "lucide-react";
 import { Button } from "./ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { useAppStore } from "../store/appStore";
 import { combinedText } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
@@ -14,6 +20,7 @@ export function TranscriptPanel() {
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
+  const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const [copied, setCopied] = useState(false);
 
   const viewingHistory = recordingHistory.find((r) => r.id === selectedHistoryId);
@@ -42,30 +49,42 @@ export function TranscriptPanel() {
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-foreground">文字起こし結果</h2>
         <div className="flex gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={handleCopy} disabled={!hasTranscript}>
-            {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-            コピー
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => void handleExport("txt")}
-            disabled={!hasTranscript}
-          >
-            <Download className="h-4 w-4" />
-            .txt
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => void handleExport("srt")}
-            disabled={!hasTranscript}
-          >
-            <Download className="h-4 w-4" />
-            .srt
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button type="button" variant="outline" size="sm" disabled={!hasTranscript}>
+                {copied ? <Check className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+                コピー・保存
+                <ChevronDown className="h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => void handleCopy()}>
+                <Copy className="h-4 w-4" />
+                コピー
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void handleExport("txt")}>
+                <Download className="h-4 w-4" />
+                .txt として保存
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void handleExport("srt")}>
+                <Download className="h-4 w-4" />
+                .srt として保存
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {viewingHistory && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void rerunHistoryEntry(viewingHistory.id)}
+              disabled={busy}
+              title="現在の設定（話者分離・VAD・音響イベント）でこの録音を再処理し、履歴を上書きします"
+            >
+              <RotateCw className="h-4 w-4" />
+              再実行
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"

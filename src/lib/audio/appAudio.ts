@@ -4,6 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface AudioAppInfo {
   processId: number;
   name: string;
+  /** A `data:image/png;base64,...` URI ready for an `<img src>`, or `null`
+   * when the executable had no icon resource or extraction failed. */
+  icon: string | null;
 }
 
 interface AppAudioErrorPayload {

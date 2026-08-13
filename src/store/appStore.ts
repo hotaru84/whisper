@@ -19,7 +19,7 @@ import type {
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
 import { nonBlankChunks, segmentsFromResult } from "../lib/transcript";
-import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording } from "../lib/history";
+import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording, wavPath } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import {
   startPcmRecording,
@@ -176,40 +176,6 @@ function saveAudioEventSettings(settings: AudioEventSettings): void {
   }
 }
 
-export interface AppAudioSettings {
-  enabled: boolean;
-}
-
-const DEFAULT_APP_AUDIO_SETTINGS: AppAudioSettings = { enabled: false };
-const APP_AUDIO_SETTINGS_KEY = "app-audio-settings";
-
-/**
- * Only `enabled` is persisted. The target app (a PID) is never persisted: a
- * PID from a previous session almost certainly does not refer to the same
- * process next time, so the picker always starts unselected and the user
- * re-picks from a freshly listed set of currently-active sessions.
- */
-function loadAppAudioSettings(): AppAudioSettings {
-  try {
-    const stored = globalThis.localStorage?.getItem(APP_AUDIO_SETTINGS_KEY);
-    if (!stored) return DEFAULT_APP_AUDIO_SETTINGS;
-    const parsed = JSON.parse(stored) as Partial<AppAudioSettings>;
-    return {
-      enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_APP_AUDIO_SETTINGS.enabled,
-    };
-  } catch {
-    return DEFAULT_APP_AUDIO_SETTINGS;
-  }
-}
-
-function saveAppAudioSettings(settings: AppAudioSettings): void {
-  try {
-    globalThis.localStorage?.setItem(APP_AUDIO_SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
-}
-
 interface AppState {
   recordingStatus: RecordingStatus;
   modelStatus: ModelStatus;
@@ -245,7 +211,6 @@ interface AppState {
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
-  appAudioSettings: AppAudioSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
    * ("マイク N") until the first successful getUserMedia call in this session. */
@@ -254,9 +219,13 @@ interface AppState {
    * picker. Only ever populated by an explicit refresh (see its doc comment
    * on why this can't just be kept fresh automatically). */
   appAudioApps: AudioAppInfo[];
-  /** The app-audio target picked for the *next* recording. Not persisted
-   * (see `loadAppAudioSettings`) and unrelated to whether a recording is
-   * currently capturing it -- that is internal to `startRecording`. */
+  /** The app-audio target for the *next* recording, and the sole switch for
+   * whether app-audio capture is used at all -- `null` means mic-only, no
+   * separate enabled flag needed. Not persisted: a PID from a previous
+   * session almost certainly does not refer to the same process next time,
+   * so the picker always starts unselected and the user re-picks from a
+   * freshly listed set of currently-active sessions. Unrelated to whether a
+   * recording is currently capturing it -- that is internal to `startRecording`. */
   appAudioTargetPid: number | null;
 
   initModel: () => Promise<void>;
@@ -266,13 +235,20 @@ interface AppState {
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
-  updateAppAudioSettings: (partial: Partial<AppAudioSettings>) => void;
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
   refreshRecordingHistory: () => Promise<void>;
   loadHistoryEntry: (id: string) => Promise<void>;
   deleteHistoryEntry: (id: string) => Promise<void>;
+  /** Re-runs the accuracy pass (transcribe + diarize + audio-tag, per
+   * whatever is currently enabled in settings) against a past recording's
+   * WAV and overwrites its history entry -- e.g. after turning on
+   * diarization or changing its threshold and wanting this recording
+   * relabeled with it. Reuses `recordingStatus: "refining"` and
+   * `refineProgress`, so the same progress UI `refineRecording` drives
+   * applies here too. */
+  rerunHistoryEntry: (id: string) => Promise<void>;
   clearTranscript: () => void;
   reset: () => void;
 }
@@ -336,6 +312,75 @@ onAudioDeviceChange(() => {
   void useAppStore.getState().refreshAudioInputDevices();
 });
 
+/** What `runAccuracyPipeline` produces: the re-transcription, plus whatever
+ * diarization/audio-tagging managed to add, plus any user-facing notices
+ * about the parts that did not go perfectly (never a hard failure -- see the
+ * function's own doc). */
+interface AccuracyPipelineResult {
+  result: TranscribeResult;
+  speakers?: Array<number | null>;
+  excluded?: boolean[];
+  newEvents: AudioEvent[];
+  notices: string[];
+}
+
+/**
+ * The re-transcribe/diarize/audio-tag sequence shared by `refineRecording`
+ * (a just-finished live recording) and `rerunHistoryEntry` (any past one,
+ * typically after the user changed a setting). Everything here operates on
+ * `path`'s own 0-based timeline; rebasing onto a session's global timeline
+ * (if the caller even has one -- `rerunHistoryEntry` does not) is the
+ * caller's job, same as `nonBlankChunks`' doc comment already describes.
+ *
+ * Diarization/audio-tagging failures are collected as notices rather than
+ * thrown: a transcript without speaker labels or event filtering is still
+ * the whole point of this pass, so losing the transcript over either would
+ * be a much worse trade than just not having that one extra.
+ */
+async function runAccuracyPipeline(
+  path: string,
+  settings: AsrSettings,
+  vadSettings: VadSettings,
+  diarizeSettings: DiarizeSettings,
+  audioEventSettings: AudioEventSettings,
+): Promise<AccuracyPipelineResult> {
+  const notices: string[] = [];
+  const result = await asrClient.transcribeRecording(path, settings, vadSettings);
+  if (result.vadUnavailable) {
+    notices.push(
+      "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
+    );
+  }
+
+  // Diarization and audio tagging both read the same WAV on its own 0-based
+  // timeline, so they have to run on result.chunks *before* segmentsFromResult
+  // rebases anything -- see nonBlankChunks' doc comment.
+  const targets = nonBlankChunks(result).map((c) => c.timestamp);
+
+  let speakers: Array<number | null> | undefined;
+  if (diarizeSettings.enabled && targets.length > 0) {
+    try {
+      speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
+    } catch (err) {
+      notices.push(`話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
+    }
+  }
+
+  let excluded: boolean[] | undefined;
+  let newEvents: AudioEvent[] = [];
+  if (audioEventSettings.enabled && targets.length > 0) {
+    try {
+      const eventResult = await asrClient.detectAudioEvents(path, targets, audioEventSettings);
+      excluded = eventResult.exclude;
+      newEvents = eventResult.events;
+    } catch (err) {
+      notices.push(`音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
+    }
+  }
+
+  return { result, speakers, excluded, newEvents, notices };
+}
+
 /**
  * Re-transcribes the finished recording as one continuous piece and swaps the
  * result in for the segments the live pass produced.
@@ -363,55 +408,19 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
 
   useAppStore.setState({ recordingStatus: "refining", refineProgress: 0 });
   try {
-    const result = await asrClient.transcribeRecording(
+    const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
+    const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
       path,
-      useAppStore.getState().settings,
-      useAppStore.getState().vadSettings,
+      settings,
+      vadSettings,
+      diarizeSettings,
+      audioEventSettings,
     );
-
-    if (result.vadUnavailable) {
-      useAppStore.setState({
-        refineNotice:
-          "VAD 用のモデルファイルが見つからないため、VAD 無しで精度向上パスを実行しました。README の手順でモデルを配置すると有効になります。",
-      });
+    if (notices.length > 0) {
+      useAppStore.setState({ refineNotice: notices.join(" ") });
     }
 
-    // Diarization and audio tagging both read the same WAV on its own 0-based
-    // timeline, so they have to run on result.chunks *before*
-    // segmentsFromResult rebases anything onto the session's global timeline
-    // -- see nonBlankChunks' doc comment.
     const targets = nonBlankChunks(result).map((c) => c.timestamp);
-
-    let speakers: Array<number | null> | undefined;
-    const diarizeSettings = useAppStore.getState().diarizeSettings;
-    if (diarizeSettings.enabled && targets.length > 0) {
-      try {
-        speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
-      } catch (err) {
-        // A transcript without speaker labels is still the whole point of
-        // this pass; losing it over diarization would be a bad trade.
-        useAppStore.setState({
-          refineNotice: `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-        });
-      }
-    }
-
-    let excluded: boolean[] | undefined;
-    let newEvents: AudioEvent[] = [];
-    const audioEventSettings = useAppStore.getState().audioEventSettings;
-    if (audioEventSettings.enabled && targets.length > 0) {
-      try {
-        const eventResult = await asrClient.detectAudioEvents(path, targets, audioEventSettings);
-        excluded = eventResult.exclude;
-        newEvents = eventResult.events;
-      } catch (err) {
-        // A transcript without audio-event filtering is still the whole point
-        // of this pass; losing it over this would be a bad trade.
-        useAppStore.setState({
-          refineNotice: `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-        });
-      }
-    }
     const rebasedEvents = newEvents.map((e) => ({ ...e, start: e.start + baseSec, end: e.end + baseSec }));
     useAppStore.setState((s) => ({
       audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
@@ -446,9 +455,9 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
       try {
         await saveRecordingHistory(idFromWavPath(path), {
           durationSec: recordingDurationSec,
-          language: useAppStore.getState().settings.language,
+          language: settings.language,
           usedDiarize: diarizeSettings.enabled,
-          usedVad: useAppStore.getState().vadSettings.enabled,
+          usedVad: vadSettings.enabled,
           usedAudioEvents: audioEventSettings.enabled,
           segments: localSegments,
           audioEvents: newEvents,
@@ -488,7 +497,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
   audioEventSettings: loadAudioEventSettings(),
-  appAudioSettings: loadAppAudioSettings(),
   levelMeter: null,
   audioInputDevices: [],
   appAudioApps: [],
@@ -584,6 +592,68 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  rerunHistoryEntry: async (id) => {
+    const status = get().recordingStatus;
+    if (status === "recording" || status === "processing" || status === "refining") return;
+
+    const durationSec = get().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
+    const path = await wavPath(id);
+
+    set({ recordingStatus: "refining", refineProgress: 0, refineNotice: null });
+    try {
+      const { settings, vadSettings, diarizeSettings, audioEventSettings } = get();
+      const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
+        path,
+        settings,
+        vadSettings,
+        diarizeSettings,
+        audioEventSettings,
+      );
+
+      // Always the recording's own 0-based timeline with fresh sequential
+      // ids -- this entry has no "session" of its own to rebase onto, and
+      // saveRecordingHistory always stores under that same convention (see
+      // refineRecording's persistence step).
+      const refined = segmentsFromResult(result, 0, 1, speakers, excluded);
+      if (refined.length === 0) {
+        // Mirrors refineRecording's own guard: an empty result is far more
+        // likely a setting change gone wrong (wrong language, an overly
+        // strict threshold) than "this recording legitimately has nothing
+        // in it now" -- the existing history entry is worth more than a
+        // result this suspicious.
+        set({
+          refineNotice:
+            "この設定では文字起こし結果が0件になったため、履歴は上書きしていません。設定を確認してから再度お試しください。",
+        });
+        return;
+      }
+      const localSegments = refined.map((s, i) => ({ ...s, id: i + 1 }));
+
+      await saveRecordingHistory(id, {
+        durationSec,
+        language: settings.language,
+        usedDiarize: diarizeSettings.enabled,
+        usedVad: vadSettings.enabled,
+        usedAudioEvents: audioEventSettings.enabled,
+        segments: localSegments,
+        audioEvents: newEvents,
+      });
+      await get().refreshRecordingHistory();
+
+      // Refresh what's on screen too, if this is the entry currently shown.
+      if (get().selectedHistoryId === id) {
+        set({ segments: localSegments, audioEvents: newEvents });
+      }
+      if (notices.length > 0) {
+        set({ refineNotice: notices.join(" ") });
+      }
+    } catch (err) {
+      set({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
+    } finally {
+      set({ recordingStatus: "done", refineProgress: null });
+    }
+  },
+
   startRecording: async () => {
     try {
       // Transcribe on the fly: the recorder streams PCM frames into the streaming
@@ -606,13 +676,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
 
       // App audio (Teams/Zoom/...) is optional and additive: if it fails to
-      // start, or was never enabled, recording proceeds mic-only exactly as
-      // before -- the mixer is simply never engaged.
-      const { appAudioSettings, appAudioTargetPid } = get();
+      // start, or no target was picked, recording proceeds mic-only exactly
+      // as before -- the mixer is simply never engaged.
+      const { appAudioTargetPid } = get();
       const mixer = new AudioMixer();
       appAudioActive = false;
       let appAudioNotice: string | null = null;
-      if (appAudioSettings.enabled && appAudioTargetPid != null) {
+      if (appAudioTargetPid != null) {
         try {
           await appAudioClient.startCapture(
             appAudioTargetPid,
@@ -739,13 +809,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       const audioEventSettings = { ...s.audioEventSettings, ...partial };
       saveAudioEventSettings(audioEventSettings);
       return { audioEventSettings };
-    }),
-
-  updateAppAudioSettings: (partial) =>
-    set((s) => {
-      const appAudioSettings = { ...s.appAudioSettings, ...partial };
-      saveAppAudioSettings(appAudioSettings);
-      return { appAudioSettings };
     }),
 
   clearTranscript: () => {

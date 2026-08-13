@@ -57,7 +57,12 @@ async function jsonPath(id: string): Promise<string> {
   return join(await recordingsDir(), `${id}.json`);
 }
 
-async function wavPath(id: string): Promise<string> {
+/** Exported for `appStore.ts`'s `rerunHistoryEntry`, which needs the WAV
+ * path to re-run the accuracy pass without a new Rust command -- the same
+ * commands `refineRecording` already calls (`transcribeRecording` etc.) just
+ * take a path string, so the frontend can point them at any past
+ * recording's WAV, not only the one just finished. */
+export async function wavPath(id: string): Promise<string> {
   return join(await recordingsDir(), `${id}.wav`);
 }
 

@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
-import { Info, RefreshCw } from "lucide-react";
+import { Info } from "lucide-react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "./ui/accordion";
-import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
@@ -96,108 +95,22 @@ export function SettingsPanel() {
   const updateVadSettings = useAppStore((s) => s.updateVadSettings);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
   const updateAudioEventSettings = useAppStore((s) => s.updateAudioEventSettings);
-  const appAudioSettings = useAppStore((s) => s.appAudioSettings);
-  const updateAppAudioSettings = useAppStore((s) => s.updateAppAudioSettings);
-  const appAudioApps = useAppStore((s) => s.appAudioApps);
-  const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
-  const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
-  const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
-  const audioInputDevices = useAppStore((s) => s.audioInputDevices);
   const recordingStatus = useAppStore((s) => s.recordingStatus);
   const isRecording = recordingStatus === "recording";
   const glossaryChars = Array.from(settings.glossary).length;
   const fixedSpeakerCount = diarizeSettings.numSpeakers > 0;
 
   return (
-    <Accordion type="multiple" className="w-full">
-      <AccordionItem value="input">
-        <AccordionTrigger>入力</AccordionTrigger>
-        <AccordionContent>
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center gap-2">
-              <Label htmlFor="device-select">マイク</Label>
-              <Select
-                value={settings.inputDeviceId || "__default__"}
-                onValueChange={(v) => updateSettings({ inputDeviceId: v === "__default__" ? "" : v })}
-              >
-                <SelectTrigger id="device-select" className="w-56">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__default__">既定のマイク</SelectItem>
-                  {audioInputDevices.map((d) => (
-                    <SelectItem key={d.deviceId} value={d.deviceId}>
-                      {d.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <InfoTooltip>
-                録音中の切り替えは次の録音から反映されます。選択したマイクが見つからない場合は既定のマイクにフォールバックします。
-              </InfoTooltip>
-            </div>
-
-            <div className="flex flex-col gap-2 border-t border-border pt-4">
-              <div className="flex items-center gap-2">
-                <Switch
-                  id="app-audio-enabled"
-                  checked={appAudioSettings.enabled}
-                  onCheckedChange={(checked) => {
-                    updateAppAudioSettings({ enabled: checked });
-                    if (checked) void refreshAppAudioApps();
-                  }}
-                />
-                <Label htmlFor="app-audio-enabled">相手（アプリ）の音声も録音する</Label>
-                <InfoTooltip>
-                  Teams や Zoom など、指定したアプリが再生している音声をマイクと合わせて録音します。
-                  Windows の音声セッションを使って取得するため、対象アプリが実際に音を再生していないと
-                  一覧に出てきません（通話に参加してから「更新」を押してください）。
-                </InfoTooltip>
-              </div>
-
-              {appAudioSettings.enabled && (
-                <div className="flex flex-col gap-2 pl-6">
-                  <div className="flex items-center gap-2">
-                    <Label htmlFor="app-audio-target" className="whitespace-nowrap">
-                      対象アプリ
-                    </Label>
-                    <Select
-                      value={appAudioTargetPid != null ? String(appAudioTargetPid) : ""}
-                      onValueChange={(v) => setAppAudioTarget(v ? Number(v) : null)}
-                    >
-                      <SelectTrigger id="app-audio-target" className="w-56">
-                        <SelectValue placeholder="選択してください" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {appAudioApps.map((a) => (
-                          <SelectItem key={a.processId} value={String(a.processId)}>
-                            {a.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void refreshAppAudioApps()}
-                      title="対象アプリの一覧を更新"
-                    >
-                      <RefreshCw className="h-3.5 w-3.5" />
-                      更新
-                    </Button>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    一覧に出ない場合は、対象アプリで通話や再生を始めてから更新してください。
-                    {appAudioTargetPid == null && "未選択のままだとマイクのみで録音します。"}
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-        </AccordionContent>
-      </AccordionItem>
-
+    // Both categories start open: before this dialog existed, every setting
+    // sat in one always-open panel, so nothing needed an extra click to
+    // find. Splitting into categories organizes them but must not hide any
+    // of them behind a second click by default -- a user reported not being
+    // able to find a setting for exactly this reason when this had three
+    // categories (the third, mic/app-audio, has since moved to the toolbar --
+    // see StatusBar.tsx -- since those are switched often enough to want
+    // one click, not two). Anyone who wants a quieter view can still
+    // collapse a category; this only changes the starting state.
+    <Accordion type="multiple" className="w-full" defaultValue={["transcription", "accuracy"]}>
       <AccordionItem value="transcription">
         <AccordionTrigger>文字起こし</AccordionTrigger>
         <AccordionContent>

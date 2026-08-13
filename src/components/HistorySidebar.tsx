@@ -1,9 +1,18 @@
 import { useState } from "react";
-import { Plus, Trash2, Users, Wand2, AudioLines } from "lucide-react";
+import { Plus, Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal } from "lucide-react";
 import { Button } from "./ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./ui/dropdown-menu";
 import { ScrollArea } from "./ui/scroll-area";
 import { useAppStore } from "../store/appStore";
+import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
+import { combinedText } from "../lib/transcript";
+import { saveTranscript } from "../lib/export/saveTranscript";
 
 function formatDateTime(date: Date): { day: string; time: string } {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -32,11 +41,29 @@ function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
   );
 }
 
+/** Copy/export act on this row's own recording, loaded on demand -- the
+ * sidebar only ever holds the small projected `RecordingHistoryMeta`, not
+ * full segments (see `listRecordings`' doc comment on why), so these need
+ * their own `loadRecording` call rather than reading the already-loaded
+ * entry a click on the row itself would show. */
+function useHistoryRowActions(id: string) {
+  const handleCopy = async () => {
+    const entry = await loadRecording(id);
+    await navigator.clipboard.writeText(combinedText(entry.segments));
+  };
+  const handleExport = async (format: "txt" | "srt") => {
+    const entry = await loadRecording(id);
+    await saveTranscript(entry.segments, format);
+  };
+  return { handleCopy, handleExport };
+}
+
 function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
   const selected = selectedHistoryId === meta.id;
 
@@ -60,7 +87,35 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
         {meta.preview && <p className="line-clamp-2 text-xs text-foreground">{meta.preview}</p>}
         <FeatureIcons meta={meta} />
       </button>
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-1">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 opacity-0 group-hover:opacity-100"
+              aria-label="コピー・保存"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <MoreHorizontal className="h-3 w-3" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+            <DropdownMenuItem onSelect={() => void handleCopy()}>
+              <Copy className="h-4 w-4" />
+              コピー
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => void handleExport("txt")}>
+              <Download className="h-4 w-4" />
+              .txt として保存
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => void handleExport("srt")}>
+              <Download className="h-4 w-4" />
+              .srt として保存
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <Button
           type="button"
           variant={confirmingDelete ? "destructive" : "ghost"}
@@ -92,22 +147,37 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
  * replaces the main view's transcript/audio-events; see
  * `appStore.loadHistoryEntry`.
  */
-export function HistorySidebar() {
+export function HistorySidebar({ width }: { width: number }) {
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const clearTranscript = useAppStore((s) => s.clearTranscript);
+  const startRecording = useAppStore((s) => s.startRecording);
   const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const modelStatus = useAppStore((s) => s.modelStatus);
   const busy = recordingStatus === "recording" || recordingStatus === "processing" || recordingStatus === "refining";
 
   return (
-    <div className="flex h-full w-56 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
+    <div
+      className="flex h-full shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
+      style={{ width }}
+    >
       <div className="p-2">
         <Button
           type="button"
           variant="outline"
           size="sm"
           className="w-full justify-start"
-          disabled={busy}
-          onClick={clearTranscript}
+          disabled={busy || modelStatus !== "ready"}
+          // The label promises a new recording, so it starts one -- not just
+          // clears the view (that silently did nothing when there was
+          // nothing to clear, which a user reported as "the button doesn't
+          // do anything"). Clearing first discards whatever is currently
+          // shown (live transcript or a loaded history entry) so the new
+          // recording starts from a blank transcript rather than appending
+          // onto it.
+          onClick={() => {
+            clearTranscript();
+            void startRecording();
+          }}
         >
           <Plus className="h-3.5 w-3.5" />
           新規録音

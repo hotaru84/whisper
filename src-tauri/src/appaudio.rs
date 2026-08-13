@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use base64::Engine;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager};
@@ -29,10 +30,18 @@ use wasapi::{
     initialize_mta, AudioClient, DeviceEnumerator, Direction, SampleType, SessionState,
     StreamMode, WaveFormat,
 };
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Graphics::Gdi::{
+    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS,
+};
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
 /// Matches `wav::SAMPLE_RATE`: app audio is captured pre-resampled to exactly
 /// what the rest of the pipeline (mic, WAV file, whisper) already expects, so
@@ -53,6 +62,12 @@ const CHUNK_SAMPLES: usize = CAPTURE_SAMPLE_RATE * CHUNK_MS as usize / 1000;
 pub struct AudioAppInfo {
     pub process_id: u32,
     pub name: String,
+    /// A small icon as a `data:image/png;base64,...` URI, ready for an
+    /// `<img src>` with no extra round-trip. `None` when the executable has
+    /// no icon resource or any step of the GDI extraction fails -- the
+    /// picker falls back to no icon rather than losing the whole app entry
+    /// over it (see `extract_icon_data_url`).
+    pub icon: Option<String>,
 }
 
 /// Lists apps with an active audio session, across every render device.
@@ -111,20 +126,26 @@ pub fn list_audio_apps_sync() -> Result<Vec<AudioAppInfo>, String> {
             if pid == 0 || !seen_pids.insert(pid) {
                 continue;
             }
-            let name = process_name(pid).unwrap_or_else(|| format!("PID {pid}"));
-            apps.push(AudioAppInfo { process_id: pid, name });
+            let (name, icon) = match process_exe_path(pid) {
+                Some(path) => {
+                    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+                    (name, extract_icon_data_url(&path))
+                }
+                None => (format!("PID {pid}"), None),
+            };
+            apps.push(AudioAppInfo { process_id: pid, name, icon });
         }
     }
     apps.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(apps)
 }
 
-/// Resolves a process's executable file name (no directory, no extension
-/// stripped) via `QueryFullProcessImageNameW`. Returns `None` for a process
-/// this one cannot query (protected system process, or it has already
-/// exited) -- the caller falls back to showing the bare PID rather than
-/// failing the whole listing over one uninspectable process.
-fn process_name(pid: u32) -> Option<String> {
+/// Resolves a process's full executable path via `QueryFullProcessImageNameW`.
+/// Returns `None` for a process this one cannot query (protected system
+/// process, or it has already exited) -- the caller falls back to showing
+/// the bare PID rather than failing the whole listing over one
+/// uninspectable process.
+fn process_exe_path(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 260]; // MAX_PATH
@@ -137,8 +158,100 @@ fn process_name(pid: u32) -> Option<String> {
         );
         let _ = CloseHandle(handle);
         result.ok()?;
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string())
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// Extracts the small (typically 16x16) shell icon associated with `exe_path`
+/// and encodes it as a `data:image/png;base64,...` URI. `None` on any
+/// failure along the way -- no icon resource, a GDI call failing, a bitmap
+/// this code doesn't know how to read -- since a missing icon is far less
+/// bad than losing the app from the picker entirely.
+///
+/// The GDI dance is unavoidable: Windows hands back icons as an `HICON`
+/// (a mask bitmap + a color bitmap, both device-dependent), not pixels, so
+/// getting actual RGBA bytes out means `GetIconInfo` for the bitmaps,
+/// `GetObjectW` for their real dimensions, and `GetDIBits` to read them back
+/// as a plain top-down 32-bit DIB.
+fn extract_icon_data_url(exe_path: &str) -> Option<String> {
+    unsafe {
+        let wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut info = SHFILEINFOW::default();
+        let cookie = SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        );
+        if cookie == 0 || info.hIcon.is_invalid() {
+            return None;
+        }
+        let hicon = info.hIcon;
+
+        let mut icon_info = ICONINFO::default();
+        if GetIconInfo(hicon, &mut icon_info).is_err() {
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+        // Only the color bitmap's pixels are used below; the mask is not.
+        let _ = DeleteObject(icon_info.hbmMask.into());
+
+        let mut bmp = BITMAP::default();
+        let got = GetObjectW(
+            icon_info.hbmColor.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut bmp as *mut BITMAP).cast()),
+        );
+        let (width, height) = (bmp.bmWidth, bmp.bmHeight);
+        if got == 0 || width <= 0 || height <= 0 {
+            let _ = DeleteObject(icon_info.hbmColor.into());
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+
+        let hdc = GetDC(None);
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // negative: request top-down rows, matching the loop below
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buffer = vec![0u8; width as usize * height as usize * 4];
+        let scan_lines = GetDIBits(
+            hdc,
+            icon_info.hbmColor,
+            0,
+            height as u32,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut bitmap_info,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(None, hdc);
+        let _ = DeleteObject(icon_info.hbmColor.into());
+        let _ = DestroyIcon(hicon);
+        if scan_lines == 0 {
+            return None;
+        }
+
+        // GDI hands back BGRA; PNG (via the `image` crate) wants RGBA.
+        for px in buffer.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+
+        let img = image::RgbaImage::from_raw(width as u32, height as u32, buffer)?;
+        let mut png_bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).ok()?;
+        Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+        ))
     }
 }
 
@@ -322,4 +435,33 @@ fn f32_to_le_bytes(samples: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_icon_data_url;
+
+    /// Runs the real GDI extraction path against a Windows binary every
+    /// machine running this test has (unlike the app-audio picker itself,
+    /// which needs a currently-playing session and so can't be exercised
+    /// this way) -- a compiled-clean FFI signature is not the same as one
+    /// that actually produces a valid icon at runtime.
+    #[test]
+    fn extracts_a_real_icon_from_notepad() {
+        let url = extract_icon_data_url(r"C:\Windows\System32\notepad.exe")
+            .expect("notepad.exe should have an icon resource on any Windows install");
+        let prefix = "data:image/png;base64,";
+        assert!(url.starts_with(prefix), "unexpected data URL: {url}");
+
+        use base64::Engine;
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&url[prefix.len()..])
+            .expect("base64 payload should decode");
+        assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n", "decoded bytes should be a valid PNG");
+    }
+
+    #[test]
+    fn returns_none_for_a_path_with_no_icon() {
+        assert!(extract_icon_data_url(r"C:\Windows\System32\this-does-not-exist.exe").is_none());
+    }
 }
