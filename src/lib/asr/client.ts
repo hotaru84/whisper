@@ -77,6 +77,41 @@ export const DEFAULT_VAD_SETTINGS: VadSettings = {
   threshold: 0.5,
 };
 
+/**
+ * Audio event (audio tagging) knobs, mirroring `events::AudioEventSettings`
+ * in Rust. A separate settings slice for the same reason as diarization: a
+ * post-hoc model pass over the finished recording, not a decoding parameter.
+ */
+export interface AudioEventSettings {
+  /** Off by default -- see `events::AudioEventSettings` for why. */
+  enabled: boolean;
+  threshold: number;
+  topK: number;
+}
+
+export const DEFAULT_AUDIO_EVENT_SETTINGS: AudioEventSettings = {
+  enabled: false,
+  threshold: 0.3,
+  topK: 3,
+};
+
+/** One detected tag on a `[start, end)` window of the recording, mirroring
+ * `events::AudioEvent` in Rust. Never rendered into the transcript body --
+ * see `events.rs`'s module doc for why. */
+export interface AudioEvent {
+  start: number;
+  end: number;
+  name: string;
+  index: number;
+  prob: number;
+}
+
+export interface AudioEventResult {
+  events: AudioEvent[];
+  /** One entry per input chunk, in the same order -- see `diarizeRecording`. */
+  exclude: boolean[];
+}
+
 interface ModelReadyPayload {
   device: AsrDevice;
 }
@@ -202,6 +237,32 @@ export class AsrClient {
       numSpeakers: settings.numSpeakers,
       minDurationOn: settings.minDurationOn,
       minDurationOff: settings.minDurationOff,
+    });
+  }
+
+  /**
+   * Detects audio events on a finished recording and, for each entry of
+   * `chunks`, whether it should be excluded from the transcript (no
+   * overlapping speech tag, but an overlapping music/noise one).
+   *
+   * `chunks` must be `nonBlankChunks(result).map(c => c.timestamp)` from the
+   * same `TranscribeResult`, exactly as `diarizeRecording` requires -- see its
+   * doc comment for why the positional correspondence matters.
+   *
+   * Throws if the model files are missing (see README) or detection otherwise
+   * fails; the caller is expected to keep the un-filtered transcript rather
+   * than lose it over this.
+   */
+  async detectAudioEvents(
+    path: string,
+    chunks: Array<[number, number]>,
+    settings: AudioEventSettings,
+  ): Promise<AudioEventResult> {
+    return await invoke<AudioEventResult>("detect_audio_events", {
+      path,
+      chunks,
+      threshold: settings.threshold,
+      topK: settings.topK,
     });
   }
 

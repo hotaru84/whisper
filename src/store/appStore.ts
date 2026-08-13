@@ -3,6 +3,7 @@ import {
   AsrClient,
   DEFAULT_DIARIZE_SETTINGS,
   DEFAULT_VAD_SETTINGS,
+  DEFAULT_AUDIO_EVENT_SETTINGS,
   RecordingCapture,
   StreamingTranscriber,
 } from "../lib/asr";
@@ -10,6 +11,8 @@ import type {
   AsrDevice,
   DiarizeSettings,
   VadSettings,
+  AudioEventSettings,
+  AudioEvent,
   TranscriptionTask,
   TranscribeResult,
   StreamingSegment,
@@ -145,6 +148,32 @@ function saveVadSettings(settings: VadSettings): void {
   }
 }
 
+const AUDIO_EVENT_SETTINGS_KEY = "audio-event-settings";
+
+function loadAudioEventSettings(): AudioEventSettings {
+  try {
+    const stored = globalThis.localStorage?.getItem(AUDIO_EVENT_SETTINGS_KEY);
+    if (!stored) return DEFAULT_AUDIO_EVENT_SETTINGS;
+    const parsed = JSON.parse(stored) as Partial<AudioEventSettings>;
+    return {
+      enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_AUDIO_EVENT_SETTINGS.enabled,
+      threshold:
+        typeof parsed.threshold === "number" ? parsed.threshold : DEFAULT_AUDIO_EVENT_SETTINGS.threshold,
+      topK: typeof parsed.topK === "number" ? parsed.topK : DEFAULT_AUDIO_EVENT_SETTINGS.topK,
+    };
+  } catch {
+    return DEFAULT_AUDIO_EVENT_SETTINGS;
+  }
+}
+
+function saveAudioEventSettings(settings: AudioEventSettings): void {
+  try {
+    globalThis.localStorage?.setItem(AUDIO_EVENT_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // Persistence is a convenience; losing it is not worth surfacing an error.
+  }
+}
+
 export interface AppAudioSettings {
   enabled: boolean;
 }
@@ -185,6 +214,14 @@ interface AppState {
   modelDevice: AsrDevice | null;
   /** Accumulated transcript. Grows across start/stop cycles; cleared via clearTranscript(). */
   segments: TranscriptSegment[];
+  /**
+   * Accumulated audio-tagging events, on the same global timeline as
+   * `segments`, for the standalone timeline panel (never merged into the
+   * transcript body -- see `events.rs`'s module doc). Only populated when
+   * `audioEventSettings.enabled`; grows and is pruned the same way `segments`
+   * does across recordings (see `refineRecording`).
+   */
+  audioEvents: AudioEvent[];
   errorMessage: string | null;
   /**
    * Why the second pass did not happen, when the live transcript is still good.
@@ -197,6 +234,7 @@ interface AppState {
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
+  audioEventSettings: AudioEventSettings;
   appAudioSettings: AppAudioSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
@@ -217,6 +255,7 @@ interface AppState {
   updateSettings: (partial: Partial<AsrSettings>) => void;
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
+  updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
   updateAppAudioSettings: (partial: Partial<AppAudioSettings>) => void;
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
@@ -312,31 +351,60 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
       });
     }
 
-    // Diarization reads the same WAV on its own 0-based timeline, so it has to
-    // run on result.chunks *before* segmentsFromResult rebases anything onto
-    // the session's global timeline -- see nonBlankChunks' doc comment.
+    // Diarization and audio tagging both read the same WAV on its own 0-based
+    // timeline, so they have to run on result.chunks *before*
+    // segmentsFromResult rebases anything onto the session's global timeline
+    // -- see nonBlankChunks' doc comment.
+    const targets = nonBlankChunks(result).map((c) => c.timestamp);
+
     let speakers: Array<number | null> | undefined;
     const diarizeSettings = useAppStore.getState().diarizeSettings;
-    if (diarizeSettings.enabled) {
-      const targets = nonBlankChunks(result).map((c) => c.timestamp);
-      if (targets.length > 0) {
-        try {
-          speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
-        } catch (err) {
-          // A transcript without speaker labels is still the whole point of
-          // this pass; losing it over diarization would be a bad trade.
-          useAppStore.setState({
-            refineNotice: `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-          });
-        }
+    if (diarizeSettings.enabled && targets.length > 0) {
+      try {
+        speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
+      } catch (err) {
+        // A transcript without speaker labels is still the whole point of
+        // this pass; losing it over diarization would be a bad trade.
+        useAppStore.setState({
+          refineNotice: `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        });
       }
     }
 
-    const refined = segmentsFromResult(result, baseSec, nextSegmentId, speakers);
+    let excluded: boolean[] | undefined;
+    let newEvents: AudioEvent[] = [];
+    const audioEventSettings = useAppStore.getState().audioEventSettings;
+    if (audioEventSettings.enabled && targets.length > 0) {
+      try {
+        const eventResult = await asrClient.detectAudioEvents(path, targets, audioEventSettings);
+        excluded = eventResult.exclude;
+        newEvents = eventResult.events;
+      } catch (err) {
+        // A transcript without audio-event filtering is still the whole point
+        // of this pass; losing it over this would be a bad trade.
+        useAppStore.setState({
+          refineNotice: `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        });
+      }
+    }
+    const rebasedEvents = newEvents.map((e) => ({ ...e, start: e.start + baseSec, end: e.end + baseSec }));
+    useAppStore.setState((s) => ({
+      audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
+    }));
+
+    const refined = segmentsFromResult(result, baseSec, nextSegmentId, speakers, excluded);
+    // segmentsFromResult can assign ids sparser than refined.length -- a chunk
+    // audio tagging excluded still consumes an id, it just produces no
+    // segment -- so advance by how many ids it could have used, not by how
+    // many segments came back, or the next recording could reuse one.
+    if (targets.length > 0) {
+      nextSegmentId += targets.length;
+    } else if (refined.length > 0) {
+      nextSegmentId += refined.length;
+    }
     // An empty second pass means something went wrong upstream, not that the
     // meeting was silent -- the live pass already found speech in this audio.
     if (refined.length > 0) {
-      nextSegmentId += refined.length;
       useAppStore.setState((s) => ({
         segments: [...s.segments.slice(0, keptSegments), ...refined],
       }));
@@ -355,12 +423,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   modelStatus: "loading",
   modelDevice: null,
   segments: [],
+  audioEvents: [],
   errorMessage: null,
   refineNotice: null,
   refineProgress: null,
   settings: loadSettings(),
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
+  audioEventSettings: loadAudioEventSettings(),
   appAudioSettings: loadAppAudioSettings(),
   levelMeter: null,
   audioInputDevices: [],
@@ -552,6 +622,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { vadSettings };
     }),
 
+  updateAudioEventSettings: (partial) =>
+    set((s) => {
+      const audioEventSettings = { ...s.audioEventSettings, ...partial };
+      saveAudioEventSettings(audioEventSettings);
+      return { audioEventSettings };
+    }),
+
   updateAppAudioSettings: (partial) =>
     set((s) => {
       const appAudioSettings = { ...s.appAudioSettings, ...partial };
@@ -566,6 +643,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     segmentsBeforeRecording = 0;
     set({
       segments: [],
+      audioEvents: [],
       recordingStatus: "idle",
       errorMessage: null,
       refineNotice: null,

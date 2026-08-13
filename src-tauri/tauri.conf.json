@@ -46,6 +46,7 @@
       "resources/models/whisper-large-v3-turbo/**/*": "resources/models/whisper-large-v3-turbo/",
       "resources/models/diarization/**/*": "resources/models/diarization/",
       "resources/models/vad/**/*": "resources/models/vad/",
+      "resources/models/audio-tagging/**/*": "resources/models/audio-tagging/",
       "resources/bin/**/*": "."
     }
   }

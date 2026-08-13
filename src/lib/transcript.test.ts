@@ -177,4 +177,27 @@ describe("segmentsFromResult", () => {
     expect(out).toHaveLength(1);
     expect(out[0].speaker).toBe(3);
   });
+
+  it("drops a chunk entirely when its excluded entry is true, leaving no trace", () => {
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false]);
+    expect(out).toHaveLength(1);
+    expect(out[0].text).toBe("議事録を始めます。");
+  });
+
+  it("keeps every chunk when excluded is not given at all", () => {
+    const out = segmentsFromResult(result, 0, 1);
+    expect(out).toHaveLength(2);
+  });
+
+  it("keeps ids stable relative to the pre-filter chunk index when excluding", () => {
+    // The first chunk's id (7) is skipped entirely rather than reused by the
+    // second -- callers rely on this to keep future ids from colliding.
+    const out = segmentsFromResult(result, 0, 7, undefined, [true, false]);
+    expect(out.map((s) => s.id)).toEqual([8]);
+  });
+
+  it("drops all chunks when every entry is excluded", () => {
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, true]);
+    expect(out).toEqual([]);
+  });
 });

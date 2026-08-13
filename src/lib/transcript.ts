@@ -55,12 +55,20 @@ export function nonBlankChunks(result: { chunks?: TranscriptChunk[] }): Transcri
  * `nonBlankChunks(result)`, in the same order (i.e. built from that same
  * function) -- that positional correspondence is how a speaker reaches the
  * right segment, there is no id-based matching.
+ *
+ * `excluded`, if given, has the same shape: `true` drops that chunk entirely
+ * (no segment is produced for it) rather than keeping it with blank text, so
+ * a filtered-out window leaves no trace in the transcript. This is
+ * `events::classify_chunks`'s non-speech exclusion (see `events.rs`), applied
+ * here rather than left to the caller so the id-gap bookkeeping below stays
+ * in one place.
  */
 export function segmentsFromResult(
   result: { text: string; chunks?: TranscriptChunk[] },
   baseSec: number,
   startId: number,
   speakers?: Array<number | null>,
+  excluded?: boolean[],
 ): TranscriptSegment[] {
   const chunks = nonBlankChunks(result);
 
@@ -73,7 +81,9 @@ export function segmentsFromResult(
       : [{ id: startId, startOffsetSec: baseSec, text: result.text, chunks: [] }];
   }
 
-  return chunks.map((c, i) => {
+  const segments: TranscriptSegment[] = [];
+  chunks.forEach((c, i) => {
+    if (excluded?.[i]) return;
     const start = c.timestamp[0] ?? 0;
     const end = c.timestamp[1] ?? start;
     const segment: TranscriptSegment = {
@@ -83,8 +93,9 @@ export function segmentsFromResult(
       chunks: [{ text: c.text, timestamp: [0, Math.max(0, end - start)] as [number, number] }],
     };
     if (speakers) segment.speaker = speakers[i] ?? null;
-    return segment;
+    segments.push(segment);
   });
+  return segments;
 }
 
 /**

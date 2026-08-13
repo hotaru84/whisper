@@ -12,6 +12,9 @@ pub mod cer;
 // Speaker diarization (sherpa-onnx) and merging its output onto whisper's
 // transcript segments.
 pub mod diarize;
+// Audio event detection (sherpa-onnx audio tagging): a standalone timeline,
+// and a non-speech exclusion filter over whisper's transcript chunks.
+pub mod events;
 // Shared by the capture writer, the second pass, and the harness, so a fixture
 // is read by exactly the code that reads a real recording.
 pub mod wav;
@@ -33,6 +36,7 @@ pub fn run() {
             capture::append_capture,
             capture::finish_capture,
             diarize::diarize_recording,
+            events::detect_audio_events,
             appaudio::list_audio_apps,
             appaudio::start_app_audio_capture,
             appaudio::stop_app_audio_capture,

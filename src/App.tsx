@@ -3,6 +3,7 @@ import { ModelLoadingOverlay } from "./components/ModelLoadingOverlay";
 import { RecordButton } from "./components/RecordButton";
 import { LevelMeter } from "./components/LevelMeter";
 import { TranscriptPanel } from "./components/TranscriptPanel";
+import { AudioEventPanel } from "./components/AudioEventPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { useAppStore, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
 
@@ -44,6 +45,7 @@ function App() {
       </div>
 
       <TranscriptPanel />
+      <AudioEventPanel />
       <SettingsPanel />
     </main>
   );

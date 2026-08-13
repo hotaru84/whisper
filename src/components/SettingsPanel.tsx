@@ -24,6 +24,8 @@ export function SettingsPanel() {
   const updateDiarizeSettings = useAppStore((s) => s.updateDiarizeSettings);
   const vadSettings = useAppStore((s) => s.vadSettings);
   const updateVadSettings = useAppStore((s) => s.updateVadSettings);
+  const audioEventSettings = useAppStore((s) => s.audioEventSettings);
+  const updateAudioEventSettings = useAppStore((s) => s.updateAudioEventSettings);
   const appAudioSettings = useAppStore((s) => s.appAudioSettings);
   const updateAppAudioSettings = useAppStore((s) => s.updateAppAudioSettings);
   const appAudioApps = useAppStore((s) => s.appAudioApps);
@@ -370,6 +372,84 @@ export function SettingsPanel() {
                     <p className="text-xs text-neutral-500">
                       短い相槌が独立した話者として分かれてしまう場合は、最小発話長を長くする。
                     </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-neutral-200 pt-4">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="audio-event-enabled"
+                    checked={audioEventSettings.enabled}
+                    onCheckedChange={(checked) => updateAudioEventSettings({ enabled: checked === true })}
+                  />
+                  <Label htmlFor="audio-event-enabled">音響イベントを検出する</Label>
+                  <Tooltip>
+                    <TooltipTrigger type="button" className="text-neutral-400">
+                      <Info className="h-3.5 w-3.5" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      録音停止後の精度向上パスに続けて、音楽・拍手・ノイズなどを検出し、下の「音響イベント」欄に
+                      時刻付きで一覧表示します。文字起こし本文には反映されません。会話が検出されない区間は
+                      文字起こしの対象から除外されます。
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+
+                {audioEventSettings.enabled && (
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pl-6">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="audio-event-threshold" className="whitespace-nowrap">
+                        検出の閾値
+                      </Label>
+                      <input
+                        id="audio-event-threshold"
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={audioEventSettings.threshold}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v)) updateAudioEventSettings({ threshold: v });
+                        }}
+                        className="w-20 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                      />
+                      <Tooltip>
+                        <TooltipTrigger type="button" className="text-neutral-400">
+                          <Info className="h-3.5 w-3.5" />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          高くするほど確信度の高いタグだけが残ります（既定 0.3）。
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="audio-event-topk" className="whitespace-nowrap">
+                        タグの最大数
+                      </Label>
+                      <input
+                        id="audio-event-topk"
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={audioEventSettings.topK}
+                        onChange={(e) => {
+                          const v = Math.round(Number(e.target.value));
+                          if (Number.isFinite(v) && v > 0) updateAudioEventSettings({ topK: v });
+                        }}
+                        className="w-16 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                      />
+                      <Tooltip>
+                        <TooltipTrigger type="button" className="text-neutral-400">
+                          <Info className="h-3.5 w-3.5" />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          10秒ごとの区間で保持するタグの数（既定 3）。
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
                   </div>
                 )}
               </div>

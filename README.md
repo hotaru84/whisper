@@ -132,7 +132,44 @@ Invoke-WebRequest -Uri "https://huggingface.co/ggml-org/whisper-vad/resolve/main
   VAD無し 約11秒 → VAD有り 約1.8秒（デコード対象が大幅に短縮されるため）。実音声での精度への影響は
   フィクスチャが無いため未測定。
 - **これは「音楽やノイズを除く」機能ではない。** VAD が対象にするのは「音声か非音声か」の判定であり、
-  雑音か音楽かといった種別の判定はしない（そちらは別途検討中の音響イベント検出の役割）。
+  雑音か音楽かといった種別の判定はしない（そちらは次の音響イベント検出の役割）。
+
+### 音響イベント検出モデルの配置（任意機能）
+
+停止後の精度向上パスで、録音全体を音楽・拍手・ノイズなどのタグ付け（audio tagging）にかける。**設定パネルでは
+既定オフ**。無くても文字起こし自体は失敗せず、有効にしない限りこれらのモデルには触れない。
+
+```powershell
+$dest = "src-tauri/resources/models/audio-tagging"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/audio-tagging-models/sherpa-onnx-zipformer-small-audio-tagging-2024-04-15.tar.bz2" -OutFile "$dest/model.tar.bz2"
+tar -xjf "$dest/model.tar.bz2" -C $dest --wildcards "*/model.int8.onnx" "*/class_labels_indices.csv"
+Move-Item "$dest/sherpa-onnx-zipformer-small-audio-tagging-2024-04-15/model.int8.onnx" "$dest/model.int8.onnx"
+Move-Item "$dest/sherpa-onnx-zipformer-small-audio-tagging-2024-04-15/class_labels_indices.csv" "$dest/class_labels_indices.csv"
+Remove-Item -Recurse -Force "$dest/sherpa-onnx-zipformer-small-audio-tagging-2024-04-15", "$dest/model.tar.bz2"
+```
+
+- **zipformer 版（int8、約26MB）を使い、sherpa-onnx が同じページで配布している CED 版は使っていない。**
+  どちらも AudioSet 527クラスのタグ付けモデルだが、ライセンスが違う。zipformer 版はアーカイブ同梱の
+  `README.md`（`license: apache-2.0` の frontmatter）の通り k2-fsa 自身が icefall で学習したもので
+  **Apache-2.0**。CED 版は変換元 [`RicherMans/CED`](https://github.com/RicherMans/CED) が **GPL-3.0** で、
+  話者分離のときと同様にここでもライセンスを実装前に直接確認し、コピーレフトの CED を避けた。
+- 10秒ごとの窓に区切って推論する（最後の窓だけ短く切る、パディングはしない）。AudioSet の学習クリップ自体が
+  10秒単位のため、このモデルが実際に見て学習した長さに合わせている。
+- 検出結果は**文字起こし本文には一切挿入しない**。設定パネル下の「音響イベント」欄に時刻・ラベル・確信度を
+  一覧表示するだけ（`src/components/AudioEventPanel.tsx`）。ラベルは AudioSet の英語名のうち会議で意味のある
+  一部だけ日本語に対応させ、対応の無いものは英語のまま出す（`src/lib/audioEvents.ts`）。
+- 用途はもう一つある: 検出した窓に「発話」系のタグが一切無く「音楽」または「ノイズ」系のタグがある場合、
+  その区間と重なる文字起こしチャンクを**文字起こし対象から除外する**（`events::classify_chunks`）。逆に
+  発話タグが一つでもあれば、音楽やノイズが同時に検出されていても除外しない（BGM 下での発言を消さないため）。
+  重なるイベントが一つも無いチャンク（検出が無効、または窓の隙間）は除外しない — 根拠が無い状態で
+  文字起こしを消すのは、話者分離で根拠なく話者を割り当てないのと同じ理由で避けている。
+- 音楽・ノイズ系タグの判定はラベル名に `music`/`noise` を含むかという素朴な文字列一致で、AudioSet の
+  楽器サブクラス（`Guitar` 等）までは拾わない。誤った除外を避けるため、広く拾うより狭く外すことを優先した
+  意図的な制約（`events.rs` のコメント参照）。
+- 実機検証は k2-fsa がモデルに同梱している `test_wavs/` の3ファイルを、実際の `events::detect_events` から
+  直接叩いて行った（猫の鳴き声・ピアノ曲・サイレンの録音で、それぞれ `Cat`/`Meow`、`Music`/`Piano`、
+  `Siren` が確信度 0.1〜0.98 で正しく検出された）。検証用の `examples/_probe_events.rs` は確認後に削除済み。
 
 ## 開発
 
@@ -316,6 +353,26 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   - **アプリ音声の取得は失敗しても録音全体を止めない。** 開始時に失敗すればマイクのみで録音を続け、
     録音中に対象アプリが終了する等で失敗すれば以降マイクのみに切り替わる（`asr:app-audio-error` イベント）。
     いずれも `refineNotice` で理由を表示する。
+- **音響イベント検出も話者分離と同じく、録音全体を見る停止後の別パスとして実装している。** 逐次パスの
+  15秒ウィンドウでは「この10秒は音楽か」の判定に使える文脈が足りない、というのが主な理由（`src-tauri/src/events.rs`）。
+  診断（`diarize_recording`）・除外判定（`detect_audio_events`）とも Rust 側の Tauri コマンドで完結し、
+  フロントエンドは `chunks`（`nonBlankChunks(result).map(c => c.timestamp)`）を渡して `exclude: boolean[]` を
+  受け取るだけ。話者分離の `diarizeRecording` と全く同じ「同じ 0-based タイムライン上で、`chunks` と同じ順序の
+  配列を返す」という契約に揃えてあり、`appStore.ts` の `refineRecording` でも両者は隣り合わせで同じ `targets`
+  を共有して呼ばれる。
+  - **除外されたチャンクは `segmentsFromResult` の中で消える** (`src/lib/transcript.ts`)。話者分離のように
+    `speaker: null` を持つ空のセグメントを残すのではなく、そのチャンクの分だけセグメントが生成されない。
+    ただし ID は `startId + i`（`i` はフィルタ前のチャンク index）のままなので、次の録音の ID がここで
+    飛んだ番号と衝突しないよう、`appStore.ts` 側では `refined.length` ではなく元のチャンク数ぶん
+    `nextSegmentId` を進めている。
+  - **「聞き直し推奨」マーカーは文字起こしセグメント側には持たせていない。** 音響イベント欄
+    (`AudioEventPanel.tsx`) がイベントのラベルを見てその場で音楽/ノイズ系かどうかを判定し、該当行にだけ
+    バッジを出す。文字起こし本文を汚さないという方針（本節冒頭）を UI 側でも徹底するため、専用のフラグを
+    フロントの型に足すより、既に持っている生イベントから都度導出する方を選んだ。
+  - **音響イベント欄も `segments` と同様、開始→停止のたびに累積する。** ただし専用のカウンタは持たず、
+    新しい結果を差し込む直前に「今回の録音の開始時刻より前のイベントだけ残す」フィルタ
+    (`e.start < baseSec`) をかけている。録音のタイムラインは常に単調増加するため、これだけで前の録音の
+    イベントを壊さずに今回の分を差し替えられる。
 - **精度のための設定。** デコードはビームサーチ（`beam_size` 5、whisper.cpp CLI と同じ既定）。温度が既定の 0.0 では
   greedy の `best_of` は効かず単なる argmax になるため、ここは明確な差になる。`suppress_nst` で「(音楽)」等の
   非音声トークンも抑制している。
