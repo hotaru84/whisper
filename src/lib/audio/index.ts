@@ -3,3 +3,8 @@ export type { PcmRecorderController } from "./pcmRecorder";
 export { decodeAudioToPcm16k, WHISPER_SAMPLE_RATE } from "./resample";
 export { createAudioLevelMeter } from "./levelMeter";
 export type { AudioLevelMeter } from "./levelMeter";
+export { listAudioInputDevices, onAudioDeviceChange, toAudioInputDevices } from "./devices";
+export type { AudioInputDevice } from "./devices";
+export { AppAudioClient } from "./appAudio";
+export type { AudioAppInfo } from "./appAudio";
+export { AudioMixer } from "./mixer";

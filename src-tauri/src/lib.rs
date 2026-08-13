@@ -1,11 +1,17 @@
+// Captures another application's rendered audio (Teams/Zoom/...) via WASAPI
+// process-loopback, for mixing with the microphone on the frontend.
+pub mod appaudio;
 // Public so the accuracy harness (`examples/cer.rs`) can decode with exactly the
 // same settings the app uses.
 pub mod asr;
-// Retains the whole recording so a second pass (and, later, diarization) can see
+// Retains the whole recording so a second pass (and diarization) can see
 // more than one streaming window at a time.
 pub mod capture;
 // The CER metric lives here rather than in the example so `cargo test` covers it.
 pub mod cer;
+// Speaker diarization (sherpa-onnx) and merging its output onto whisper's
+// transcript segments.
+pub mod diarize;
 // Shared by the capture writer, the second pass, and the harness, so a fixture
 // is read by exactly the code that reads a real recording.
 pub mod wav;
@@ -18,6 +24,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(asr::AsrState::default())
         .manage(capture::CaptureState::default())
+        .manage(appaudio::AppAudioState::default())
         .invoke_handler(tauri::generate_handler![
             asr::init_model,
             asr::transcribe_window,
@@ -25,6 +32,10 @@ pub fn run() {
             capture::start_capture,
             capture::append_capture,
             capture::finish_capture,
+            diarize::diarize_recording,
+            appaudio::list_audio_apps,
+            appaudio::start_app_audio_capture,
+            appaudio::stop_app_audio_capture,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

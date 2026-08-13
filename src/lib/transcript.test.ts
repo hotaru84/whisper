@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   combinedText,
   combinedChunks,
+  nonBlankChunks,
   segmentsFromResult,
   type TranscriptSegment,
 } from "./transcript";
@@ -27,6 +28,15 @@ describe("combinedText", () => {
   it("drops empty segments", () => {
     expect(combinedText([{ id: 9, startOffsetSec: 0, text: "   ", chunks: [] }])).toBe("");
   });
+
+  it("prefixes a 1-indexed speaker label when the segment has one", () => {
+    const withSpeakers: TranscriptSegment[] = [
+      { id: 1, startOffsetSec: 0, text: "First", chunks: [], speaker: 0 },
+      { id: 2, startOffsetSec: 1, text: "Second", chunks: [], speaker: 1 },
+      { id: 3, startOffsetSec: 2, text: "Unlabeled", chunks: [], speaker: null },
+    ];
+    expect(combinedText(withSpeakers)).toBe("話者1: First\n話者2: Second\nUnlabeled");
+  });
 });
 
 describe("combinedChunks", () => {
@@ -36,6 +46,40 @@ describe("combinedChunks", () => {
       { text: " second", timestamp: [3, 4] },
       { text: " part.", timestamp: [4, 5] },
     ]);
+  });
+
+  it("carries the segment's speaker onto every chunk it flattens", () => {
+    const withSpeaker: TranscriptSegment[] = [
+      {
+        id: 1,
+        startOffsetSec: 0,
+        text: "a b",
+        speaker: 2,
+        chunks: [
+          { text: "a", timestamp: [0, 1] },
+          { text: "b", timestamp: [1, 2] },
+        ],
+      },
+    ];
+    expect(combinedChunks(withSpeaker).map((c) => c.speaker)).toEqual([2, 2]);
+  });
+});
+
+describe("nonBlankChunks", () => {
+  it("filters out whitespace-only chunks, preserving order", () => {
+    const result = {
+      chunks: [
+        { text: "a", timestamp: [0, 1] as [number, number] },
+        { text: "   ", timestamp: [1, 2] as [number, number] },
+        { text: "b", timestamp: [2, 3] as [number, number] },
+      ],
+    };
+    expect(nonBlankChunks(result).map((c) => c.text)).toEqual(["a", "b"]);
+  });
+
+  it("returns an empty array when chunks is missing or empty", () => {
+    expect(nonBlankChunks({})).toEqual([]);
+    expect(nonBlankChunks({ chunks: [] })).toEqual([]);
   });
 });
 
@@ -97,5 +141,40 @@ describe("segmentsFromResult", () => {
   it("never produces a negative duration from out-of-order timestamps", () => {
     const out = segmentsFromResult({ text: "x", chunks: [{ text: "x", timestamp: [5, 3] }] }, 0, 1);
     expect(out[0].chunks[0].timestamp).toEqual([0, 0]);
+  });
+
+  it("attaches speakers positionally when given, one per non-blank chunk", () => {
+    const out = segmentsFromResult(result, 0, 1, [0, 1]);
+    expect(out.map((s) => s.speaker)).toEqual([0, 1]);
+  });
+
+  it("stores a null assignment as null, not as absent", () => {
+    const out = segmentsFromResult(result, 0, 1, [0, null]);
+    expect(out[0].speaker).toBe(0);
+    expect(out[1].speaker).toBeNull();
+    expect("speaker" in out[1]).toBe(true);
+  });
+
+  it("leaves speaker unset when no speakers array is given at all", () => {
+    // Diarization off, or the second pass ran without it -- must not be
+    // mistaken for "diarization ran and assigned nobody" (null).
+    const out = segmentsFromResult(result, 0, 1);
+    expect(out[0].speaker).toBeUndefined();
+    expect("speaker" in out[0]).toBe(false);
+  });
+
+  it("aligns speakers to non-blank chunks, not raw chunk indices", () => {
+    // If the caller built `speakers` from nonBlankChunks (as intended), the
+    // blank chunk at index 0 never consumes an entry.
+    const withBlank = {
+      text: "b",
+      chunks: [
+        { text: "  ", timestamp: [0, 1] as [number, number] },
+        { text: "b", timestamp: [1, 2] as [number, number] },
+      ],
+    };
+    const out = segmentsFromResult(withBlank, 0, 1, [3]);
+    expect(out).toHaveLength(1);
+    expect(out[0].speaker).toBe(3);
   });
 });

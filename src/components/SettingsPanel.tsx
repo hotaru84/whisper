@@ -1,5 +1,6 @@
-import { Info } from "lucide-react";
+import { Info, RefreshCw } from "lucide-react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "./ui/accordion";
+import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Label } from "./ui/label";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
@@ -19,9 +20,21 @@ const GLOSSARY_LIMIT = 200;
 export function SettingsPanel() {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
+  const diarizeSettings = useAppStore((s) => s.diarizeSettings);
+  const updateDiarizeSettings = useAppStore((s) => s.updateDiarizeSettings);
+  const vadSettings = useAppStore((s) => s.vadSettings);
+  const updateVadSettings = useAppStore((s) => s.updateVadSettings);
+  const appAudioSettings = useAppStore((s) => s.appAudioSettings);
+  const updateAppAudioSettings = useAppStore((s) => s.updateAppAudioSettings);
+  const appAudioApps = useAppStore((s) => s.appAudioApps);
+  const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
+  const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
+  const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
+  const audioInputDevices = useAppStore((s) => s.audioInputDevices);
   const recordingStatus = useAppStore((s) => s.recordingStatus);
   const isRecording = recordingStatus === "recording";
   const glossaryChars = Array.from(settings.glossary).length;
+  const fixedSpeakerCount = diarizeSettings.numSpeakers > 0;
 
   return (
     <Accordion type="single" collapsible className="w-full">
@@ -30,6 +43,96 @@ export function SettingsPanel() {
         <AccordionContent>
           <TooltipProvider>
             <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="device-select">マイク</Label>
+                <select
+                  id="device-select"
+                  value={settings.inputDeviceId}
+                  onChange={(e) => updateSettings({ inputDeviceId: e.target.value })}
+                  className="rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                >
+                  <option value="">既定のマイク</option>
+                  {audioInputDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>
+                      {d.label}
+                    </option>
+                  ))}
+                </select>
+                <Tooltip>
+                  <TooltipTrigger type="button" className="text-neutral-400">
+                    <Info className="h-3.5 w-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-xs">
+                    録音中の切り替えは次の録音から反映されます。選択したマイクが見つからない場合は
+                    既定のマイクにフォールバックします。
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-neutral-200 pt-4">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="app-audio-enabled"
+                    checked={appAudioSettings.enabled}
+                    onCheckedChange={(checked) => {
+                      const enabled = checked === true;
+                      updateAppAudioSettings({ enabled });
+                      if (enabled) void refreshAppAudioApps();
+                    }}
+                  />
+                  <Label htmlFor="app-audio-enabled">相手（アプリ）の音声も録音する</Label>
+                  <Tooltip>
+                    <TooltipTrigger type="button" className="text-neutral-400">
+                      <Info className="h-3.5 w-3.5" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      Teams や Zoom など、指定したアプリが再生している音声をマイクと合わせて録音します。
+                      Windows の音声セッションを使って取得するため、対象アプリが実際に音を再生していないと
+                      一覧に出てきません（通話に参加してから「更新」を押してください）。
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+
+                {appAudioSettings.enabled && (
+                  <div className="flex flex-col gap-2 pl-6">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="app-audio-target" className="whitespace-nowrap">
+                        対象アプリ
+                      </Label>
+                      <select
+                        id="app-audio-target"
+                        value={appAudioTargetPid ?? ""}
+                        onChange={(e) =>
+                          setAppAudioTarget(e.target.value ? Number(e.target.value) : null)
+                        }
+                        className="rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                      >
+                        <option value="">選択してください</option>
+                        {appAudioApps.map((a) => (
+                          <option key={a.processId} value={a.processId}>
+                            {a.name}
+                          </option>
+                        ))}
+                      </select>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void refreshAppAudioApps()}
+                        title="対象アプリの一覧を更新"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        更新
+                      </Button>
+                    </div>
+                    <p className="text-xs text-neutral-500">
+                      一覧に出ない場合は、対象アプリで通話や再生を始めてから更新してください。
+                      {appAudioTargetPid == null && "未選択のままだとマイクのみで録音します。"}
+                    </p>
+                  </div>
+                )}
+              </div>
+
               <div className="flex items-center gap-2">
                 <Label htmlFor="language-select">音声の言語</Label>
                 <select
@@ -100,6 +203,175 @@ export function SettingsPanel() {
                     ? "録音中の変更は、次のウィンドウ（最大15秒後）の文字起こしから反映されます。処理済みの部分は変わりません。"
                     : "変更は自動で保存され、次の文字起こしから反映されます。"}
                 </p>
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-neutral-200 pt-4">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="vad-enabled"
+                    checked={vadSettings.enabled}
+                    onCheckedChange={(checked) => updateVadSettings({ enabled: checked === true })}
+                  />
+                  <Label htmlFor="vad-enabled">無音区間を検出して除く（VAD）</Label>
+                  <Tooltip>
+                    <TooltipTrigger type="button" className="text-neutral-400">
+                      <Info className="h-3.5 w-3.5" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      録音停止後の精度向上パスにのみ効きます。会議中の「間」を音声区間検出で先に取り除いてから
+                      文字起こしすることで、無音での幻覚（架空の発言）を抑え、処理も速くなります。逐次表示中は
+                      別の仕組み（音量ベースの無音スキップ）が既に効いているため対象外です。
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+
+                {vadSettings.enabled && (
+                  <div className="flex items-center gap-2 pl-6">
+                    <Label htmlFor="vad-threshold" className="whitespace-nowrap">
+                      検出の閾値
+                    </Label>
+                    <input
+                      id="vad-threshold"
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={vadSettings.threshold}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        if (Number.isFinite(v)) updateVadSettings({ threshold: v });
+                      }}
+                      className="w-20 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                    />
+                    <Tooltip>
+                      <TooltipTrigger type="button" className="text-neutral-400">
+                        <Info className="h-3.5 w-3.5" />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-xs">
+                        高くするほど発話とみなす基準が厳しくなり、小さな声を無音側に倒しやすくなります（既定 0.5）。
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-2 border-t border-neutral-200 pt-4">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="diarize-enabled"
+                    checked={diarizeSettings.enabled}
+                    onCheckedChange={(checked) => updateDiarizeSettings({ enabled: checked === true })}
+                  />
+                  <Label htmlFor="diarize-enabled">話者分離を行う</Label>
+                  <Tooltip>
+                    <TooltipTrigger type="button" className="text-neutral-400">
+                      <Info className="h-3.5 w-3.5" />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-xs">
+                      録音停止後の精度向上パスに続けて、声の特徴から発言者を推定し「話者1」「話者2」のように
+                      ラベルを付けます。録音全体を見る必要があるため録音中には効きません。追加のモデル読み込みで
+                      停止後の待ち時間が延びます。
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+
+                {diarizeSettings.enabled && (
+                  <div className="flex flex-col gap-3 pl-6">
+                    <div className="flex items-center gap-2">
+                      <Label htmlFor="diarize-threshold" className="whitespace-nowrap">
+                        分離の閾値
+                      </Label>
+                      <input
+                        id="diarize-threshold"
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={diarizeSettings.threshold}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v)) updateDiarizeSettings({ threshold: v });
+                        }}
+                        className="w-20 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                      />
+                      <Tooltip>
+                        <TooltipTrigger type="button" className="text-neutral-400">
+                          <Info className="h-3.5 w-3.5" />
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          小さくするほど話者を細かく分け、大きくするほど同一人物とみなしてまとめます（既定 0.5）。
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="diarize-fixed-count"
+                        checked={fixedSpeakerCount}
+                        onCheckedChange={(checked) =>
+                          updateDiarizeSettings({ numSpeakers: checked === true ? 2 : -1 })
+                        }
+                      />
+                      <Label htmlFor="diarize-fixed-count">話者数を固定する</Label>
+                      {fixedSpeakerCount && (
+                        <input
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={diarizeSettings.numSpeakers}
+                          onChange={(e) => {
+                            const v = Math.round(Number(e.target.value));
+                            if (Number.isFinite(v) && v > 0) updateDiarizeSettings({ numSpeakers: v });
+                          }}
+                          className="w-16 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                        />
+                      )}
+                      <span className="text-xs text-neutral-500">
+                        {fixedSpeakerCount ? "" : "未指定（自動推定）"}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                      <div className="flex items-center gap-2">
+                        <Label htmlFor="diarize-min-on" className="whitespace-nowrap text-xs">
+                          最小発話長（秒）
+                        </Label>
+                        <input
+                          id="diarize-min-on"
+                          type="number"
+                          min={0}
+                          step={0.1}
+                          value={diarizeSettings.minDurationOn}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v) && v >= 0) updateDiarizeSettings({ minDurationOn: v });
+                          }}
+                          className="w-16 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Label htmlFor="diarize-min-off" className="whitespace-nowrap text-xs">
+                          最小無音長（秒）
+                        </Label>
+                        <input
+                          id="diarize-min-off"
+                          type="number"
+                          min={0}
+                          step={0.1}
+                          value={diarizeSettings.minDurationOff}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (Number.isFinite(v) && v >= 0) updateDiarizeSettings({ minDurationOff: v });
+                          }}
+                          className="w-16 rounded-md border border-neutral-300 bg-white px-2 py-1 text-sm"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-neutral-500">
+                      短い相槌が独立した話者として分かれてしまう場合は、最小発話長を長くする。
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           </TooltipProvider>

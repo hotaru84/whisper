@@ -7,6 +7,10 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": {
+      "script": "powershell -ExecutionPolicy Bypass -File scripts/copy-sherpa-dlls.ps1",
+      "cwd": ".."
+    },
     "frontendDist": "../dist"
   },
   "app": {
@@ -38,6 +42,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/models/**/*"]
+    "resources": {
+      "resources/models/whisper-large-v3-turbo/**/*": "resources/models/whisper-large-v3-turbo/",
+      "resources/models/diarization/**/*": "resources/models/diarization/",
+      "resources/models/vad/**/*": "resources/models/vad/",
+      "resources/bin/**/*": "."
+    }
   }
 }

@@ -16,6 +16,12 @@ dist-ssr
 src-tauri/resources/models/*
 !src-tauri/resources/models/.gitkeep
 
+# sherpa-onnx shared-library DLLs, copied here by scripts/copy-sherpa-dlls.ps1
+# (build.beforeBundleCommand in tauri.conf.json) from the Cargo target dir.
+# Build output, not source -- and copied fresh on every bundle build anyway.
+src-tauri/resources/bin/*
+!src-tauri/resources/bin/.gitkeep
+
 # Accuracy fixtures: recordings and their reference transcripts stay local.
 src-tauri/fixtures/*
 !src-tauri/fixtures/README.md

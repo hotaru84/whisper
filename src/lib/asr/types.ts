@@ -13,4 +13,10 @@ export type TranscriptionTask = "transcribe" | "translate";
 export interface TranscriptChunk {
   text: string;
   timestamp: [number, number];
+  /**
+   * Set only when diarization ran on the segment this chunk came from. See
+   * `TranscriptSegment.speaker` in `lib/transcript.ts` for the three-state
+   * meaning (absent / null / number).
+   */
+  speaker?: number | null;
 }

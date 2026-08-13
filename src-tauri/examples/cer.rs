@@ -58,6 +58,8 @@ Usage: cargo run --release --example cer [options]
   --threads <n>           CPU thread cap
   --prompt <text>         glossary fed as initial_prompt (~224 token budget)
   --prompt-file <path>    same, read from a file
+  --vad-model <path>      Silero VAD ggml model; filters non-speech before decoding
+  --vad-threshold <f>     VAD speech probability threshold (default: 0.5)
   --keep-punct            compare punctuation instead of stripping it
   --json <path>           also write results as JSON
   -h, --help
@@ -105,6 +107,10 @@ fn parse_args() -> Result<Args, String> {
                     Some(std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?);
             }
             "--threads" => args.settings.n_threads = value()?.parse().map_err(|e| format!("{e}"))?,
+            "--vad-model" => args.settings.vad_model_path = Some(value()?),
+            "--vad-threshold" => {
+                args.settings.vad_threshold = value()?.parse().map_err(|e| format!("{e}"))?
+            }
             other => return Err(format!("unknown option {other:?}\n\n{USAGE}")),
         }
     }
@@ -216,6 +222,10 @@ fn run() -> Result<(), String> {
     match args.settings.prompt.as_deref() {
         Some(p) => println!("prompt       : {} chars — {:?}", p.chars().count(), p),
         None => println!("prompt       : (none)"),
+    }
+    match args.settings.vad_model_path.as_deref() {
+        Some(p) => println!("vad          : {p} (threshold={})", args.settings.vad_threshold),
+        None => println!("vad          : (disabled)"),
     }
     println!();
 

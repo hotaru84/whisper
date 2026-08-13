@@ -44,4 +44,25 @@ describe("chunksToSrt", () => {
     const srt = chunksToSrt([{ text: "Odd", timestamp: [-1, Number.NaN] }]);
     expect(srt).toContain("00:00:00,000 --> 00:00:00,000");
   });
+
+  it("prefixes a 1-indexed speaker label when the chunk has one", () => {
+    const srt = chunksToSrt([{ text: "Hello", timestamp: [0, 1], speaker: 0 }]);
+    expect(srt).toContain("話者1: Hello");
+  });
+
+  it("omits the prefix when speaker is null or absent", () => {
+    expect(chunksToSrt([{ text: "No label", timestamp: [0, 1], speaker: null }])).toContain(
+      "\nNo label\n",
+    );
+    expect(chunksToSrt([{ text: "No label", timestamp: [0, 1] }])).toContain("\nNo label\n");
+  });
+
+  it("labels each chunk by its own speaker, not the previous one", () => {
+    const srt = chunksToSrt([
+      { text: "First", timestamp: [0, 1], speaker: 0 },
+      { text: "Second", timestamp: [1, 2], speaker: 1 },
+    ]);
+    expect(srt).toContain("話者1: First");
+    expect(srt).toContain("話者2: Second");
+  });
 });

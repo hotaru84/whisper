@@ -15,6 +15,11 @@ function formatSrtTimestamp(seconds: number): string {
   return `${pad2(h)}:${pad2(m)}:${pad2(s)},${pad3(ms)}`;
 }
 
+/** 1-indexed for readers, since the cluster index itself is an internal detail. */
+function speakerPrefix(speaker: number | null | undefined): string {
+  return typeof speaker === "number" ? `話者${speaker + 1}: ` : "";
+}
+
 /** Converts ASR timestamped chunks into an SRT subtitle file's text content. */
 export function chunksToSrt(chunks: TranscriptChunk[]): string {
   return chunks
@@ -24,7 +29,7 @@ export function chunksToSrt(chunks: TranscriptChunk[]): string {
       return [
         `${index + 1}`,
         `${formatSrtTimestamp(start)} --> ${formatSrtTimestamp(endSeconds)}`,
-        chunk.text.trim(),
+        speakerPrefix(chunk.speaker) + chunk.text.trim(),
         "",
       ].join("\n");
     })

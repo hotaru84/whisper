@@ -40,3 +40,21 @@ tauri-plugin-dialog = "=2.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 whisper-rs = "0.16.0"
+# `shared`, not the default `static`: the prebuilt static archive is `-MT-`
+# (built against the static CRT with VS2022's STL), and this machine's linker
+# is VS2019 Build Tools 14.29, whose libcpmt.lib lacks several VS2022 STL
+# symbols the archive needs (__std_find_last_trivial_1 and friends -- 41
+# unresolved symbols, verified). Static linking would require installing VS2022
+# just for this dependency. `shared` closes the runtime inside its own DLLs, so
+# it links against whatever toolchain built it and needs nothing from ours.
+# Trade-off: sherpa-onnx-c-api.dll + onnxruntime.dll (~22MB) must ship next to
+# the exe -- see the `bundle.resources` entries in tauri.conf.json.
+sherpa-onnx = { version = "1.13.5", default-features = false, features = ["shared"] }
+# WASAPI process-loopback capture for "app audio" (Teams/Zoom/etc).
+wasapi = "0.24.0"
+# Same major version wasapi itself depends on (kept in sync so Cargo unifies
+# them into one copy rather than compiling `windows` twice). Used directly
+# here only for QueryFullProcessImageNameW, to turn a session's PID into a
+# human-readable app name for the picker -- wasapi's own session API returns a
+# PID and an opaque session identifier, not a friendly name.
+windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_Foundation"] }

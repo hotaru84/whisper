@@ -12,6 +12,12 @@ export interface PcmRecorderController {
   cancel: () => void;
   /** The live microphone stream, e.g. for driving a level meter. */
   stream: MediaStream;
+  /**
+   * True when a specific `deviceId` was requested but could not be honored
+   * (most commonly: the saved device was unplugged) and recording fell back to
+   * the system default instead of failing outright.
+   */
+  usedFallbackDevice: boolean;
 }
 
 /**
@@ -20,11 +26,33 @@ export interface PcmRecorderController {
  * they arrive and are not retained here, so the recorder itself uses ~no memory
  * regardless of recording length; the streaming transcriber owns buffering. Only
  * the captured sample count is tracked, so `stop()` can report the duration.
+ *
+ * `deviceId` selects a specific microphone (from `devices.ts`); omit it, or
+ * pass the empty string, for the system default. A saved device that has since
+ * been unplugged raises `OverconstrainedError` under `{ exact: ... }` -- rather
+ * than fail the recording outright, this falls back to the default device and
+ * reports that via `usedFallbackDevice` so the caller can tell the user.
  */
 export async function startPcmRecording(
   onFrame: (frame: Float32Array) => void,
+  deviceId?: string,
 ): Promise<PcmRecorderController> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  let stream: MediaStream;
+  let usedFallbackDevice = false;
+  if (deviceId) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "OverconstrainedError") {
+        usedFallbackDevice = true;
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }
   // Forcing the context rate makes the browser resample the mic to 16 kHz for us.
   const audioCtx = new AudioContext({ sampleRate: WHISPER_SAMPLE_RATE });
   await audioCtx.audioWorklet.addModule(WORKLET_URL);
@@ -54,6 +82,7 @@ export async function startPcmRecording(
 
   return {
     stream,
+    usedFallbackDevice,
     stop: async () => {
       teardown();
       return totalSamples;

@@ -28,7 +28,54 @@ export interface TranscribeOptions {
 export interface TranscribeResult {
   text: string;
   chunks: TranscriptChunk[];
+  /** True when VAD was requested but its model file was missing, so the pass
+   * ran without it. Only ever set by `transcribeRecording`. */
+  vadUnavailable?: boolean;
 }
+
+/**
+ * User-facing speaker diarization knobs, mirroring `diarize::DiarizeSettings`
+ * in Rust. Kept as its own settings slice rather than folded into
+ * `TranscribeOptions`: diarization is a separate model pass that runs after
+ * transcription, not a decoding parameter.
+ */
+export interface DiarizeSettings {
+  /** Off by default -- see `diarize::DiarizeSettings` for why. */
+  enabled: boolean;
+  threshold: number;
+  /** -1 = estimate the speaker count automatically. */
+  numSpeakers: number;
+  minDurationOn: number;
+  minDurationOff: number;
+}
+
+export const DEFAULT_DIARIZE_SETTINGS: DiarizeSettings = {
+  enabled: false,
+  threshold: 0.5,
+  numSpeakers: -1,
+  minDurationOn: 0.3,
+  minDurationOff: 0.5,
+};
+
+/**
+ * Voice-activity-detection knobs for the second pass, mirroring the
+ * `vad_*` fields of `asr::DecodeSettings` in Rust. Only ever applied to
+ * `transcribeRecording`: the live pass already gates near-silent windows on
+ * the frontend (see `diagnostics.isNearSilent`), so a second, heavier filter
+ * there would mostly add model-load cost without much left to catch.
+ */
+export interface VadSettings {
+  /** On by default: the whole-file second pass cannot skip silence on the way
+   * in (a meeting's pauses sit in the middle of audio it still has to decode
+   * as one piece), which is exactly the case VAD helps most. */
+  enabled: boolean;
+  threshold: number;
+}
+
+export const DEFAULT_VAD_SETTINGS: VadSettings = {
+  enabled: true,
+  threshold: 0.5,
+};
 
 interface ModelReadyPayload {
   device: AsrDevice;
@@ -115,15 +162,47 @@ export class AsrClient {
   async transcribeRecording(
     path: string,
     options: TranscribeOptions = {},
+    vad: VadSettings = DEFAULT_VAD_SETTINGS,
   ): Promise<TranscribeResult> {
     const result = await invoke<TranscribeResult>("transcribe_recording", {
       path,
       language: options.language ?? null,
       task: options.task ?? null,
       prompt: options.glossary?.trim() ? options.glossary : null,
+      vad: vad.enabled,
+      vadThreshold: vad.threshold,
     });
     logResultHealth(result.text);
     return result;
+  }
+
+  /**
+   * Diarizes a finished recording and returns one speaker (or `null`) per
+   * entry of `chunks`, in the same order.
+   *
+   * `chunks` must be `nonBlankChunks(result).map(c => c.timestamp)` from the
+   * very same `TranscribeResult` this recording produced -- diarization reads
+   * the WAV file directly, on its own 0-based timeline, and that positional
+   * correspondence is the only thing connecting a returned speaker back to a
+   * transcript line. See `transcript.nonBlankChunks`.
+   *
+   * Throws if the model files are missing (see README for how to obtain them)
+   * or diarization otherwise fails; the caller is expected to fall back to an
+   * un-labeled transcript rather than lose the recording over this.
+   */
+  async diarizeRecording(
+    path: string,
+    chunks: Array<[number, number]>,
+    settings: DiarizeSettings,
+  ): Promise<Array<number | null>> {
+    return await invoke<Array<number | null>>("diarize_recording", {
+      path,
+      chunks,
+      threshold: settings.threshold,
+      numSpeakers: settings.numSpeakers,
+      minDurationOn: settings.minDurationOn,
+      minDurationOff: settings.minDurationOff,
+    });
   }
 
   dispose(): void {

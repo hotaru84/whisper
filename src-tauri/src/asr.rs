@@ -4,7 +4,10 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters, WhisperVadParams,
+};
 
 /// Holds the loaded whisper.cpp model for the lifetime of the app. `None` until
 /// `init_model` succeeds.
@@ -82,6 +85,11 @@ fn resolve_model_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resource_dir.join("resources/models/whisper-large-v3-turbo/model.gguf"))
 }
 
+fn resolve_vad_model_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    Ok(resource_dir.join("resources/models/vad/ggml-silero-v5.1.2.bin"))
+}
+
 /// Silences whisper.cpp's and ggml's own stdout/stderr logging.
 ///
 /// Left alone, they print a model dump on load plus ~7 lines of `whisper_init_state:`
@@ -105,8 +113,24 @@ pub async fn init_model(app: AppHandle) -> Result<(), String> {
     // Loading a ~600MB GGUF file is blocking CPU/IO work; keep it off the async runtime.
     let result = tauri::async_runtime::spawn_blocking(move || {
         let model_path = resolve_model_path(&app_for_load)?;
-        WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-            .map_err(|e| e.to_string())
+        let mut params = WhisperContextParameters::default();
+        // DTW gives per-token timestamps by tracking attention alignment through
+        // the decoder, rather than whisper's default of reading them off the
+        // single-timestamp tokens it happens to emit -- which is why segment
+        // boundaries can land hundreds of ms from the actual speech. This preset
+        // is model-specific (its attention heads were selected for
+        // large-v3-turbo) and only applies to the model we ship.
+        //
+        // Safe to enable unconditionally: flash_attn (the one thing DTW
+        // conflicts with) and new_segment_callback (whose calls DTW makes
+        // inconsistent) are both unused here.
+        params.dtw_parameters(DtwParameters {
+            mode: DtwMode::ModelPreset {
+                model_preset: DtwModelPreset::LargeV3Turbo,
+            },
+            ..DtwParameters::default()
+        });
+        WhisperContext::new_with_params(&model_path, params).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -141,9 +165,17 @@ pub struct TranscribeChunk {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TranscribeResult {
     pub text: String,
     pub chunks: Vec<TranscribeChunk>,
+    /// True when the caller asked for VAD but the model file was missing, so
+    /// decoding proceeded without it. Always `false` from `transcribe_window`,
+    /// which never requests VAD. Kept on the result rather than turned into an
+    /// error: VAD is an optional accuracy nudge, and its absence must not take
+    /// down the transcription it was supposed to improve.
+    #[serde(default)]
+    pub vad_unavailable: bool,
 }
 
 /// Every decoding knob that affects transcription quality, in one place.
@@ -192,6 +224,27 @@ pub struct DecodeSettings {
     /// (WHISPER_HISTORY_CONDITIONING_TEMP_CUTOFF), so it stops helping exactly
     /// when decoding is already struggling.
     pub prompt: Option<String>,
+    /// Path to a Silero VAD ggml model. `None` disables VAD entirely -- and is
+    /// the only thing gating it: there is no separate `vad: bool`, because
+    /// whisper-rs's `enable_vad(true)` panics if no model path has been set
+    /// first, and folding the switch into this `Option` makes that call
+    /// impossible to reach.
+    ///
+    /// Left `None` by default (i.e. for the live pass, `transcribe_window`):
+    /// its windows are already gated on the frontend by an RMS silence check
+    /// before they ever reach here, so a second, heavier filter adds model-load
+    /// cost without much left to catch. The whole-file second pass is the
+    /// opposite case -- it cannot skip silence on the way in, since a meeting's
+    /// pauses sit in the middle of audio that still has to be decoded as one
+    /// piece -- so `transcribe_recording` fills this in by default. See
+    /// `drop_silent_segments` for the RMS-based safety net that stays regardless.
+    pub vad_model_path: Option<String>,
+    pub vad_threshold: f32,
+    pub vad_min_speech_duration_ms: i32,
+    pub vad_min_silence_duration_ms: i32,
+    pub vad_max_speech_duration_s: f32,
+    pub vad_speech_pad_ms: i32,
+    pub vad_samples_overlap: f32,
 }
 
 impl Default for DecodeSettings {
@@ -204,6 +257,16 @@ impl Default for DecodeSettings {
             suppress_nst: false,
             n_threads: default_n_threads(),
             prompt: None,
+            vad_model_path: None,
+            // Mirrors whisper_rs::WhisperVadParams::default() so a caller that
+            // only sets vad_model_path (the common case) gets whisper.cpp's own
+            // tuning, not silently different numbers.
+            vad_threshold: 0.5,
+            vad_min_speech_duration_ms: 250,
+            vad_min_silence_duration_ms: 100,
+            vad_max_speech_duration_s: f32::MAX,
+            vad_speech_pad_ms: 30,
+            vad_samples_overlap: 0.1,
         }
     }
 }
@@ -249,6 +312,21 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
             params.set_initial_prompt(prompt);
         }
     }
+    // Order matters: enable_vad(true) panics if no model path has been set yet,
+    // so the path always goes first. See the field doc on vad_model_path for
+    // why absence of a path is the only way VAD gets disabled here.
+    if let Some(vad_model_path) = settings.vad_model_path.as_deref() {
+        params.set_vad_model_path(Some(vad_model_path));
+        params.enable_vad(true);
+        let mut vad_params = WhisperVadParams::new();
+        vad_params.set_threshold(settings.vad_threshold);
+        vad_params.set_min_speech_duration(settings.vad_min_speech_duration_ms);
+        vad_params.set_min_silence_duration(settings.vad_min_silence_duration_ms);
+        vad_params.set_max_speech_duration(settings.vad_max_speech_duration_s);
+        vad_params.set_speech_pad(settings.vad_speech_pad_ms);
+        vad_params.set_samples_overlap(settings.vad_samples_overlap);
+        params.set_vad_params(vad_params);
+    }
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
@@ -278,7 +356,11 @@ pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeRe
             timestamp: (t0, t1),
         });
     }
-    Ok(TranscribeResult { text, chunks })
+    Ok(TranscribeResult {
+        text,
+        chunks,
+        vad_unavailable: false,
+    })
 }
 
 /// Transcribes one streaming window of mono 16kHz f32 PCM audio.
@@ -363,9 +445,14 @@ pub const SILENCE_RMS: f32 = 1e-3;
 /// How far either side of a segment to look before calling it silent.
 ///
 /// whisper's segment timestamps are coarse enough to be off by a noticeable
-/// fraction of a second (precisely why DTW exists), so judging a segment by its
-/// declared interval alone risks measuring the pause *next* to real speech.
-/// Padding makes a false drop require a full second of silence on both sides.
+/// fraction of a second, so judging a segment by its declared interval alone
+/// risks measuring the pause *next* to real speech. Padding makes a false drop
+/// require a full second of silence on both sides.
+///
+/// `init_model` now enables DTW token-level timestamps, which should tighten
+/// this in practice -- but by how much is unmeasured (no fixtures with known
+/// ground-truth timestamps exist yet), so this stays at its original
+/// conservative value rather than guessing a smaller one down.
 const SILENCE_MARGIN_SEC: f32 = 1.0;
 
 fn rms(samples: &[f32]) -> f32 {
@@ -391,6 +478,7 @@ fn rms(samples: &[f32]) -> f32 {
 /// phrase; this cannot, because silent audio provably has no speech in it.
 pub fn drop_silent_segments(result: TranscribeResult, samples: &[f32]) -> TranscribeResult {
     let sr = crate::wav::SAMPLE_RATE as f32;
+    let vad_unavailable = result.vad_unavailable;
     let kept: Vec<TranscribeChunk> = result
         .chunks
         .into_iter()
@@ -409,6 +497,7 @@ pub fn drop_silent_segments(result: TranscribeResult, samples: &[f32]) -> Transc
     TranscribeResult {
         text: kept.iter().map(|c| c.text.as_str()).collect(),
         chunks: kept,
+        vad_unavailable,
     }
 }
 
@@ -435,6 +524,8 @@ pub async fn transcribe_recording(
     language: Option<String>,
     task: Option<String>,
     prompt: Option<String>,
+    vad: bool,
+    vad_threshold: f32,
 ) -> Result<TranscribeResult, String> {
     let language = language.filter(|l| !l.is_empty() && l != "auto");
     let translate = task.as_deref() == Some("translate");
@@ -454,10 +545,30 @@ pub async fn transcribe_recording(
             .ok_or_else(|| "model is not initialized".to_string())?;
         let mut whisper_state = ctx.create_state().map_err(|e| e.to_string())?;
 
+        // Unlike diarization (a separate command call that can fail without
+        // touching the transcript already produced), VAD runs inside this same
+        // decode -- an error here would take the whole pass down. So a missing
+        // model degrades to "proceed without VAD" rather than failing outright;
+        // `vad_unavailable` on the result tells the frontend to say so.
+        let mut vad_unavailable = false;
+        let vad_model_path = if vad {
+            let path = resolve_vad_model_path(&app)?;
+            if path.exists() {
+                Some(path.display().to_string())
+            } else {
+                vad_unavailable = true;
+                None
+            }
+        } else {
+            None
+        };
+
         let settings = DecodeSettings {
             language,
             translate,
             prompt,
+            vad_model_path,
+            vad_threshold,
             ..DecodeSettings::default()
         };
         let mut params = build_full_params(&settings);
@@ -476,10 +587,9 @@ pub async fn transcribe_recording(
             .full(params, &samples)
             .map_err(|e| e.to_string())?;
 
-        Ok(drop_silent_segments(
-            collect_segments(&whisper_state)?,
-            &samples,
-        ))
+        let mut result = drop_silent_segments(collect_segments(&whisper_state)?, &samples);
+        result.vad_unavailable = vad_unavailable;
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -510,6 +620,7 @@ mod silence_tests {
         TranscribeResult {
             text: chunks.iter().map(|c| c.text.as_str()).collect(),
             chunks,
+            vad_unavailable: false,
         }
     }
 
@@ -595,6 +706,33 @@ mod silence_tests {
         assert_eq!(rms(&[]), 0.0);
         assert_eq!(rms(&[1.0, -1.0]), 1.0);
         assert!((rms(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod vad_default_tests {
+    use super::DecodeSettings;
+
+    #[test]
+    fn vad_is_disabled_by_default() {
+        // The live pass (transcribe_window) always uses DecodeSettings::default()
+        // unmodified, so this is what governs whether VAD runs there.
+        assert!(DecodeSettings::default().vad_model_path.is_none());
+    }
+
+    #[test]
+    fn vad_defaults_mirror_whisper_rs_own_tuning() {
+        // Pinned to whisper_rs::WhisperVadParams::default() (private fields, so
+        // this can't cross-check against it directly) -- if a future whisper-rs
+        // upgrade changes those defaults, this test won't catch it, but it does
+        // catch an accidental edit here silently drifting from what's documented.
+        let d = DecodeSettings::default();
+        assert_eq!(d.vad_threshold, 0.5);
+        assert_eq!(d.vad_min_speech_duration_ms, 250);
+        assert_eq!(d.vad_min_silence_duration_ms, 100);
+        assert_eq!(d.vad_max_speech_duration_s, f32::MAX);
+        assert_eq!(d.vad_speech_pad_ms, 30);
+        assert_eq!(d.vad_samples_overlap, 0.1);
     }
 }
 

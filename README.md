@@ -66,6 +66,74 @@ Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/mai
 - whisper.cpp は語彙・トークナイザーを GGUF ファイル自体に内包しているため、旧構成のような複数ファイル
   （tokenizer/config JSON、`onnx/` サブフォルダ）は不要。
 
+**`src-tauri/resources/models/` 配下には旧 Transformers.js 実装の名残（`kotoba-whisper-v2.2`、`whisper-base`、
+計約2.6GB）が残っていることがある。** これは現在のバックエンドからは一切参照されない死んだファイルなので、
+削除してよい（`whisper-large-v3-turbo/` だけ残す）。`tauri.conf.json` の `bundle.resources` は
+`resources/models/whisper-large-v3-turbo/**/*` だけを明示的に指定しており、この配下に無いものはどのみち
+インストーラには入らない。**新しいモデル（VAD、話者分離、音響イベント検出など）を追加するときは、この
+`bundle.resources` の配列にそのモデルのディレクトリを明示的に追記すること。** `resources/models/**/*` の
+ような広い glob に戻すと、リポジトリの手元に置いた不要なモデルまで気づかず同梱してしまう
+（実際に旧実装のモデルで3.2GBまで膨らんでいた）。
+
+### 話者分離モデルの配置（任意機能）
+
+話者分離を使う場合のみ必要。無くてもアプリ本体・文字起こしは動く（設定で話者分離を有効にしない限り
+これらのモデルには触れない）。`src-tauri/src/diarize.rs` が読むパスに合わせて配置する。
+
+```powershell
+$dest = "src-tauri/resources/models/diarization"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" -OutFile "$dest/segmentation.tar.bz2"
+tar -xjf "$dest/segmentation.tar.bz2" -C $dest
+Move-Item "$dest/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" "$dest/segmentation.onnx"
+Remove-Item -Recurse -Force "$dest/sherpa-onnx-pyannote-segmentation-3-0", "$dest/segmentation.tar.bz2"
+Invoke-WebRequest -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx" -OutFile "$dest/embedding.onnx"
+```
+
+- **セグメンテーションモデル**（pyannote 由来、約6.6MB）: 元の `pyannote/segmentation-3.0` は Hugging Face 上で
+  ゲート付き配布だが、**ライセンス自体は MIT** で常にオープンソースであることが明記されている
+  （[ライセンス表記](https://huggingface.co/pyannote/segmentation-3.0)）。ここで使う sherpa-onnx 版はその
+  MIT ライセンスの重みから抽出された ONNX ミラーを k2-fsa が自前で再配布したものなので、ゲート越え・
+  HuggingFace トークンの取得は不要。
+- **埋め込みモデル**（約27MB）: 3D-Speaker の CAM++（中国語・英語共通学習）を使う。日本語には未対応の名称に
+  見えるが、話者埋め込みは声質を捉えるものでテキスト言語に依存しないため、日本語の会議でも問題なく機能する
+  （話者分離の分野で一般的な前提）。
+- 話者数は指定せず、クラスタリングの閾値（既定 0.5）から自動推定する。人数が既知の場合のみ設定で固定できる。
+
+**話者分離は `sherpa-onnx` を `shared`（DLL）リンクで使っている**（既定の `static` はこのマシンのリンカでは
+41件のシンボル未解決になる。詳細は `Cargo.toml` の該当箇所のコメントを参照）。そのため `sherpa-onnx-c-api.dll` /
+`onnxruntime.dll` など計4つの DLL が実行時に必要になる。これらは `cargo build` 時に Cargo のターゲット
+ディレクトリ（`.cargo/config.toml` で `C:/wsbuild`）へ自動生成されるが、`src-tauri/resources/` 配下ではないため
+そのままでは NSIS インストーラに含まれない。`tauri.conf.json` の `build.beforeBundleCommand` が
+[`scripts/copy-sherpa-dlls.ps1`](scripts/copy-sherpa-dlls.ps1) を実行し、ビルド直後にそのターゲットディレクトリ
+から `src-tauri/resources/bin/` へコピーしてから `bundle.resources` の対象に含めている。この一連の流れは
+`npm run tauri build` の中で自動的に走るため、手動での追加操作は不要。
+
+### VAD モデルの配置（任意機能・既定で有効）
+
+停止後の精度向上パスで無音区間を除く音声区間検出（VAD）に使う。**設定パネルでは既定オン**だが、モデルファイル
+が無くても文字起こし自体は失敗しない — 見つからない場合は VAD 無しで続行し、その旨を画面に表示する
+（`asr::transcribe_recording` の `vad_unavailable`）。
+
+```powershell
+$dest = "src-tauri/resources/models/vad"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest -Uri "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" -OutFile "$dest/ggml-silero-v5.1.2.bin"
+```
+
+- Silero VAD の ggml 移植版（約864KB）。whisper.cpp の `full()` 呼び出しに内蔵の VAD として統合されており、
+  非音声区間を除いた上でタイムスタンプの再マッピングまで面倒を見てくれる。自前で区間を切り出して繋ぎ直す
+  実装は不要。
+- **効果は実測で限定的だった。** 15秒の完全な無音に対しては、VAD の有無に関わらず `drop_silent_segments`
+  （音声のRMSで無音セグメントを弾く既存の仕組み）が同じ結果（0セグメント）を返す。一方、無音区間に
+  合成的な広帯域ノイズ（音声ではないが完全な無音でもない）を混ぜたケースでは、VAD を有効にしても
+  「ご視聴ありがとうございました」という定番の幻覚が抑えられなかった（`drop_silent_segments` も同様。
+  RMS がしきい値を超えるため無音とは判定されない）。**確認できた効果は速度面**: 15秒の無音入力で
+  VAD無し 約11秒 → VAD有り 約1.8秒（デコード対象が大幅に短縮されるため）。実音声での精度への影響は
+  フィクスチャが無いため未測定。
+- **これは「音楽やノイズを除く」機能ではない。** VAD が対象にするのは「音声か非音声か」の判定であり、
+  雑音か音楽かといった種別の判定はしない（そちらは別途検討中の音響イベント検出の役割）。
+
 ## 開発
 
 ```powershell
@@ -195,10 +263,59 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   第2パスは会議中の「間」を含む全体を1本で処理するため入口で塞げない。そこでデコード後に、各セグメントの
   区間（前後1秒の余裕込み）の RMS が `SILENCE_RMS` 未満ならそのセグメントを捨てる
   (`asr::drop_silent_segments`)。**判定材料はテキストではなく音声**なので、「はいはいはい」のような正当な発話を
-  文面の見た目で消すことがない。前後1秒の余裕は whisper のタイムスタンプが粗いこと（Part 3 の DTW で改善予定）
-  への保険。なお `no_speech_thold` は 0.6 / 0.3 / 0.1 のいずれでもこの幻覚を抑えられないことを実測で確認済み。
+  文面の見た目で消すことがない。前後1秒の余裕は whisper のタイムスタンプが粗いことへの保険（下記 DTW を参照）。
+  なお `no_speech_thold` は 0.6 / 0.3 / 0.1 のいずれでもこの幻覚を抑えられないことを実測で確認済み。
+- **タイムスタンプは DTW（動的時間伸縮法）で精密化している。** whisper が既定で出すセグメント境界は、
+  デコード中にたまたま出た単一タイムスタンプトークンを読むだけの粗い実装で、数百ms ずれることがある。
+  `asr::init_model` で `DtwParameters { mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3Turbo } }`
+  を設定し、アテンション行列を追跡してトークン単位の時刻を求める方式に切り替えている。`large-v3-turbo` 専用の
+  プリセットが `whisper-rs` に存在するため、モデルに合わせてこれを使う。話者分離の話者割り当ては時刻の突き合わせに
+  依存するため、ここの精度がそのまま効いてくる。制約: DTW は `flash_attn` と併用不可、`new_segment_callback` の
+  呼び出しが不整合になるとされているが、**このアプリはどちらも使っていないため影響なし**。
+  コストは実測で軽微（40秒音声・Vulkan、3回平均で DTW 無し約3.3秒 → 有り約3.5秒、+4〜5%）。
 - **言語は既定で日本語。** whisper.cpp は `"auto"` 指定で真の言語自動検出をサポートする（設定パネルの
   「自動検出」）。既定言語は `src/store/appStore.ts` で ISO 639-1 コード `"ja"` に設定している。
+- **マイクは設定パネルから選べる。** `navigator.mediaDevices.enumerateDevices()`（`src/lib/audio/devices.ts`）で
+  列挙するが、**デバイスラベルはマイク権限を許可するまで空文字列になる**（ブラウザの仕様。フィンガープリンティング
+  対策）。許可前は「マイク 1」のような仮ラベルで表示し、録音を一度開始してマイク権限が確定した時点で
+  再列挙して本来のラベルに差し替える。保存したデバイスが録音開始時に見つからない場合（USB マイクを
+  抜いた等）は `OverconstrainedError` を捕まえて既定のマイクにフォールバックし、その旨を通知する
+  （`src/lib/audio/pcmRecorder.ts` の `usedFallbackDevice`）。`devicechange` イベントも購読しており、
+  抜き差しに応じて一覧が自動更新される。
+- **相手（Teams/Zoom 等）の音声は WASAPI プロセスループバックで取り込む。** マイクだけでは自分の声しか録れず、
+  ヘッドセット利用時は相手の声が一切記録されない。これを解決するため、指定したアプリが再生している音声だけを
+  対象に取り込む（`src-tauri/src/appaudio.rs`）。
+  - `Chromium` の `getDisplayMedia` は Windows では画面共有のタブ音声かシステム全体の音声しか取れず、
+    **ネイティブアプリのウィンドウ単位の音声取得はできない**。代わりに Win32 の
+    `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`（[`wasapi`](https://github.com/HEnquist/wasapi-rs) クレート
+    の `AudioClient::new_application_loopback_client`）を使い、指定した PID（と `include_tree: true` でその
+    子プロセスも）が再生する音声だけをキャプチャする。要件は Windows 10 build 20348 以降（このアプリの
+    動作環境なら通常問題ない）。
+  - **対象アプリの一覧は「今まさに音を出しているプロセス」からしか作れない。** `IAudioSessionManager2` の
+    アクティブなオーディオセッションを列挙して PID を取得し、`QueryFullProcessImageNameW`
+    （`windows` クレート。`wasapi` が既に依存しているので追加コストなし）で実行ファイル名に解決する。
+    Windows が「音を出す可能性があるプロセス」ではなく「今セッションを持っているプロセス」しか教えてくれない
+    ため、**Teams/Zoom は通話に参加してから一覧に現れる**。UI に更新ボタンを置いているのはこのため。
+  - **16kHz mono への変換はリサンプラを自前で書かず WASAPI 自身にやらせている。** `wasapi` の
+    `StreamMode::EventsShared { autoconvert: true, .. }`（`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`）は、
+    プロセスループバックモードでも機能することを自プロセスでのトーン再生＋キャプチャで実測確認済み
+    （48kHz ステレオ → 16kHz モノを要求してそのまま通った）。当初計画していた `rubato` は不要と判断し、
+    依存に加えていない。
+  - **アプリが無音の間、プロセスループバックは何もデータを返さない。** 放置するとマイクとの時間軸がずれるため、
+    キャプチャループは経過時間を基準に一定間隔（100ms）でチャンクを送り出し、実際の音声が足りない分は無音で
+    埋める（`appaudio.rs` の `flush_due_chunks`）。自プロセスでの実測では、5秒間キャプチャして
+    受信サンプル数が期待値の 99.97%、`implied duration` が 5.00秒（期待5秒）と、時間軸のズレをほぼ解消できている。
+  - **マイクとの合流はフロント側で行う。** マイクは既存どおりブラウザの `getUserMedia`（エコー除去/ノイズ抑制/AGC
+    を保持）、アプリ音声は Rust から Tauri の `Channel`（生バイナリ IPC）で届く。両者を Rust 側で混ぜず
+    フロントで合流させているのは、逐次文字起こしの chunk-and-commit ロジック（`StreamingTranscriber`）を
+    Rust に移植するより、そちらを変えずにアプリ音声を引き上げるほうが小さく安全なため。合流は
+    `src/lib/audio/mixer.ts` の `AudioMixer` が担い、**マイク側のフレームが基準（ペースメーカー）**。
+    マイクフレームが来るたびに、その時点でキューにあるアプリ音声を同じ長さだけ取り出して合成し、足りなければ
+    無音で埋める。片方だけがクリップしないよう、各ソースを 0.7 倍してから加算する（両方が同時に最大振幅でも
+    1.4 倍で収まり、まれに超えた分だけ clamp する）。
+  - **アプリ音声の取得は失敗しても録音全体を止めない。** 開始時に失敗すればマイクのみで録音を続け、
+    録音中に対象アプリが終了する等で失敗すれば以降マイクのみに切り替わる（`asr:app-audio-error` イベント）。
+    いずれも `refineNotice` で理由を表示する。
 - **精度のための設定。** デコードはビームサーチ（`beam_size` 5、whisper.cpp CLI と同じ既定）。温度が既定の 0.0 では
   greedy の `best_of` は効かず単なる argmax になるため、ここは明確な差になる。`suppress_nst` で「(音楽)」等の
   非音声トークンも抑制している。
