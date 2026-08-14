@@ -111,6 +111,32 @@ export interface AsrSettings {
   inputDeviceId: string;
 }
 
+/**
+ * Shared shape behind every `settings-key -> localStorage` pair below: read
+ * back whatever JSON is there, field-validate it against `defaults` (so a
+ * stale/foreign shape can't leak wrong types into state), and never let a
+ * corrupt or unavailable `localStorage` stop the app from starting. `sanitize`
+ * carries the one part that legitimately differs per settings type -- which
+ * fields exist and what counts as valid.
+ */
+function loadPersistedSettings<T>(key: string, defaults: T, sanitize: (parsed: Partial<T>, defaults: T) => T): T {
+  try {
+    const stored = globalThis.localStorage?.getItem(key);
+    if (!stored) return defaults;
+    return sanitize(JSON.parse(stored) as Partial<T>, defaults);
+  } catch {
+    return defaults;
+  }
+}
+
+function savePersistedSettings<T>(key: string, settings: T): void {
+  try {
+    globalThis.localStorage?.setItem(key, JSON.stringify(settings));
+  } catch {
+    // Persistence is a convenience; losing it is not worth surfacing an error.
+  }
+}
+
 const SETTINGS_KEY = "asr-settings";
 
 /**
@@ -119,28 +145,16 @@ const SETTINGS_KEY = "asr-settings";
  */
 function loadSettings(): AsrSettings {
   const defaults: AsrSettings = { language: "ja", task: "transcribe", glossary: "", inputDeviceId: "" };
-  try {
-    const stored = globalThis.localStorage?.getItem(SETTINGS_KEY);
-    if (!stored) return defaults;
-    const parsed = JSON.parse(stored) as Partial<AsrSettings>;
-    return {
-      language: typeof parsed.language === "string" ? parsed.language : defaults.language,
-      task: parsed.task === "translate" ? "translate" : "transcribe",
-      glossary: typeof parsed.glossary === "string" ? parsed.glossary : defaults.glossary,
-      inputDeviceId: typeof parsed.inputDeviceId === "string" ? parsed.inputDeviceId : defaults.inputDeviceId,
-    };
-  } catch {
-    // Corrupt or unavailable storage must never stop the app from starting.
-    return defaults;
-  }
+  return loadPersistedSettings(SETTINGS_KEY, defaults, (parsed, d) => ({
+    language: typeof parsed.language === "string" ? parsed.language : d.language,
+    task: parsed.task === "translate" ? "translate" : "transcribe",
+    glossary: typeof parsed.glossary === "string" ? parsed.glossary : d.glossary,
+    inputDeviceId: typeof parsed.inputDeviceId === "string" ? parsed.inputDeviceId : d.inputDeviceId,
+  }));
 }
 
 function saveSettings(settings: AsrSettings): void {
-  try {
-    globalThis.localStorage?.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
+  savePersistedSettings(SETTINGS_KEY, settings);
 }
 
 const DIARIZE_SETTINGS_KEY = "diarize-settings";
@@ -148,81 +162,44 @@ const DIARIZE_SETTINGS_KEY = "diarize-settings";
 /** Same persistence shape as `loadSettings`/`saveSettings`, kept separate: this
  * is a different concern (a post-hoc model pass, not a decoding parameter). */
 function loadDiarizeSettings(): DiarizeSettings {
-  try {
-    const stored = globalThis.localStorage?.getItem(DIARIZE_SETTINGS_KEY);
-    if (!stored) return DEFAULT_DIARIZE_SETTINGS;
-    const parsed = JSON.parse(stored) as Partial<DiarizeSettings>;
-    return {
-      enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_DIARIZE_SETTINGS.enabled,
-      threshold: typeof parsed.threshold === "number" ? parsed.threshold : DEFAULT_DIARIZE_SETTINGS.threshold,
-      numSpeakers:
-        typeof parsed.numSpeakers === "number" ? parsed.numSpeakers : DEFAULT_DIARIZE_SETTINGS.numSpeakers,
-      minDurationOn:
-        typeof parsed.minDurationOn === "number" ? parsed.minDurationOn : DEFAULT_DIARIZE_SETTINGS.minDurationOn,
-      minDurationOff:
-        typeof parsed.minDurationOff === "number" ? parsed.minDurationOff : DEFAULT_DIARIZE_SETTINGS.minDurationOff,
-    };
-  } catch {
-    return DEFAULT_DIARIZE_SETTINGS;
-  }
+  return loadPersistedSettings(DIARIZE_SETTINGS_KEY, DEFAULT_DIARIZE_SETTINGS, (parsed, d) => ({
+    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
+    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
+    numSpeakers: typeof parsed.numSpeakers === "number" ? parsed.numSpeakers : d.numSpeakers,
+    minDurationOn: typeof parsed.minDurationOn === "number" ? parsed.minDurationOn : d.minDurationOn,
+    minDurationOff: typeof parsed.minDurationOff === "number" ? parsed.minDurationOff : d.minDurationOff,
+  }));
 }
 
 function saveDiarizeSettings(settings: DiarizeSettings): void {
-  try {
-    globalThis.localStorage?.setItem(DIARIZE_SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
+  savePersistedSettings(DIARIZE_SETTINGS_KEY, settings);
 }
 
 const VAD_SETTINGS_KEY = "vad-settings";
 
 function loadVadSettings(): VadSettings {
-  try {
-    const stored = globalThis.localStorage?.getItem(VAD_SETTINGS_KEY);
-    if (!stored) return DEFAULT_VAD_SETTINGS;
-    const parsed = JSON.parse(stored) as Partial<VadSettings>;
-    return {
-      enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_VAD_SETTINGS.enabled,
-      threshold: typeof parsed.threshold === "number" ? parsed.threshold : DEFAULT_VAD_SETTINGS.threshold,
-    };
-  } catch {
-    return DEFAULT_VAD_SETTINGS;
-  }
+  return loadPersistedSettings(VAD_SETTINGS_KEY, DEFAULT_VAD_SETTINGS, (parsed, d) => ({
+    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
+    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
+  }));
 }
 
 function saveVadSettings(settings: VadSettings): void {
-  try {
-    globalThis.localStorage?.setItem(VAD_SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
+  savePersistedSettings(VAD_SETTINGS_KEY, settings);
 }
 
 const AUDIO_EVENT_SETTINGS_KEY = "audio-event-settings";
 
 function loadAudioEventSettings(): AudioEventSettings {
-  try {
-    const stored = globalThis.localStorage?.getItem(AUDIO_EVENT_SETTINGS_KEY);
-    if (!stored) return DEFAULT_AUDIO_EVENT_SETTINGS;
-    const parsed = JSON.parse(stored) as Partial<AudioEventSettings>;
-    return {
-      enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULT_AUDIO_EVENT_SETTINGS.enabled,
-      threshold:
-        typeof parsed.threshold === "number" ? parsed.threshold : DEFAULT_AUDIO_EVENT_SETTINGS.threshold,
-      topK: typeof parsed.topK === "number" ? parsed.topK : DEFAULT_AUDIO_EVENT_SETTINGS.topK,
-    };
-  } catch {
-    return DEFAULT_AUDIO_EVENT_SETTINGS;
-  }
+  return loadPersistedSettings(AUDIO_EVENT_SETTINGS_KEY, DEFAULT_AUDIO_EVENT_SETTINGS, (parsed, d) => ({
+    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
+    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
+    topK: typeof parsed.topK === "number" ? parsed.topK : d.topK,
+  }));
 }
 
 function saveAudioEventSettings(settings: AudioEventSettings): void {
-  try {
-    globalThis.localStorage?.setItem(AUDIO_EVENT_SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
+  savePersistedSettings(AUDIO_EVENT_SETTINGS_KEY, settings);
 }
 
 interface AppState {
