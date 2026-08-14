@@ -36,14 +36,25 @@ const ICON_MIN_WIDTH_PCT = 4;
 /**
  * The proportional-width event track sharing the seek bar's time axis below
  * it, so an audio event's position visually lines up with where it is in the
- * recording -- the "closer to a real timeline" half of the design plan's
- * `AudioEventPanel` rework (the detail list itself stays in
- * `AudioEventPanel`; this is the at-a-glance overview). Always rendered once
+ * recording. This is the only place detected audio events are shown at all
+ * (there used to be a separate tabbed list, `AudioEventPanel`; it was
+ * removed as redundant once every block here became clickable and already
+ * carries its label and time range in a tooltip). Always rendered once
  * something is loaded for playback, even with zero events -- an empty muted
  * track still carries the playhead, so the axis stays legible whether or not
  * this recording had anything worth tagging.
  */
-function EventBand({ events, playback }: { events: AudioEvent[]; playback: PlaybackState }) {
+function EventBand({
+  events,
+  playback,
+  onSeek,
+}: {
+  events: AudioEvent[];
+  playback: PlaybackState;
+  /** Seconds into the loaded recording's own timeline, matching what
+   * `seekTo` (and the seek bar / segment timestamps) already expect. */
+  onSeek: (sec: number) => void;
+}) {
   const duration = Math.max(playback.durationSec, 0.01);
   // Only events overlapping the recording currently loaded -- see
   // PlaybackState.timelineOffsetSec's doc comment for why an event from an
@@ -65,9 +76,18 @@ function EventBand({ events, playback }: { events: AudioEvent[]; playback: Playb
         return (
           <Tooltip key={i}>
             <TooltipTrigger asChild>
-              <div
+              {/* A button, not a decorative div: clicking a block seeks to it
+                  and (via TranscriptPanel's seekSeq effect) scrolls the
+                  transcript to whatever was said there -- this band is the
+                  only surface audio events show up on at all now that they no
+                  longer have their own tab, so it has to carry both "what is
+                  this" (the tooltip) and "take me to it". */}
+              <button
+                type="button"
+                onClick={() => onSeek(localStart)}
+                aria-label={`${audioEventLabelJa(e.name)}（${formatTimestamp(e.start)}–${formatTimestamp(e.end)}）にシーク`}
                 className={cn(
-                  "absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[2px] border",
+                  "absolute inset-y-0 flex items-center justify-center overflow-hidden rounded-[2px] border transition-opacity hover:opacity-80",
                   // `--graphite` isn't exposed as a Tailwind color token (only
                   // used via CSS var elsewhere), so the neutral category color
                   // reuses one of the chart tokens instead, same as the
@@ -79,10 +99,14 @@ function EventBand({ events, playback }: { events: AudioEvent[]; playback: Playb
                 {width >= ICON_MIN_WIDTH_PCT && (
                   <Icon className="h-3 w-3 shrink-0 text-foreground/70" aria-hidden="true" />
                 )}
-              </div>
+              </button>
             </TooltipTrigger>
             <TooltipContent>
               {audioEventLabelJa(e.name)} ({formatTimestamp(e.start)}–{formatTimestamp(e.end)})
+              {/* The amber coloring alone doesn't explain *why* a block is
+                  colored differently -- this is the only place that reason is
+                  spelled out now that the separate event list is gone. */}
+              {noisy && <> — 聞き直し推奨</>}
             </TooltipContent>
           </Tooltip>
         );
@@ -147,7 +171,7 @@ export function RecordingTimeline() {
 
   return (
     <div className="flex w-full flex-col gap-2 rounded-lg border border-border p-4">
-      <EventBand events={audioEvents} playback={playback} />
+      <EventBand events={audioEvents} playback={playback} onSeek={seekTo} />
 
       <div className="flex items-center gap-3">
         <TimeRangeChip start={playback.currentTimeSec} className="w-12" />

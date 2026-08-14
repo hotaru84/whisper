@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal } from "lucide-react";
+import { Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal, FileAudio } from "lucide-react";
 import { Button } from "./ui/button";
 import {
   DropdownMenu,
@@ -8,7 +8,7 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { ScrollArea } from "./ui/scroll-area";
-import { useAppStore } from "../store/appStore";
+import { useAppStore, selectCapabilities } from "../store/appStore";
 import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
@@ -26,7 +26,7 @@ function formatDateTime(date: Date): { day: string; time: string } {
 
 /** Feature badges are icon-only (no label) to keep each row to one line --
  * the icons mirror the ones used for the same features elsewhere (StatusBar,
- * AudioEventPanel) so their meaning is learned once. */
+ * RecordingTimeline's event band) so their meaning is learned once. */
 function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
   return (
     <span className="flex items-center gap-1 text-muted-foreground">
@@ -58,10 +58,16 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
+  const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
+  const modelStatus = useAppStore((s) => s.modelStatus);
+  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
   // Opening an entry replaces the on-screen transcript and every timeline
   // counter, so it is a stopped-only action -- the store enforces this too,
   // but a dead-looking click is worse than a disabled control.
-  const browsable = useAppStore((s) => s.recordingPhase) === "stopped";
+  const browsable = recordingPhase === "stopped";
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
@@ -89,10 +95,43 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             {formatTimestamp(meta.durationSec)}
           </span>
         </div>
-        {meta.preview && <p className="line-clamp-2 text-xs text-foreground">{meta.preview}</p>}
+        {meta.transcribed ? (
+          meta.preview && <p className="line-clamp-2 text-xs text-foreground">{meta.preview}</p>
+        ) : (
+          <p className="flex items-center gap-1 text-xs text-muted-foreground">
+            <FileAudio className="h-3 w-3" aria-hidden="true" />
+            未解析（録音のみ）
+          </p>
+        )}
         <FeatureIcons meta={meta} />
       </button>
       <div className="flex items-center justify-end gap-1">
+        {!meta.transcribed && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100"
+            disabled={!can.reanalyze}
+            title="この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+            onClick={(e) => {
+              e.stopPropagation();
+              // Opens the entry first so the transcript panel switches to it
+              // right away (showing the "未解析" placeholder), then runs the
+              // analysis against that same now-selected recording -- without
+              // this, `rerunHistoryEntry` still transcribes correctly but has
+              // nothing to display its result into until the user separately
+              // clicks the row.
+              void (async () => {
+                await loadHistoryEntry(meta.id);
+                await rerunHistoryEntry(meta.id);
+              })();
+            }}
+          >
+            <Wand2 className="h-3 w-3" />
+            解析
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -107,15 +146,18 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
-            <DropdownMenuItem onSelect={() => void handleCopy()}>
+            {/* Copying/exporting an unanalyzed entry would silently produce an
+                empty file -- disabled rather than hidden, so the row's actions
+                stay in the same place regardless of transcription state. */}
+            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleCopy()}>
               <Copy className="h-4 w-4" />
               コピー
             </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => void handleExport("txt")}>
+            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleExport("txt")}>
               <Download className="h-4 w-4" />
               .txt として保存
             </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => void handleExport("srt")}>
+            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleExport("srt")}>
               <Download className="h-4 w-4" />
               .srt として保存
             </DropdownMenuItem>

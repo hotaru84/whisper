@@ -25,7 +25,8 @@ export function RecordButton() {
   const stopRecording = useAppStore((s) => s.stopRecording);
   const pauseRecording = useAppStore((s) => s.pauseRecording);
   const resumeRecording = useAppStore((s) => s.resumeRecording);
-  const can = selectCapabilities({ recordingPhase, processing, modelStatus });
+  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
 
   if (recordingPhase === "stopped") {
     const label = processing !== null ? "処理中です" : "録音を開始";

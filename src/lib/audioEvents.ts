@@ -1,6 +1,7 @@
 /**
- * Display-only helpers for `AudioEventPanel`. Separate from the Rust-side
- * exclusion decision (`events::classify_chunks`): that one decides what
+ * Display-only helpers for `RecordingTimeline`'s event band, the only place
+ * detected audio events are shown. Separate from the Rust-side exclusion
+ * decision (`events::classify_chunks`): that one decides what
  * leaves the transcript and has to be conservative, this one only decides how
  * a tag is labeled and highlighted, so the two are allowed to disagree at the
  * edges without either being "wrong".
@@ -64,8 +65,9 @@ export function isNoiseOrMusicEvent(name: string): boolean {
 
 /**
  * Coarse buckets an `AudioEvent.name` (an AudioSet class) sorts into, purely
- * for picking an icon in `AudioEventPanel`. Deliberately broader/fuzzier than
- * `is_speech_label`/`is_noise_or_music_label` in `events.rs` -- those decide
+ * for picking an icon in `RecordingTimeline`'s event band. Deliberately
+ * broader/fuzzier than `is_speech_label`/`is_noise_or_music_label` in
+ * `events.rs` -- those decide
  * whether a transcript chunk gets dropped and have to be conservative, this
  * one only decides which glyph to draw and can afford to guess.
  */

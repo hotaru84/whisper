@@ -4,7 +4,10 @@ export function ModelLoadingOverlay() {
   const modelStatus = useAppStore((s) => s.modelStatus);
   const errorMessage = useAppStore((s) => s.errorMessage);
 
-  if (modelStatus === "ready") return null;
+  // "idle" is the model not being loaded on purpose -- record-only mode never
+  // asks for it, and a session that starts there must not be greeted by a
+  // blocking overlay for a load that is never going to happen.
+  if (modelStatus === "ready" || modelStatus === "idle") return null;
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-background/90 backdrop-blur-sm">

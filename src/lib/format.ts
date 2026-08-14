@@ -2,7 +2,7 @@
  * Formats a duration/timestamp in seconds as `m:ss`, switching to `h:mm:ss`
  * once it reaches an hour. Shared by every place in the app that shows a
  * timestamp, elapsed time, or a recording's duration (`StatusBar`,
- * `HistorySidebar`, `AudioEventPanel`, `TranscriptPanel`, `TimeRangeChip`),
+ * `HistorySidebar`, `RecordingTimeline`, `TranscriptPanel`, `TimeRangeChip`),
  * so they can never drift into disagreeing about when the hours digit
  * appears or how minutes/seconds are padded.
  */

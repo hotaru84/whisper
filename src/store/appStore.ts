@@ -41,28 +41,21 @@ import type {
   AudioAppInfo,
   PlaybackController,
 } from "../lib/audio";
+// The state axes and `selectCapabilities` live in their own import-free module
+// so they can be unit-tested without dragging in the Tauri client and the
+// audio stack -- see capabilities.ts.
+import { selectCapabilities } from "./capabilities";
+import type { RecordingPhase, ProcessingPhase, ModelStatus } from "./capabilities";
 
-/**
- * What the recorder itself is doing -- the app's primary, user-visible state.
- *
- * Deliberately only three values, with the post-stop pipeline (`ProcessingPhase`)
- * and failures (`errorMessage`) kept on their own axes. Folding all three into
- * one enum, as this used to, meant every consumer had to re-derive "is a take
- * in progress" from a different subset of values, and adding a state silently
- * fell through every `===` chain that did not list it.
- */
-export type RecordingPhase = "stopped" | "recording" | "paused";
-
-/**
- * The pipeline that runs after a recording stops, orthogonal to `RecordingPhase`
- * (it is only ever non-null while stopped). `transcribing` flushes the last live
- * window; `refining` is the second pass re-reading the whole recording. They are
- * distinct because they take wildly different amounts of time -- a second or two
- * versus minutes -- and only the second one has progress to report.
- */
-export type ProcessingPhase = "transcribing" | "refining" | null;
-
-export type ModelStatus = "loading" | "ready" | "error";
+// Re-exported because this is where every consumer already imports them from.
+export {
+  selectCapabilities,
+  type RecordingPhase,
+  type ProcessingPhase,
+  type ModelStatus,
+  type Capabilities,
+  type CapabilityInputs,
+} from "./capabilities";
 
 export interface PlaybackState {
   recordingId: string | null;
@@ -84,6 +77,17 @@ export interface PlaybackState {
    * without the two ever being confused.
    */
   timelineOffsetSec: number;
+  /**
+   * Bumped by every explicit seek (`seekTo`, `skip`) -- never by the ordinary
+   * ticking of `currentTimeSec` during playback. `TranscriptPanel` watches
+   * this to jump the transcript to the seeked-to segment unconditionally,
+   * distinct from its "follow the playhead while playing" effect, which
+   * deliberately backs off once the user has scrolled away to read something
+   * else. An explicit seek -- the timeline slider, a segment's own timestamp,
+   * an audio-event block -- is a "take me there" action that should win over
+   * that escape hatch; a `currentTimeSec` change from a tick should not.
+   */
+  seekSeq: number;
 }
 
 const IDLE_PLAYBACK: PlaybackState = {
@@ -94,6 +98,7 @@ const IDLE_PLAYBACK: PlaybackState = {
   durationSec: 0,
   rate: 1,
   timelineOffsetSec: 0,
+  seekSeq: 0,
 };
 
 export interface AsrSettings {
@@ -202,6 +207,38 @@ function saveAudioEventSettings(settings: AudioEventSettings): void {
   savePersistedSettings(AUDIO_EVENT_SETTINGS_KEY, settings);
 }
 
+export interface RecordingModeSettings {
+  /**
+   * Record the audio and nothing else: no model load, no live transcription,
+   * no audio tagging. The WAV still lands on disk exactly as it always does,
+   * and the take shows up in history as an unanalyzed entry the user can
+   * transcribe later (`rerunHistoryEntry`, which loads the model on demand).
+   *
+   * Named for what it *does* rather than for its effect: "power saving"
+   * describes the outcome, but what the user needs to know before flipping it
+   * is that transcription will not run.
+   */
+  recordOnly: boolean;
+}
+
+const RECORDING_MODE_KEY = "recording-mode-settings";
+
+export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false };
+
+/** Same persistence shape as the settings above. Worth persisting because the
+ * whole point is that a session started in this mode never loads the model at
+ * all -- a setting that reset on launch would load it before the user could
+ * say otherwise, which is exactly the cost being avoided. */
+function loadRecordingMode(): RecordingModeSettings {
+  return loadPersistedSettings(RECORDING_MODE_KEY, DEFAULT_RECORDING_MODE, (parsed, d) => ({
+    recordOnly: typeof parsed.recordOnly === "boolean" ? parsed.recordOnly : d.recordOnly,
+  }));
+}
+
+function saveRecordingMode(settings: RecordingModeSettings): void {
+  savePersistedSettings(RECORDING_MODE_KEY, settings);
+}
+
 interface AppState {
   /** What the recorder is doing. The primary state everything else keys off. */
   recordingPhase: RecordingPhase;
@@ -240,6 +277,7 @@ interface AppState {
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
+  recordingMode: RecordingModeSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
    * ("マイク N") until the first successful getUserMedia call in this session. */
@@ -279,6 +317,11 @@ interface AppState {
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
+  /** Turning record-only *off* starts loading the model right away rather
+   * than waiting for the next record press: `startRecording` is gated on the
+   * model being ready outside this mode, so without it the button would sit
+   * disabled with nothing on screen explaining why. */
+  updateRecordingMode: (partial: Partial<RecordingModeSettings>) => void;
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
@@ -305,43 +348,19 @@ interface AppState {
 }
 
 /**
- * What the user may do right now, derived from the state axes above rather
- * than re-assembled per component. Every consumer reads these instead of
- * spelling out its own status comparison, so adding a phase cannot silently
- * leave one control behind -- which is exactly how the old flat enum let
- * `loadHistoryEntry` stay reachable mid-recording.
+ * `selectCapabilities` against the store's own shape, so the actions below
+ * don't each have to remember that `recordOnly` lives one level down inside
+ * `recordingMode`. Components build the argument themselves instead, because
+ * they subscribe to each field separately (a selector returning a fresh
+ * object would re-render on every store change).
  */
-export interface Capabilities {
-  startRecording: boolean;
-  pause: boolean;
-  resume: boolean;
-  stop: boolean;
-  browseHistory: boolean;
-  playback: boolean;
-  reanalyze: boolean;
-  /** Settings that feed the live pass must not change mid-take: the streaming
-   * transcriber re-reads `settings` on every window, so switching language
-   * while paused would silently decode the rest of the recording differently. */
-  editSettings: boolean;
-}
-
-export function selectCapabilities(s: {
-  recordingPhase: RecordingPhase;
-  processing: ProcessingPhase;
-  modelStatus: ModelStatus;
-}): Capabilities {
-  const stopped = s.recordingPhase === "stopped";
-  const idle = stopped && s.processing === null;
-  return {
-    startRecording: idle && s.modelStatus === "ready",
-    pause: s.recordingPhase === "recording",
-    resume: s.recordingPhase === "paused",
-    stop: !stopped,
-    browseHistory: stopped,
-    playback: stopped,
-    reanalyze: idle,
-    editSettings: stopped,
-  };
+function capabilitiesOf(s: Pick<AppState, "recordingPhase" | "processing" | "modelStatus" | "recordingMode">) {
+  return selectCapabilities({
+    recordingPhase: s.recordingPhase,
+    processing: s.processing,
+    modelStatus: s.modelStatus,
+    recordOnly: s.recordingMode.recordOnly,
+  });
 }
 
 let activeRecorder: PcmRecorderController | null = null;
@@ -360,6 +379,12 @@ let appAudioActive = false;
 // itself (it also has to stop counting samples -- see `setPaused`); this is
 // the app-audio half of the same gate.
 let recordingPaused = false;
+// `recordingMode.recordOnly` as it was when the current take started. The
+// setting is locked for the duration of a take anyway, but `stopRecording`
+// has to branch on the mode the take actually *ran* in -- reading the store
+// there would let a mode change land between start and stop and send a
+// record-only take down the refine path (or worse, the reverse).
+let recordingRecordOnly = false;
 // Monotonic segment id and the running timeline position where the *next*
 // recording's audio begins, so appended segments keep a continuous timeline.
 let nextSegmentId = 1;
@@ -586,6 +611,7 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
         await saveRecordingHistory(idFromWavPath(path), {
           durationSec: recordingDurationSec,
           language: settings.language,
+          transcribed: true,
           usedDiarize: diarizeSettings.enabled,
           usedVad: vadSettings.enabled,
           usedAudioEvents: audioEventSettings.enabled,
@@ -612,10 +638,86 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
   }
 }
 
+/**
+ * `refineRecording`'s record-only counterpart: close the WAV, make it playable,
+ * and file it in history -- with no transcription, diarization or audio
+ * tagging, none of which ran (and none of which could, since the model was
+ * never loaded).
+ *
+ * The sidecar is written even though it holds no segments. Without it the
+ * recording would be invisible: `listRecordings` enumerates sidecars, not
+ * WAVs, so a take with no JSON is a file the user can neither find nor ask to
+ * be transcribed later -- which is the whole promise of this mode.
+ *
+ * Failure is reported the same way every other post-stop failure is: a
+ * `refineNotice`, not an error. The WAV is valid on disk at every moment (see
+ * `wav::Writer`), so even a failure here costs only the history entry.
+ */
+async function finishRecordOnly(capture: RecordingCapture): Promise<void> {
+  const baseSec = recordingBaseSec;
+  try {
+    const { path, durationSec } = await capture.finish();
+    const id = idFromWavPath(path);
+    void useAppStore.getState().loadPlayback(id, path, baseSec);
+    await saveRecordingHistory(id, {
+      durationSec,
+      language: useAppStore.getState().settings.language,
+      transcribed: false,
+      // All three passes are part of the analysis this mode defers, so none of
+      // them describe this recording yet. They get their real values when the
+      // user runs `rerunHistoryEntry` on it.
+      usedDiarize: false,
+      usedVad: false,
+      usedAudioEvents: false,
+      segments: [],
+      audioEvents: [],
+    });
+    await useAppStore.getState().refreshRecordingHistory();
+  } catch (err) {
+    useAppStore.setState({
+      refineNotice: `録音の保存に失敗したため、履歴に残せませんでした: ${toErrorMessage(err)}`,
+    });
+  } finally {
+    useAppStore.setState({ processing: null });
+  }
+}
+
+/**
+ * Loads the model if it isn't loaded yet and resolves once it actually is.
+ *
+ * `asrClient.init()` only *starts* the load -- readiness arrives later on the
+ * `asr:model-ready` event (see client.ts), so awaiting it is not enough. This
+ * waits on the state that event drives instead.
+ *
+ * Resolves `false` rather than throwing when the model cannot be loaded: the
+ * one caller (`rerunHistoryEntry`) reports that as a notice next to a history
+ * entry that is still perfectly intact, not as a failure of the app.
+ */
+async function ensureModelReady(): Promise<boolean> {
+  const { modelStatus, initModel } = useAppStore.getState();
+  if (modelStatus === "ready") return true;
+  if (modelStatus === "error") return false;
+  if (modelStatus === "idle") void initModel();
+  return new Promise((resolve) => {
+    const unsubscribe = useAppStore.subscribe((s) => {
+      if (s.modelStatus === "ready") {
+        unsubscribe();
+        resolve(true);
+      } else if (s.modelStatus === "error") {
+        unsubscribe();
+        resolve(false);
+      }
+    });
+  });
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
   processing: null,
-  modelStatus: "loading",
+  // Not "loading": nothing is loading until something asks for it. Record-only
+  // mode never does, and starting in "loading" would put the blocking overlay
+  // on screen for a load that is never going to happen.
+  modelStatus: "idle",
   modelDevice: null,
   segments: [],
   audioEvents: [],
@@ -628,6 +730,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
   audioEventSettings: loadAudioEventSettings(),
+  recordingMode: loadRecordingMode(),
   levelMeter: null,
   audioInputDevices: [],
   appAudioApps: [],
@@ -635,6 +738,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   playback: IDLE_PLAYBACK,
 
   initModel: async () => {
+    // Only ever a no-op if the load already happened -- `asrClient.init()` is
+    // itself idempotent, so a second caller riding an in-flight load is fine.
+    if (get().modelStatus === "ready") return;
+    set({ modelStatus: "loading" });
     try {
       await asrClient.init();
     } catch (err) {
@@ -688,14 +795,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     // so doing it mid-take would leave the running recorder writing against
     // the history entry's offsets -- the transcript would then be truncated
     // at the wrong point when the take stops.
-    if (!selectCapabilities(get()).browseHistory) return;
+    if (!capabilitiesOf(get()).browseHistory) return;
     try {
       const entry = await loadRecording(id);
       // Replaces what's on screen the same way starting fresh does, except the
       // fresh state is the loaded history entry instead of an empty transcript.
-      // Continuing ids/timeline from the loaded entry (rather than resetting to
-      // zero) means a recording started right after viewing history appends
-      // after it instead of risking an id collision with it.
+      // These counters matter only while merely browsing -- if the user goes on
+      // to press record, `startRecording` resets them (and clears `segments`)
+      // to start a genuinely new session rather than appending after this entry.
       nextSegmentId = entry.segments.length + 1;
       timelineBaseSec = entry.durationSec;
       recordingBaseSec = entry.durationSec;
@@ -717,7 +824,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   deleteHistoryEntry: async (id) => {
-    if (!selectCapabilities(get()).browseHistory) return;
+    if (!capabilitiesOf(get()).browseHistory) return;
     try {
       await deleteRecording(id);
       if (get().playback.recordingId === id) get().unloadPlayback();
@@ -736,7 +843,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   rerunHistoryEntry: async (id) => {
-    if (!selectCapabilities(get()).reanalyze) return;
+    if (!capabilitiesOf(get()).reanalyze) return;
+
+    // The one place the model gets loaded on demand: in record-only mode this
+    // is the first time it is needed at all. A no-op once it is loaded, so the
+    // normal path is unaffected.
+    if (!(await ensureModelReady())) {
+      set({
+        refineNotice: `音声認識モデルを読み込めなかったため、解析できませんでした（録音はそのまま残っています）: ${
+          get().errorMessage ?? "原因不明"
+        }`,
+      });
+      return;
+    }
 
     const durationSec = get().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
     const path = await wavPath(id);
@@ -774,6 +893,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await saveRecordingHistory(id, {
         durationSec,
         language: settings.language,
+        transcribed: true,
         usedDiarize: diarizeSettings.enabled,
         usedVad: vadSettings.enabled,
         usedAudioEvents: audioEventSettings.enabled,
@@ -782,8 +902,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       await get().refreshRecordingHistory();
 
-      // Refresh what's on screen too, if this is the entry currently shown.
-      if (get().selectedHistoryId === id) {
+      // Refresh what's on screen too, if this is the recording currently
+      // shown. Deliberately `playback.recordingId`, not `selectedHistoryId`:
+      // a take just finished (record-only or not) loads its own playback via
+      // `loadPlayback` without ever setting `selectedHistoryId` -- that field
+      // means "browsing a *past* entry from the sidebar", which this isn't.
+      // Checking it here left the transcript panel stuck showing nothing
+      // (or stale content) after running 解析/詳細解析 on a take that had
+      // never been opened from history -- the primary way this feature is
+      // used in record-only mode, where it's the very first analysis pass.
+      if (get().playback.recordingId === id) {
         set({ segments: localSegments, audioEvents: newEvents });
       }
       if (notices.length > 0) {
@@ -832,11 +960,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     else playbackController.play();
   },
 
-  seekTo: (sec) => playbackController?.seekTo(sec),
+  // Bumps `seekSeq` so `TranscriptPanel` can jump to the seeked-to segment --
+  // see its doc comment. `playbackController.seekTo` already updates
+  // `currentTimeSec` synchronously (through its own `emit()`), so by the time
+  // this second `set` runs, `activeSegmentId` derived from it is already
+  // correct for whichever row the effect ends up scrolling to.
+  seekTo: (sec) => {
+    playbackController?.seekTo(sec);
+    set((s) => ({ playback: { ...s.playback, seekSeq: s.playback.seekSeq + 1 } }));
+  },
 
+  // Routed through `seekTo` itself (rather than calling
+  // `playbackController.seekTo` directly, as this used to) so a skip bumps
+  // `seekSeq` exactly like any other seek -- the ←/→ keys and the 10s buttons
+  // are just as much a "take me there" action as dragging the slider.
   skip: (deltaSec) => {
     const { currentTimeSec } = get().playback;
-    playbackController?.seekTo(currentTimeSec + deltaSec);
+    get().seekTo(currentTimeSec + deltaSec);
   },
 
   setPlaybackRate: (rate) => {
@@ -849,37 +989,52 @@ export const useAppStore = create<AppState>((set, get) => ({
     // `activeRecorder`/`activeStreamer`/`activeCapture` and orphan the running
     // one -- its frames would keep arriving forever, and `capture.start()`
     // would drop the old WAV writer out from under it.
-    if (!selectCapabilities(get()).startRecording) return;
+    if (!capabilitiesOf(get()).startRecording) return;
     // Whatever was loaded for playback (a past recording, or the previous
     // take) no longer corresponds to what's about to be on screen.
     get().unloadPlayback();
+    // Frozen for the whole take -- see `recordingRecordOnly`.
+    const recordOnly = get().recordingMode.recordOnly;
+    recordingRecordOnly = recordOnly;
     try {
       // Transcribe on the fly: the recorder streams PCM frames into the streaming
       // transcriber, which commits transcript segments while recording continues.
-      const streamer = new StreamingTranscriber(
-        (audio) => asrClient.transcribe(audio, get().settings),
-        appendStreamingSegment,
-      );
+      // Record-only mode is exactly the absence of this -- no streamer means no
+      // inference, which is the entire cost being avoided.
+      const streamer = recordOnly
+        ? null
+        : new StreamingTranscriber(
+            (audio) => asrClient.transcribe(audio, get().settings),
+            appendStreamingSegment,
+          );
 
       // Live audio-event preview, only when the feature is on -- see
       // events.rs's module doc for why this is a preview the post-hoc pass
-      // always overwrites, never the authoritative result.
+      // always overwrites, never the authoritative result. Also inference, so
+      // record-only mode skips it regardless of the setting; the post-hoc pass
+      // still produces the real events whenever the take is analyzed later.
       const audioEventSettings = get().audioEventSettings;
-      const eventStreamer = audioEventSettings.enabled
-        ? new AudioEventStreamer(
-            (audio, startSec) => asrClient.detectEventsWindow(audio, startSec, get().audioEventSettings),
-            appendLiveAudioEvents,
-          )
-        : null;
+      const eventStreamer =
+        !recordOnly && audioEventSettings.enabled
+          ? new AudioEventStreamer(
+              (audio, startSec) => asrClient.detectEventsWindow(audio, startSec, get().audioEventSettings),
+              appendLiveAudioEvents,
+            )
+          : null;
 
       // The same frames also go to disk, for the second pass after stop. If that
       // cannot be started, record anyway: a live-only transcript beats no
       // recording because the cache directory was not writable.
+      //
+      // Except in record-only mode, where the file *is* the entire output --
+      // continuing would produce a take that leaves nothing behind at all, so
+      // this becomes fatal and the catch below reports it instead.
       const capture = new RecordingCapture();
       let captureStarted = true;
       try {
         await capture.start();
       } catch (err) {
+        if (recordOnly) throw err;
         captureStarted = false;
         console.warn("[capture] disabled for this recording:", err);
       }
@@ -926,7 +1081,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
       const controller = await startPcmRecording((frame) => {
         const mixed = appAudioActive ? mixer.mix(frame) : frame;
-        streamer.pushFrame(mixed);
+        streamer?.pushFrame(mixed);
         eventStreamer?.pushFrame(mixed);
         if (captureStarted) capture.push(mixed);
       }, get().settings.inputDeviceId || undefined);
@@ -935,6 +1090,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeEventStreamer = eventStreamer;
       activeCapture = captureStarted ? capture : null;
       recordingPaused = false;
+      // A recording started while browsing a past entry begins a new,
+      // unrelated session, not a continuation of what's on screen -- without
+      // this, that entry's old transcript would keep sitting there (with the
+      // new take's segments silently appended after it, per its stale
+      // timeline) until the live pass produced its first result. The
+      // segments themselves are safe either way: they're already durable in
+      // that entry's own sidecar JSON, this only clears what's displayed.
+      if (get().selectedHistoryId !== null) {
+        nextSegmentId = 1;
+        timelineBaseSec = 0;
+        set({ segments: [], audioEvents: [] });
+      }
       recordingBaseSec = timelineBaseSec;
       segmentsBeforeRecording = get().segments.length;
       const levelMeter = createAudioLevelMeter(controller.stream);
@@ -965,6 +1132,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeEventStreamer = null;
       activeCapture = null;
       recordingPaused = false;
+      recordingRecordOnly = false;
       if (appAudioActive) {
         appAudioActive = false;
         void appAudioClient.stopCapture();
@@ -974,7 +1142,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   pauseRecording: async () => {
-    if (!selectCapabilities(get()).pause) return;
+    if (!capabilitiesOf(get()).pause) return;
     const streamer = activeStreamer;
     recordingPaused = true;
     activeRecorder?.setPaused(true);
@@ -998,7 +1166,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   resumeRecording: () => {
-    if (!selectCapabilities(get()).resume) return;
+    if (!capabilitiesOf(get()).resume) return;
     // Nothing to drain: both callbacks were gated for the whole pause, so the
     // mixer's queue is exactly where it was and mic/app audio line back up.
     recordingPaused = false;
@@ -1011,23 +1179,33 @@ export const useAppStore = create<AppState>((set, get) => ({
     const streamer = activeStreamer;
     const eventStreamer = activeEventStreamer;
     const capture = activeCapture;
-    if (!controller || !streamer) return;
+    // Not `|| !streamer`: a record-only take never had one.
+    if (!controller) return;
+    const recordOnly = recordingRecordOnly;
     activeRecorder = null;
     activeStreamer = null;
     activeEventStreamer = null;
     activeCapture = null;
     recordingPaused = false;
+    recordingRecordOnly = false;
     get().levelMeter?.dispose();
     if (appAudioActive) {
       appAudioActive = false;
       await appAudioClient.stopCapture();
     }
-    set({ recordingPhase: "stopped", processing: "transcribing", levelMeter: null });
+    // "saving" rather than "transcribing" for a record-only take: there is no
+    // live window to flush, only the WAV to close and its sidecar to write.
+    // Still non-null, so the guard below on starting a new take still holds.
+    set({
+      recordingPhase: "stopped",
+      processing: recordOnly ? "saving" : "transcribing",
+      levelMeter: null,
+    });
 
     try {
       const totalSamples = await controller.stop();
       // Flush any audio not yet committed by the streaming pass.
-      await streamer.finish();
+      await streamer?.finish();
       // Best-effort: a live preview window failing to flush must never hold
       // up the recording finishing, or (worse) block the post-hoc pass that
       // is about to supersede it anyway.
@@ -1050,8 +1228,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Then re-read the whole recording for accuracy, replacing what the live
     // windows produced. Runs after the live result is already on screen, so the
-    // user has a transcript throughout.
-    if (capture) await refineRecording(capture);
+    // user has a transcript throughout. A record-only take has nothing to
+    // replace and no model loaded to do it with, so it only gets filed away.
+    if (capture) {
+      if (recordOnly) await finishRecordOnly(capture);
+      else await refineRecording(capture);
+    }
   },
 
   updateSettings: (partial) =>
@@ -1081,6 +1263,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveAudioEventSettings(audioEventSettings);
       return { audioEventSettings };
     }),
+
+  updateRecordingMode: (partial) => {
+    const recordingMode = { ...get().recordingMode, ...partial };
+    saveRecordingMode(recordingMode);
+    set({ recordingMode });
+    // Leaving record-only mode means the next take needs the model, and
+    // `startRecording` will not enable itself until it is there. Kick the load
+    // off now so the wait happens while the user is still setting up rather
+    // than when they press record. Failures surface through `modelStatus`
+    // exactly as the startup load's do.
+    if (!recordingMode.recordOnly) void ensureModelReady();
+  },
 
 }));
 

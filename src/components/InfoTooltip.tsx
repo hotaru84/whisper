@@ -5,8 +5,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 /**
  * A small (i) glyph that reveals explanatory copy on hover/focus. Originally
  * local to `SettingsPanel` (every threshold/switch there needs one); shared
- * here so panels outside settings -- e.g. `AudioEventPanel`'s idle-state
- * explanation -- can use the same affordance instead of re-implementing it.
+ * here so panels outside settings can use the same affordance instead of
+ * re-implementing it.
  */
 export function InfoTooltip({ children }: { children: ReactNode }) {
   return (

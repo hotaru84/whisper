@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Copy, Download, Check, Trash2, RotateCw } from "lucide-react";
+import {
+  ChevronDown,
+  Copy,
+  Download,
+  Check,
+  Trash2,
+  RotateCw,
+} from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { ScrollArea } from "./ui/scroll-area";
@@ -49,7 +56,9 @@ function SegmentRow({
 }) {
   const hasSpeaker = typeof segment.speaker === "number";
   const strokeStyle = hasSpeaker
-    ? { borderLeftColor: `var(--chart-${(segment.speaker as number) % 5 + 1})` }
+    ? {
+        borderLeftColor: `var(--chart-${((segment.speaker as number) % 5) + 1})`,
+      }
     : undefined;
 
   // A drag-selection ending on this text must not also fire a seek -- text is
@@ -71,14 +80,22 @@ function SegmentRow({
       )}
       style={strokeStyle}
     >
-      <TimeRangeChip start={segment.startOffsetSec} onClick={onSeek} title={onSeek && "この位置から再生"} className="w-14 pt-0.5" />
+      <TimeRangeChip
+        start={segment.startOffsetSec}
+        onClick={onSeek}
+        title={onSeek && "この位置から再生"}
+        className="w-14 pt-0.5"
+      />
       {hasSpeaker && (
         <Badge variant="outline" className="mt-0.5 shrink-0">
           話者{(segment.speaker as number) + 1}
         </Badge>
       )}
       <p
-        className={cn("flex-1 whitespace-pre-wrap text-sm text-foreground", onSeek && "cursor-pointer")}
+        className={cn(
+          "flex-1 whitespace-pre-wrap text-sm text-foreground",
+          onSeek && "cursor-pointer",
+        )}
         onClick={handleTextClick}
       >
         {segment.text}
@@ -96,9 +113,17 @@ function SegmentRow({
  * transcript used to have none of: previously the gap was simply silent,
  * with no indication a chunk had been dropped at all.
  */
-function ExcludedGapRow({ segment, onSeek }: { segment: TranscriptSegment; onSeek?: () => void }) {
+function ExcludedGapRow({
+  segment,
+  onSeek,
+}: {
+  segment: TranscriptSegment;
+  onSeek?: () => void;
+}) {
   const duration = segment.chunks[0]?.timestamp[1] ?? 0;
-  const label = segment.excludedReason ? audioEventLabelJa(segment.excludedReason) : "非会話と判定";
+  const label = segment.excludedReason
+    ? audioEventLabelJa(segment.excludedReason)
+    : "非会話と判定";
 
   const pillClass = cn(
     "flex items-center gap-1.5 rounded-full border border-dashed border-border px-2.5 py-0.5 text-xs text-muted-foreground",
@@ -107,7 +132,10 @@ function ExcludedGapRow({ segment, onSeek }: { segment: TranscriptSegment; onSee
   const content = (
     <>
       <span aria-hidden="true">⋯ 除外区間</span>
-      <TimeRangeChip start={segment.startOffsetSec} end={segment.startOffsetSec + duration} />
+      <TimeRangeChip
+        start={segment.startOffsetSec}
+        end={segment.startOffsetSec + duration}
+      />
       <span>{label}</span>
     </>
   );
@@ -115,7 +143,12 @@ function ExcludedGapRow({ segment, onSeek }: { segment: TranscriptSegment; onSee
   return (
     <div className="flex justify-center py-1">
       {onSeek ? (
-        <button type="button" onClick={onSeek} title="この位置から再生" className={pillClass}>
+        <button
+          type="button"
+          onClick={onSeek}
+          title="この位置から再生"
+          className={pillClass}
+        >
           {content}
         </button>
       ) : (
@@ -146,7 +179,11 @@ function PendingRow() {
  * the same workaround this component's auto-scroll and its "resume at
  * bottom" detection both need. */
 function getViewport(container: HTMLDivElement | null): HTMLElement | null {
-  return container?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null;
+  return (
+    container?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    ) ?? null
+  );
 }
 
 export function TranscriptPanel() {
@@ -166,9 +203,17 @@ export function TranscriptPanel() {
   const activeRowRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const prevPhaseRef = useRef(recordingPhase);
-  const can = selectCapabilities({ recordingPhase, processing, modelStatus });
+  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const can = selectCapabilities({
+    recordingPhase,
+    processing,
+    modelStatus,
+    recordOnly,
+  });
 
-  const viewingHistory = recordingHistory.find((r) => r.id === selectedHistoryId);
+  const viewingHistory = recordingHistory.find(
+    (r) => r.id === selectedHistoryId,
+  );
   // Whatever recording is currently loaded for playback -- set both when
   // browsing a history entry and right after a live recording's second pass
   // finishes (see `refineRecording`'s `loadPlayback` call), so this reanalyze
@@ -192,14 +237,17 @@ export function TranscriptPanel() {
     segment.startOffsetSec >= playback.timelineOffsetSec &&
     segment.startOffsetSec <= playback.timelineOffsetSec + playback.durationSec;
 
-  const globalPlaybackTimeSec = playbackLoaded ? playback.timelineOffsetSec + playback.currentTimeSec : null;
+  const globalPlaybackTimeSec = playbackLoaded
+    ? playback.timelineOffsetSec + playback.currentTimeSec
+    : null;
   // The last segment starting at or before the playhead, among the ones the
   // loaded recording actually covers -- segments are always appended in
   // ascending time order, so a linear scan doubles as "latest match".
   let activeSegmentId: number | null = null;
   if (globalPlaybackTimeSec != null) {
     for (const seg of segments) {
-      if (isSeekable(seg) && seg.startOffsetSec <= globalPlaybackTimeSec) activeSegmentId = seg.id;
+      if (isSeekable(seg) && seg.startOffsetSec <= globalPlaybackTimeSec)
+        activeSegmentId = seg.id;
     }
   }
 
@@ -222,7 +270,8 @@ export function TranscriptPanel() {
     const viewport = getViewport(scrollContainerRef.current);
     if (!viewport) return;
     const onScroll = () => {
-      const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      const distanceFromBottom =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
       setAutoScroll(distanceFromBottom < AUTO_SCROLL_THRESHOLD_PX);
     };
     viewport.addEventListener("scroll", onScroll);
@@ -244,6 +293,22 @@ export function TranscriptPanel() {
     activeRowRef.current?.scrollIntoView({ block: "nearest" });
   }, [activeSegmentId, playback.isPlaying, autoScroll]);
 
+  // Jump to the seeked-to segment unconditionally -- unlike the
+  // playhead-follow effect above, this ignores both `autoScroll` and
+  // `isPlaying`. Dragging the timeline slider, clicking a segment's own
+  // timestamp, or clicking an audio-event block (`RecordingTimeline`) are all
+  // explicit "take me there" actions, not the passive tail-following that
+  // escape hatch exists for -- see `PlaybackState.seekSeq`'s doc comment.
+  // Keyed off the seq rather than `activeSegmentId` alone so re-seeking to a
+  // point inside the *same* segment (which doesn't change `activeSegmentId`)
+  // still re-centers it.
+  const lastSeekSeqRef = useRef(playback.seekSeq);
+  useEffect(() => {
+    if (playback.seekSeq === lastSeekSeqRef.current) return;
+    lastSeekSeqRef.current = playback.seekSeq;
+    activeRowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [playback.seekSeq]);
+
   const jumpToLatest = () => {
     setAutoScroll(true);
     const viewport = getViewport(scrollContainerRef.current);
@@ -263,12 +328,21 @@ export function TranscriptPanel() {
   };
 
   return (
-    <div className="flex w-full flex-1 flex-col gap-3">
+    <div className="flex w-full flex-1 flex-col gap-3 rounded-lg border border-border p-4">
       <div className="flex justify-end gap-2">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button type="button" variant="outline" size="sm" disabled={!hasTranscript}>
-              {copied ? <Check className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!hasTranscript}
+            >
+              {copied ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
               コピー・保存
               <ChevronDown className="h-3.5 w-3.5" />
             </Button>
@@ -298,7 +372,7 @@ export function TranscriptPanel() {
             title="現在の設定（話者分離・VAD・音響イベント）でこの録音を詳しく解析し直し、履歴を上書きします"
           >
             <RotateCw className="h-4 w-4" />
-            詳細解析
+            再解析
           </Button>
         )}
         {viewingHistory && (
@@ -320,7 +394,8 @@ export function TranscriptPanel() {
         <p className="text-xs text-muted-foreground">
           履歴を表示中 —{" "}
           <span className="font-mono">
-            {viewingHistory.createdAt.getFullYear()}-{String(viewingHistory.createdAt.getMonth() + 1).padStart(2, "0")}-
+            {viewingHistory.createdAt.getFullYear()}-
+            {String(viewingHistory.createdAt.getMonth() + 1).padStart(2, "0")}-
             {String(viewingHistory.createdAt.getDate()).padStart(2, "0")}{" "}
             {String(viewingHistory.createdAt.getHours()).padStart(2, "0")}:
             {String(viewingHistory.createdAt.getMinutes()).padStart(2, "0")}
@@ -352,10 +427,17 @@ export function TranscriptPanel() {
             <div className="flex flex-col gap-0.5 p-3">
               {segments.map((seg) => {
                 const onSeek = isSeekable(seg)
-                  ? () => seekTo(seg.startOffsetSec - playback.timelineOffsetSec)
+                  ? () =>
+                      seekTo(seg.startOffsetSec - playback.timelineOffsetSec)
                   : undefined;
                 if (seg.text.trim() === "") {
-                  return <ExcludedGapRow key={seg.id} segment={seg} onSeek={onSeek} />;
+                  return (
+                    <ExcludedGapRow
+                      key={seg.id}
+                      segment={seg}
+                      onSeek={onSeek}
+                    />
+                  );
                 }
                 const active = seg.id === activeSegmentId;
                 return (
@@ -364,7 +446,13 @@ export function TranscriptPanel() {
                     segment={seg}
                     active={active}
                     onSeek={onSeek}
-                    rowRef={active ? (el) => { activeRowRef.current = el; } : undefined}
+                    rowRef={
+                      active
+                        ? (el) => {
+                            activeRowRef.current = el;
+                          }
+                        : undefined
+                    }
                   />
                 );
               })}

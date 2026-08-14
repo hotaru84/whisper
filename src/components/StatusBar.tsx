@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Moon, Sun, MonitorCog, Cpu, Zap, Mic, Cast } from "lucide-react";
+import { Moon, Sun, MonitorCog, Cpu, Zap, Mic, Cast, FileAudio } from "lucide-react";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { SettingsDialog } from "./SettingsDialog";
@@ -74,10 +74,17 @@ function InputControls() {
   const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
   const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
-  // Both pickers only take effect at `startRecording`, so leaving them live
-  // mid-take would let the user change a setting that silently does nothing
-  // until the next recording.
+  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const updateRecordingMode = useAppStore((s) => s.updateRecordingMode);
+  const processing = useAppStore((s) => s.processing);
+  // All three controls only take effect at `startRecording`, so leaving them
+  // live mid-take would let the user change a setting that silently does
+  // nothing until the next recording.
   const locked = useAppStore((s) => s.recordingPhase) !== "stopped";
+  // The mode toggle is held for longer than the pickers: flipping it *off*
+  // starts loading the model, which would then contend with a post-stop pass
+  // that is still running.
+  const modeLocked = locked || processing !== null;
 
   return (
     <div className="flex items-center gap-1">
@@ -128,6 +135,24 @@ function InputControls() {
           ))}
         </SelectContent>
       </Select>
+
+      {/* Labelled, not icon-only, unlike everything else on this strip: the
+          mic and app pickers show their own current value, but this one's
+          effect is an *absence* (no live transcript appears) that no icon
+          conveys on its own. The tooltip carries the why; the label carries
+          the what. */}
+      <Button
+        type="button"
+        variant={recordOnly ? "secondary" : "ghost"}
+        size="sm"
+        disabled={modeLocked}
+        aria-pressed={recordOnly}
+        title="録音のみ：文字起こしはあとでまとめて実行します。録音中は GPU を使わないためバッテリーが長持ちします。"
+        onClick={() => updateRecordingMode({ recordOnly: !recordOnly })}
+      >
+        <FileAudio className="h-3.5 w-3.5" />
+        録音のみ
+      </Button>
     </div>
   );
 }
@@ -146,13 +171,18 @@ export function StatusBar() {
   const modelStatus = useAppStore((s) => s.modelStatus);
   const modelDevice = useAppStore((s) => s.modelDevice);
   const refineProgress = useAppStore((s) => s.refineProgress);
+  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
   const preference = useThemeStore((s) => s.preference);
   const setPreference = useThemeStore((s) => s.setPreference);
   const elapsed = useElapsedRecordingSec(recordingPhase);
 
-  // One slot, four mutually exclusive occupants: the take's own state wins
-  // while one exists, then the post-stop pipeline, then the idle device chip.
-  const showDeviceChip = recordingPhase === "stopped" && processing === null && modelStatus === "ready" && modelDevice;
+  // One slot, five mutually exclusive occupants: the take's own state wins
+  // while one exists, then the post-stop pipeline, then the idle chip -- which
+  // is the mode chip in record-only mode and the device chip otherwise. The
+  // two can't collide: record-only mode never loads a model, so
+  // `showDeviceChip`'s "ready" requirement already fails there.
+  const idleChip = recordingPhase === "stopped" && processing === null;
+  const showDeviceChip = idleChip && modelStatus === "ready" && modelDevice;
 
   return (
     <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-2 text-sm">
@@ -176,13 +206,20 @@ export function StatusBar() {
           </span>
         )}
         {processing === "transcribing" && <span className="text-muted-foreground">文字起こし処理中…</span>}
+        {processing === "saving" && <span className="text-muted-foreground">録音を保存中…</span>}
         {processing === "refining" && (
           <span className="flex items-center gap-1.5 text-muted-foreground">
             精度向上パス実行中…
             <span className="font-mono tabular-nums">{Math.round(refineProgress ?? 0)}%</span>
           </span>
         )}
-        {showDeviceChip && (
+        {idleChip && recordOnly && (
+          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            <FileAudio className="h-3 w-3" />
+            録音のみ（文字起こしはあとで）
+          </span>
+        )}
+        {showDeviceChip && !recordOnly && (
           <span className="flex items-center gap-1 text-xs text-muted-foreground">
             {modelDevice === "vulkan" ? <Zap className="h-3 w-3" /> : <Cpu className="h-3 w-3" />}
             {modelDevice === "vulkan" ? "Vulkan (GPU)" : "CPU"}

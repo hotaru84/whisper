@@ -24,6 +24,15 @@ export interface RecordingHistoryMeta {
   createdAt: Date;
   durationSec: number;
   language: string;
+  /**
+   * Whether this recording has been through the transcription pass at all.
+   * `false` for takes made in record-only mode (see `finishRecordOnly` in
+   * `appStore.ts`), whose sidecar exists only so the WAV is browsable and
+   * re-analyzable -- its `segments` are empty and its `preview` is blank.
+   * Everything else about the entry is real, so the sidebar renders it as a
+   * normal row with an "unanalyzed" badge rather than hiding it.
+   */
+  transcribed: boolean;
   usedDiarize: boolean;
   usedVad: boolean;
   usedAudioEvents: boolean;
@@ -42,6 +51,13 @@ export interface RecordingHistoryEntry extends RecordingHistoryMeta {
 interface StoredRecording {
   durationSec: number;
   language: string;
+  /**
+   * Optional on disk, required in memory: every sidecar written before
+   * record-only mode existed came from the transcription pass, so a missing
+   * field means `true`. Reading it as `stored.transcribed ?? true` is what
+   * keeps those older recordings from all showing up as "unanalyzed".
+   */
+  transcribed?: boolean;
   usedDiarize: boolean;
   usedVad: boolean;
   usedAudioEvents: boolean;
@@ -104,6 +120,7 @@ export async function saveRecordingHistory(
   const stored: StoredRecording = {
     durationSec: entry.durationSec,
     language: entry.language,
+    transcribed: entry.transcribed,
     usedDiarize: entry.usedDiarize,
     usedVad: entry.usedVad,
     usedAudioEvents: entry.usedAudioEvents,
@@ -143,6 +160,7 @@ export async function listRecordings(): Promise<RecordingHistoryMeta[]> {
         createdAt,
         durationSec: stored.durationSec,
         language: stored.language,
+        transcribed: stored.transcribed ?? true,
         usedDiarize: stored.usedDiarize,
         usedVad: stored.usedVad,
         usedAudioEvents: stored.usedAudioEvents,
@@ -167,6 +185,7 @@ export async function loadRecording(id: string): Promise<RecordingHistoryEntry> 
     createdAt,
     durationSec: stored.durationSec,
     language: stored.language,
+    transcribed: stored.transcribed ?? true,
     usedDiarize: stored.usedDiarize,
     usedVad: stored.usedVad,
     usedAudioEvents: stored.usedAudioEvents,

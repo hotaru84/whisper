@@ -3,7 +3,7 @@
  * for why body/label text is left to the system's own Japanese UI fonts
  * instead. JetBrains Mono is OFL-1.1 licensed (bundling is fine) and reserved
  * for numerals: thresholds, seconds, percentages, speaker counts, and the
- * timestamps in AudioEventPanel. Self-hosted via @fontsource so it works
+ * timestamps. Self-hosted via @fontsource so it works
  * fully offline, matching this app's CSP (no external font requests).
  */
 @import "@fontsource-variable/jetbrains-mono";

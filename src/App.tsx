@@ -6,7 +6,7 @@ import { ModelLoadingOverlay } from "./components/ModelLoadingOverlay";
 import { RecordButton } from "./components/RecordButton";
 import { LevelMeter } from "./components/LevelMeter";
 import { RecordingTimeline } from "./components/RecordingTimeline";
-import { TranscriptTabs } from "./components/TranscriptTabs";
+import { TranscriptPanel } from "./components/TranscriptPanel";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useAppStore, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
 
@@ -83,7 +83,12 @@ function App() {
   const { width: sidebarWidth, onDragHandleDown } = useSidebarWidth();
 
   useEffect(() => {
-    void initModel();
+    // Skipped entirely in record-only mode -- loading the model is the cost
+    // that mode exists to avoid, and nothing in a record-only session needs
+    // it. `rerunHistoryEntry` loads it on demand if the user asks for an
+    // analysis later, and leaving the mode loads it right away
+    // (`updateRecordingMode`).
+    if (!useAppStore.getState().recordingMode.recordOnly) void initModel();
     // Listable (with placeholder labels) even before microphone permission is
     // granted, so the settings dropdown isn't empty on a first visit.
     void refreshAudioInputDevices();
@@ -135,7 +140,7 @@ function App() {
             </div>
 
             <RecordingTimeline />
-            <TranscriptTabs />
+            <TranscriptPanel />
           </main>
         </div>
       </div>
