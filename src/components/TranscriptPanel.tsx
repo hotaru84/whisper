@@ -167,6 +167,11 @@ export function TranscriptPanel() {
   const prevStatusRef = useRef(recordingStatus);
 
   const viewingHistory = recordingHistory.find((r) => r.id === selectedHistoryId);
+  // Whatever recording is currently loaded for playback -- set both when
+  // browsing a history entry and right after a live recording's second pass
+  // finishes (see `refineRecording`'s `loadPlayback` call), so this reanalyze
+  // button is not gated on having gone through the history sidebar first.
+  const currentRecordingId = playback.recordingId;
 
   const hasTranscript = segments.length > 0;
   const text = combinedText(segments);
@@ -281,17 +286,17 @@ export function TranscriptPanel() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          {viewingHistory && (
+          {currentRecordingId && (
             <Button
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => void rerunHistoryEntry(viewingHistory.id)}
+              onClick={() => void rerunHistoryEntry(currentRecordingId)}
               disabled={busy}
-              title="現在の設定（話者分離・VAD・音響イベント）でこの録音を再処理し、履歴を上書きします"
+              title="現在の設定（話者分離・VAD・音響イベント）でこの録音のパス2（精度向上パス）を再分析し、履歴を上書きします"
             >
               <RotateCw className="h-4 w-4" />
-              再実行
+              パス2を再分析
             </Button>
           )}
           <Button
