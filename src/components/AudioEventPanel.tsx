@@ -22,7 +22,8 @@ import { AUDIO_EVENT_CATEGORY_ICON } from "../lib/audioEventIcons";
 export function AudioEventPanel() {
   const audioEvents = useAppStore((s) => s.audioEvents);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
   const segments = useAppStore((s) => s.segments);
 
   const hasEvents = audioEvents.length > 0;
@@ -56,9 +57,11 @@ export function AudioEventPanel() {
             })}
           </ul>
         </ScrollArea>
-      ) : recordingStatus === "recording" || recordingStatus === "processing" ? (
+      ) : recordingPhase === "recording" ? (
         <p className="text-xs text-muted-foreground">検出中…（10秒ごとに結果が追加されます）</p>
-      ) : recordingStatus === "refining" ? (
+      ) : recordingPhase === "paused" ? (
+        <p className="text-xs text-muted-foreground">一時停止中です。再開すると検出を続けます。</p>
+      ) : processing !== null ? (
         <p className="text-xs text-muted-foreground">精度向上パスを実行中です…</p>
       ) : segments.length > 0 ? (
         <p className="text-xs text-muted-foreground">このパスでは音響イベントは検出されませんでした。</p>

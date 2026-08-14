@@ -14,6 +14,7 @@ import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
 import { formatTimestamp } from "../lib/format";
+import { cn } from "../lib/utils";
 
 function formatDateTime(date: Date): { day: string; time: string } {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -57,6 +58,10 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
+  // Opening an entry replaces the on-screen transcript and every timeline
+  // counter, so it is a stopped-only action -- the store enforces this too,
+  // but a dead-looking click is worse than a disabled control.
+  const browsable = useAppStore((s) => s.recordingPhase) === "stopped";
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
@@ -64,13 +69,18 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
 
   return (
     <div
-      className={
-        selected
-          ? "group flex flex-col gap-1 rounded-md bg-accent p-2 text-sm"
-          : "group flex flex-col gap-1 rounded-md p-2 text-sm hover:bg-accent/60"
-      }
+      className={cn(
+        "group flex flex-col gap-1 rounded-md p-2 text-sm",
+        selected ? "bg-accent" : browsable && "hover:bg-accent/60",
+        !browsable && "opacity-50",
+      )}
     >
-      <button type="button" className="flex flex-col gap-1 text-left" onClick={() => void loadHistoryEntry(meta.id)}>
+      <button
+        type="button"
+        className="flex flex-col gap-1 text-left"
+        disabled={!browsable}
+        onClick={() => void loadHistoryEntry(meta.id)}
+      >
         <div className="flex items-center justify-between gap-2">
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {day} {time}
@@ -117,6 +127,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           size="sm"
           className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 data-[confirming=true]:opacity-100"
           data-confirming={confirmingDelete}
+          disabled={!browsable}
           onClick={(e) => {
             e.stopPropagation();
             if (!confirmingDelete) {

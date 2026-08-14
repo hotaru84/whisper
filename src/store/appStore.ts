@@ -43,12 +43,25 @@ import type {
 } from "../lib/audio";
 
 /**
- * `processing` flushes the last live window; `refining` is the second pass
- * re-reading the whole recording. They are distinct because they take wildly
- * different amounts of time -- a second or two versus minutes -- and only the
- * second one has progress to report.
+ * What the recorder itself is doing -- the app's primary, user-visible state.
+ *
+ * Deliberately only three values, with the post-stop pipeline (`ProcessingPhase`)
+ * and failures (`errorMessage`) kept on their own axes. Folding all three into
+ * one enum, as this used to, meant every consumer had to re-derive "is a take
+ * in progress" from a different subset of values, and adding a state silently
+ * fell through every `===` chain that did not list it.
  */
-export type RecordingStatus = "idle" | "recording" | "processing" | "refining" | "done" | "error";
+export type RecordingPhase = "stopped" | "recording" | "paused";
+
+/**
+ * The pipeline that runs after a recording stops, orthogonal to `RecordingPhase`
+ * (it is only ever non-null while stopped). `transcribing` flushes the last live
+ * window; `refining` is the second pass re-reading the whole recording. They are
+ * distinct because they take wildly different amounts of time -- a second or two
+ * versus minutes -- and only the second one has progress to report.
+ */
+export type ProcessingPhase = "transcribing" | "refining" | null;
+
 export type ModelStatus = "loading" | "ready" | "error";
 
 export interface PlaybackState {
@@ -213,10 +226,13 @@ function saveAudioEventSettings(settings: AudioEventSettings): void {
 }
 
 interface AppState {
-  recordingStatus: RecordingStatus;
+  /** What the recorder is doing. The primary state everything else keys off. */
+  recordingPhase: RecordingPhase;
+  /** The post-stop pipeline, orthogonal to `recordingPhase`. */
+  processing: ProcessingPhase;
   modelStatus: ModelStatus;
   modelDevice: AsrDevice | null;
-  /** Accumulated transcript. Grows across start/stop cycles; cleared via clearTranscript(). */
+  /** Accumulated transcript. Grows across start/stop cycles. */
   segments: TranscriptSegment[];
   /**
    * Accumulated audio-tagging events, on the same global timeline as
@@ -241,7 +257,7 @@ interface AppState {
    * transcript, it just did not get the accuracy pass.
    */
   refineNotice: string | null;
-  /** 0-100 while `recordingStatus` is "refining", otherwise null. */
+  /** 0-100 while `processing` is "refining", otherwise null. */
   refineProgress: number | null;
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
@@ -272,8 +288,16 @@ interface AppState {
 
   initModel: () => Promise<void>;
   startRecording: () => Promise<void>;
+  /** Ends the take for good: flushes the live pass, closes the WAV, and kicks
+   * off the accuracy pass. Callable from both "recording" and "paused". */
   stopRecording: () => Promise<void>;
-  cancelRecording: () => void;
+  /** Suspends capture without ending the take. Audio stops being collected
+   * entirely (rather than being recorded as silence), so the paused span is
+   * simply absent from the recording -- see `setPaused`'s doc comment in
+   * `pcmRecorder.ts`. Also flushes the live transcriber so what the user has
+   * said so far is fully on screen while they are stopped. */
+  pauseRecording: () => Promise<void>;
+  resumeRecording: () => void;
   updateSettings: (partial: Partial<AsrSettings>) => void;
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
@@ -288,9 +312,8 @@ interface AppState {
    * whatever is currently enabled in settings) against a past recording's
    * WAV and overwrites its history entry -- e.g. after turning on
    * diarization or changing its threshold and wanting this recording
-   * relabeled with it. Reuses `recordingStatus: "refining"` and
-   * `refineProgress`, so the same progress UI `refineRecording` drives
-   * applies here too. */
+   * relabeled with it. Reuses `processing: "refining"` and `refineProgress`,
+   * so the same progress UI `refineRecording` drives applies here too. */
   rerunHistoryEntry: (id: string) => Promise<void>;
   /** Loads `path`'s audio for playback, tagged with `recordingId` so the UI
    * can tell it apart from whatever was loaded before. Replaces (and
@@ -302,8 +325,46 @@ interface AppState {
   seekTo: (sec: number) => void;
   skip: (deltaSec: number) => void;
   setPlaybackRate: (rate: number) => void;
-  clearTranscript: () => void;
-  reset: () => void;
+}
+
+/**
+ * What the user may do right now, derived from the state axes above rather
+ * than re-assembled per component. Every consumer reads these instead of
+ * spelling out its own status comparison, so adding a phase cannot silently
+ * leave one control behind -- which is exactly how the old flat enum let
+ * `loadHistoryEntry` stay reachable mid-recording.
+ */
+export interface Capabilities {
+  startRecording: boolean;
+  pause: boolean;
+  resume: boolean;
+  stop: boolean;
+  browseHistory: boolean;
+  playback: boolean;
+  reanalyze: boolean;
+  /** Settings that feed the live pass must not change mid-take: the streaming
+   * transcriber re-reads `settings` on every window, so switching language
+   * while paused would silently decode the rest of the recording differently. */
+  editSettings: boolean;
+}
+
+export function selectCapabilities(s: {
+  recordingPhase: RecordingPhase;
+  processing: ProcessingPhase;
+  modelStatus: ModelStatus;
+}): Capabilities {
+  const stopped = s.recordingPhase === "stopped";
+  const idle = stopped && s.processing === null;
+  return {
+    startRecording: idle && s.modelStatus === "ready",
+    pause: s.recordingPhase === "recording",
+    resume: s.recordingPhase === "paused",
+    stop: !stopped,
+    browseHistory: stopped,
+    playback: stopped,
+    reanalyze: idle,
+    editSettings: stopped,
+  };
 }
 
 let activeRecorder: PcmRecorderController | null = null;
@@ -317,6 +378,11 @@ let activeEventStreamer: AudioEventStreamer | null = null;
 // startRecording's frame callback knows whether to mix or pass mic frames
 // through untouched.
 let appAudioActive = false;
+// Mirrors `recordingPhase === "paused"` for the audio callbacks, which run far
+// too often to read the store. The mic side is gated inside the recorder
+// itself (it also has to stop counting samples -- see `setPaused`); this is
+// the app-audio half of the same gate.
+let recordingPaused = false;
 // Monotonic segment id and the running timeline position where the *next*
 // recording's audio begins, so appended segments keep a continuous timeline.
 let nextSegmentId = 1;
@@ -472,7 +538,11 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
     path = info.path;
     recordingDurationSec = info.durationSec;
   } catch (err) {
+    // `stopRecording` handed over still in a processing phase (so the gap
+    // before "refining" could not be mistaken for idle), so this bail-out has
+    // to be the one to clear it.
     useAppStore.setState({
+      processing: null,
       refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
     return;
@@ -486,7 +556,7 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
   // always 0-based, only the segments referring to it are shifted.
   void useAppStore.getState().loadPlayback(idFromWavPath(path), path, baseSec);
 
-  useAppStore.setState({ recordingStatus: "refining", refineProgress: 0 });
+  useAppStore.setState({ processing: "refining", refineProgress: 0 });
   try {
     const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
     const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
@@ -561,12 +631,13 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
       refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
   } finally {
-    useAppStore.setState({ recordingStatus: "done", refineProgress: null });
+    useAppStore.setState({ processing: null, refineProgress: null });
   }
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
-  recordingStatus: "idle",
+  recordingPhase: "stopped",
+  processing: null,
   modelStatus: "loading",
   modelDevice: null,
   segments: [],
@@ -636,14 +707,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   loadHistoryEntry: async (id) => {
+    // Loading an entry rewrites `segments` and every timeline counter below,
+    // so doing it mid-take would leave the running recorder writing against
+    // the history entry's offsets -- the transcript would then be truncated
+    // at the wrong point when the take stops.
+    if (!selectCapabilities(get()).browseHistory) return;
     try {
       const entry = await loadRecording(id);
-      // Mirrors clearTranscript's counter reset: this replaces what's on
-      // screen the same way starting fresh does, except the fresh state is
-      // the loaded history entry instead of an empty transcript. Continuing
-      // ids/timeline from the loaded entry (rather than resetting to zero)
-      // means a recording started right after viewing history appends after
-      // it instead of risking an id collision with it.
+      // Replaces what's on screen the same way starting fresh does, except the
+      // fresh state is the loaded history entry instead of an empty transcript.
+      // Continuing ids/timeline from the loaded entry (rather than resetting to
+      // zero) means a recording started right after viewing history appends
+      // after it instead of risking an id collision with it.
       nextSegmentId = entry.segments.length + 1;
       timelineBaseSec = entry.durationSec;
       recordingBaseSec = entry.durationSec;
@@ -652,8 +727,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         segments: entry.segments,
         audioEvents: entry.audioEvents,
         selectedHistoryId: id,
-        recordingStatus: "done",
         refineNotice: null,
+        // The banner is now driven by `errorMessage` alone, so a previous
+        // failure has to be cleared by the next thing that succeeds -- it
+        // would otherwise sit there describing something already recovered from.
+        errorMessage: null,
       });
       void get().loadPlayback(id, await wavPath(id));
     } catch (err) {
@@ -662,6 +740,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   deleteHistoryEntry: async (id) => {
+    if (!selectCapabilities(get()).browseHistory) return;
     try {
       await deleteRecording(id);
       if (get().playback.recordingId === id) get().unloadPlayback();
@@ -672,6 +751,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // longer corresponds to anything on disk -- clear the selection so a
         // later reload doesn't try to fetch a file that is gone.
         selectedHistoryId: s.selectedHistoryId === id ? null : s.selectedHistoryId,
+        errorMessage: null,
       }));
     } catch (err) {
       set({ errorMessage: toErrorMessage(err) });
@@ -679,13 +759,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   rerunHistoryEntry: async (id) => {
-    const status = get().recordingStatus;
-    if (status === "recording" || status === "processing" || status === "refining") return;
+    if (!selectCapabilities(get()).reanalyze) return;
 
     const durationSec = get().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
     const path = await wavPath(id);
 
-    set({ recordingStatus: "refining", refineProgress: 0, refineNotice: null });
+    set({ processing: "refining", refineProgress: 0, refineNotice: null });
     try {
       const { settings, vadSettings, diarizeSettings, audioEventSettings } = get();
       const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
@@ -736,7 +815,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
     } finally {
-      set({ recordingStatus: "done", refineProgress: null });
+      set({ processing: null, refineProgress: null });
     }
   },
 
@@ -789,6 +868,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   startRecording: async () => {
+    // Without this, a second call while a take is live would overwrite
+    // `activeRecorder`/`activeStreamer`/`activeCapture` and orphan the running
+    // one -- its frames would keep arriving forever, and `capture.start()`
+    // would drop the old WAV writer out from under it.
+    if (!selectCapabilities(get()).startRecording) return;
     // Whatever was loaded for playback (a past recording, or the previous
     // take) no longer corresponds to what's about to be on screen.
     get().unloadPlayback();
@@ -834,7 +918,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         try {
           await appAudioClient.startCapture(
             appAudioTargetPid,
-            (frame) => mixer.pushAppAudio(frame),
+            // Gated by the same pause flag as the mic. The Rust side is
+            // wall-clock driven (see `capture_loop` in appaudio.rs) and keeps
+            // emitting chunks -- silence-padded when the app is quiet -- for
+            // the whole pause, so without this the mixer's queue would fill
+            // with audio captured *while paused*. On resume the mixer would
+            // then serve that stale audio first and stay that far behind the
+            // mic for the rest of the take. `dropOverflow` caps the queue, so
+            // this failure is silent: no error, no memory growth, just
+            // misaligned audio and a few leaked seconds of the other app.
+            (frame) => {
+              if (!recordingPaused) mixer.pushAppAudio(frame);
+            },
             (message) => {
               // Fires if capture dies mid-recording (most commonly: the
               // target app closed). Recording keeps going mic-only; the
@@ -862,6 +957,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeStreamer = streamer;
       activeEventStreamer = eventStreamer;
       activeCapture = captureStarted ? capture : null;
+      recordingPaused = false;
       recordingBaseSec = timelineBaseSec;
       segmentsBeforeRecording = get().segments.length;
       const levelMeter = createAudioLevelMeter(controller.stream);
@@ -880,7 +976,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Once real new content starts accumulating, this is no longer "viewing
       // a history entry" even if it started from one -- see loadHistoryEntry.
       set({
-        recordingStatus: "recording",
+        recordingPhase: "recording",
         errorMessage: null,
         refineNotice: notices.length > 0 ? notices.join(" ") : null,
         levelMeter,
@@ -891,12 +987,46 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeStreamer = null;
       activeEventStreamer = null;
       activeCapture = null;
+      recordingPaused = false;
       if (appAudioActive) {
         appAudioActive = false;
         void appAudioClient.stopCapture();
       }
-      set({ recordingStatus: "error", errorMessage: toErrorMessage(err) });
+      set({ recordingPhase: "stopped", errorMessage: toErrorMessage(err) });
     }
+  },
+
+  pauseRecording: async () => {
+    if (!selectCapabilities(get()).pause) return;
+    const streamer = activeStreamer;
+    recordingPaused = true;
+    activeRecorder?.setPaused(true);
+    set({ recordingPhase: "paused" });
+
+    // Flush the live pass so the transcript is complete up to the pause. The
+    // point of pausing is to be able to read back what was just said, and
+    // without this up to a full 15s window would still be sitting unprocessed.
+    // The event streamer is deliberately *not* flushed: its model is trained
+    // on 10s clips (see events.rs's WINDOW_SEC), so a short partial window
+    // would produce a low-quality tag, and its output is only ever a preview
+    // the post-hoc pass overwrites anyway.
+    try {
+      await streamer?.finish();
+    } catch (err) {
+      // Purely a display convenience -- the audio is still captured and the
+      // post-hoc pass re-reads all of it, so a failed flush costs nothing but
+      // a slightly stale transcript while paused.
+      console.warn("[asr] failed to flush the transcript on pause:", err);
+    }
+  },
+
+  resumeRecording: () => {
+    if (!selectCapabilities(get()).resume) return;
+    // Nothing to drain: both callbacks were gated for the whole pause, so the
+    // mixer's queue is exactly where it was and mic/app audio line back up.
+    recordingPaused = false;
+    activeRecorder?.setPaused(false);
+    set({ recordingPhase: "recording" });
   },
 
   stopRecording: async () => {
@@ -909,12 +1039,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     activeStreamer = null;
     activeEventStreamer = null;
     activeCapture = null;
+    recordingPaused = false;
     get().levelMeter?.dispose();
     if (appAudioActive) {
       appAudioActive = false;
       await appAudioClient.stopCapture();
     }
-    set({ recordingStatus: "processing", levelMeter: null });
+    set({ recordingPhase: "stopped", processing: "transcribing", levelMeter: null });
 
     try {
       const totalSamples = await controller.stop();
@@ -927,12 +1058,16 @@ export const useAppStore = create<AppState>((set, get) => ({
         console.warn("[audio-events] failed to flush the final live window:", err);
       });
       timelineBaseSec = recordingBaseSec + totalSamples / WHISPER_SAMPLE_RATE;
-      set({ recordingStatus: "done" });
+      // Stay in a processing phase if the accuracy pass is about to run:
+      // clearing it here first would briefly re-enable "start a new recording"
+      // in the gap before `refineRecording` sets "refining", and a take
+      // started in that gap would fight the pass for the model.
+      if (!capture) set({ processing: null });
     } catch (err) {
       // The capture file is left open here on purpose: it is valid on disk at
       // every moment (see wav::Writer), and the backend closes it when the next
       // recording starts. Nothing is lost by not finishing it.
-      set({ recordingStatus: "error", errorMessage: toErrorMessage(err) });
+      set({ processing: null, errorMessage: toErrorMessage(err) });
       return;
     }
 
@@ -940,44 +1075,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     // windows produced. Runs after the live result is already on screen, so the
     // user has a transcript throughout.
     if (capture) await refineRecording(capture);
-  },
-
-  /**
-   * Aborts the in-progress recording outright: stops capturing immediately
-   * and discards everything this take produced, as if it never started --
-   * no flush, no second pass, no history entry. Unlike `stopRecording`, the
-   * WAV capture is simply abandoned rather than finished; `capture.rs`'s
-   * `start_capture` doc explains why that costs nothing (the next
-   * recording's own `start_capture` drops whatever was left open).
-   */
-  cancelRecording: () => {
-    const controller = activeRecorder;
-    const streamer = activeStreamer;
-    if (!controller || !streamer) return;
-    activeRecorder = null;
-    activeStreamer = null;
-    activeEventStreamer = null;
-    activeCapture = null;
-    controller.cancel();
-    get().levelMeter?.dispose();
-    if (appAudioActive) {
-      appAudioActive = false;
-      void appAudioClient.stopCapture();
-    }
-
-    const keptSegments = segmentsBeforeRecording;
-    const baseSec = recordingBaseSec;
-    set((s) => ({
-      segments: s.segments.slice(0, keptSegments),
-      audioEvents: s.audioEvents.filter((e) => e.start < baseSec),
-      levelMeter: null,
-      // Whatever was on screen before this take started -- a blank slate if
-      // it was the first recording, or the previous take/history entry
-      // otherwise (see `recordingBaseSec`/`segmentsBeforeRecording`'s doc
-      // comment above their declaration).
-      recordingStatus: keptSegments > 0 ? "done" : "idle",
-      errorMessage: null,
-    }));
   },
 
   updateSettings: (partial) =>
@@ -1008,27 +1105,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { audioEventSettings };
     }),
 
-  clearTranscript: () => {
-    nextSegmentId = 1;
-    timelineBaseSec = 0;
-    recordingBaseSec = 0;
-    segmentsBeforeRecording = 0;
-    get().unloadPlayback();
-    set({
-      segments: [],
-      audioEvents: [],
-      selectedHistoryId: null,
-      recordingStatus: "idle",
-      errorMessage: null,
-      refineNotice: null,
-      refineProgress: null,
-    });
-  },
-
-  reset: () => {
-    get().unloadPlayback();
-    set({ recordingStatus: "idle", errorMessage: null, refineNotice: null });
-  },
 }));
 
 // Dev-only diagnostic: transcribe an audio file from a URL through the exact

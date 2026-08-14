@@ -9,6 +9,7 @@ import { Textarea } from "./ui/textarea";
 import { InfoTooltip } from "./InfoTooltip";
 import { useAppStore } from "../store/appStore";
 import { SUPPORTED_LANGUAGES } from "../lib/asr";
+import { cn } from "../lib/utils";
 
 /**
  * Practical size of the glossary, in characters.
@@ -82,8 +83,12 @@ export function SettingsPanel() {
   const updateVadSettings = useAppStore((s) => s.updateVadSettings);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
   const updateAudioEventSettings = useAppStore((s) => s.updateAudioEventSettings);
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
-  const isRecording = recordingStatus === "recording";
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  // Locked for the whole take, paused included: the streaming transcriber
+  // re-reads `settings` on every window, so a change part-way through would
+  // silently decode the rest of the recording under different settings than
+  // the beginning.
+  const locked = recordingPhase !== "stopped";
   const glossaryChars = Array.from(settings.glossary).length;
   const fixedSpeakerCount = diarizeSettings.numSpeakers > 0;
 
@@ -97,7 +102,11 @@ export function SettingsPanel() {
     // see StatusBar.tsx -- since those are switched often enough to want
     // one click, not two). Anyone who wants a quieter view can still
     // collapse a category; this only changes the starting state.
-    <Accordion type="multiple" className="w-full" defaultValue={["transcription", "accuracy"]}>
+    <Accordion
+      type="multiple"
+      className={cn("w-full", locked && "pointer-events-none opacity-60")}
+      defaultValue={["transcription", "accuracy"]}
+    >
       <AccordionItem value="transcription">
         <AccordionTrigger>文字起こし</AccordionTrigger>
         <AccordionContent>
@@ -159,13 +168,10 @@ export function SettingsPanel() {
               </p>
               {/*
                 Edits reach the model on their own -- the transcribe callback reads
-                settings fresh for each window -- so there is nothing to press. What
-                was missing is only that the delay was invisible, hence this line.
+                settings fresh for each window -- so there is nothing to press.
               */}
               <p className="text-xs text-muted-foreground">
-                {isRecording
-                  ? "録音中の変更は、次のウィンドウ（最大15秒後）の文字起こしから反映されます。処理済みの部分は変わりません。"
-                  : "変更は自動で保存され、次の文字起こしから反映されます。"}
+                変更は自動で保存され、次の文字起こしから反映されます。
               </p>
             </div>
           </div>

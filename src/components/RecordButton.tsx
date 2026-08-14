@@ -1,101 +1,83 @@
-import { useEffect, useState } from "react";
-import { Mic, Square, Loader2, X } from "lucide-react";
+import { Mic, Square, Pause, Loader2 } from "lucide-react";
 import { Button } from "./ui/button";
-import { useAppStore } from "../store/appStore";
+import { useAppStore, selectCapabilities } from "../store/appStore";
+import { cn } from "../lib/utils";
 
-/** How long a first tap on "中断" stays armed before it resets back to a
- * plain, un-armed button -- long enough to make the deliberate second tap
- * easy, short enough that walking away doesn't leave it primed to discard a
- * recording on the next accidental click. Mirrors the same tap-to-arm /
- * timeout pattern `HistoryRow`'s delete button already uses. */
-const CONFIRM_TIMEOUT_MS = 3000;
+/** Both buttons are the same circle, so the pair reads as one control rather
+ * than a big button with a stray secondary bolted on. Emphasis comes from the
+ * fill, not the size. */
+const CIRCLE = "h-16 w-16 rounded-full p-0";
 
 /**
- * Discards the in-progress recording outright rather than stopping it
- * normally: no second pass, no history entry, as if it never started (see
- * `cancelRecording`'s doc comment). That is destructive enough, and sits
- * close enough to the primary stop button, to warrant a tap-to-arm step
- * instead of firing on a single click.
+ * The record transport, one matched pair of circular buttons.
+ *
+ * The primary button changes role with `recordingPhase` (start → pause →
+ * resume) and carries the `--signal` red fill whenever a take is in progress,
+ * so "a recording exists right now" is legible at a glance in both the
+ * recording and paused states. The pulse is what separates them: live pulses,
+ * paused is static.
  */
-function CancelButton() {
-  const cancelRecording = useAppStore((s) => s.cancelRecording);
-  const [confirming, setConfirming] = useState(false);
-
-  useEffect(() => {
-    if (!confirming) return;
-    const id = setTimeout(() => setConfirming(false), CONFIRM_TIMEOUT_MS);
-    return () => clearTimeout(id);
-  }, [confirming]);
-
-  return (
-    <Button
-      type="button"
-      size="lg"
-      variant={confirming ? "destructive" : "outline"}
-      className="h-12 rounded-full px-4"
-      onClick={() => {
-        if (!confirming) {
-          setConfirming(true);
-          return;
-        }
-        setConfirming(false);
-        cancelRecording();
-      }}
-      aria-label={confirming ? "もう一度押すと録音を破棄します" : "録音を中断（保存せず破棄）"}
-      title={confirming ? "もう一度押すと録音を破棄します" : "録音を中断（保存せず破棄）"}
-    >
-      <X className="h-4 w-4" />
-      {confirming ? "本当に中断" : "中断"}
-    </Button>
-  );
-}
-
 export function RecordButton() {
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const startRecording = useAppStore((s) => s.startRecording);
   const stopRecording = useAppStore((s) => s.stopRecording);
+  const pauseRecording = useAppStore((s) => s.pauseRecording);
+  const resumeRecording = useAppStore((s) => s.resumeRecording);
+  const can = selectCapabilities({ recordingPhase, processing, modelStatus });
 
-  // Refining holds the model lock and rewrites the transcript, so starting the
-  // next recording has to wait for it.
-  const busy = recordingStatus === "processing" || recordingStatus === "refining";
-  const disabled = modelStatus !== "ready" || busy;
-
-  if (recordingStatus === "recording") {
+  if (recordingPhase === "stopped") {
+    const label = processing !== null ? "処理中です" : "録音を開始";
     return (
-      <div className="flex items-center gap-3">
-        <CancelButton />
-        <Button
-          type="button"
-          size="lg"
-          variant="destructive"
-          onClick={() => void stopRecording()}
-          // The destructive variant is deliberately subtle (a tinted background,
-          // for things like delete buttons) -- the stop button is the app's one
-          // central action while recording and gets a bold, unmistakable fill
-          // instead, using the same --signal red the rest of the app reserves
-          // for "recording".
-          className="h-16 w-16 rounded-full bg-signal p-0 text-white hover:bg-signal/90"
-          aria-label="録音を停止して保存"
-          title="録音を停止して保存"
-        >
-          <Square className="h-6 w-6" />
-        </Button>
-      </div>
+      <Button
+        type="button"
+        size="lg"
+        disabled={!can.startRecording}
+        onClick={() => void startRecording()}
+        className={CIRCLE}
+        aria-label={label}
+        title={label}
+      >
+        {processing !== null ? <Loader2 className="h-6 w-6 animate-spin" /> : <Mic className="h-6 w-6" />}
+      </Button>
     );
   }
 
+  const paused = recordingPhase === "paused";
+  const primaryLabel = paused ? "録音を再開" : "一時停止";
+
   return (
-    <Button
-      type="button"
-      size="lg"
-      variant="default"
-      disabled={disabled}
-      onClick={() => void startRecording()}
-      className="h-16 w-16 rounded-full p-0"
-      aria-label="録音を開始"
-    >
-      {busy ? <Loader2 className="h-6 w-6 animate-spin" /> : <Mic className="h-6 w-6" />}
-    </Button>
+    <div className="flex items-center gap-4">
+      <Button
+        type="button"
+        size="lg"
+        onClick={() => (paused ? resumeRecording() : void pauseRecording())}
+        // The `destructive` variant is a subtle tint meant for delete buttons;
+        // the transport's primary gets the app's full --signal red instead,
+        // the same fill the recording indicator uses.
+        className={cn(
+          CIRCLE,
+          "bg-signal text-white hover:bg-signal/90",
+          !paused && "animate-pulse motion-reduce:animate-none",
+        )}
+        aria-label={primaryLabel}
+        title={primaryLabel}
+      >
+        {paused ? <Mic className="h-6 w-6" /> : <Pause className="h-6 w-6" />}
+      </Button>
+
+      <Button
+        type="button"
+        size="lg"
+        variant="outline"
+        onClick={() => void stopRecording()}
+        className={CIRCLE}
+        aria-label="停止して保存"
+        title="停止して保存"
+      >
+        <Square className="h-6 w-6" />
+      </Button>
+    </div>
   );
 }
