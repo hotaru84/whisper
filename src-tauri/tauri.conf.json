@@ -32,7 +32,8 @@
         "worker-src": "'self' blob:",
         "style-src": "'self' 'unsafe-inline'",
         "img-src": "'self' data: blob:",
-        "connect-src": "'self' ipc: http://ipc.localhost blob:"
+        "connect-src": "'self' ipc: http://ipc.localhost blob:",
+        "media-src": "'self' blob:"
       }
     }
   },

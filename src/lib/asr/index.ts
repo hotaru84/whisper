@@ -18,5 +18,6 @@ export { RecordingCapture } from "./capture";
 export type { CaptureInfo } from "./capture";
 export { StreamingTranscriber } from "./streaming";
 export type { StreamingSegment } from "./streaming";
+export { AudioEventStreamer } from "./eventStreaming";
 export type { AsrDevice, TranscriptChunk, TranscriptionTask } from "./types";
 export { SUPPORTED_LANGUAGES } from "./languages";

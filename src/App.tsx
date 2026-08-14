@@ -5,6 +5,7 @@ import { HistorySidebar } from "./components/HistorySidebar";
 import { ModelLoadingOverlay } from "./components/ModelLoadingOverlay";
 import { RecordButton } from "./components/RecordButton";
 import { LevelMeter } from "./components/LevelMeter";
+import { RecordingTimeline } from "./components/RecordingTimeline";
 import { TranscriptPanel } from "./components/TranscriptPanel";
 import { AudioEventPanel } from "./components/AudioEventPanel";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -135,6 +136,7 @@ function App() {
               </div>
             </div>
 
+            <RecordingTimeline />
             <TranscriptPanel />
             <AudioEventPanel />
           </main>

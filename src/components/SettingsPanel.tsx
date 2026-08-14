@@ -1,5 +1,3 @@
-import type { ReactNode } from "react";
-import { Info } from "lucide-react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "./ui/accordion";
 import { Checkbox } from "./ui/checkbox";
 import { Input } from "./ui/input";
@@ -8,7 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Slider } from "./ui/slider";
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { InfoTooltip } from "./InfoTooltip";
 import { useAppStore } from "../store/appStore";
 import { SUPPORTED_LANGUAGES } from "../lib/asr";
 
@@ -21,17 +19,6 @@ import { SUPPORTED_LANGUAGES } from "../lib/asr";
  * the cap is dropped from the front, silently.
  */
 const GLOSSARY_LIMIT = 200;
-
-function InfoTooltip({ children }: { children: ReactNode }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger type="button" className="text-muted-foreground">
-        <Info className="h-3.5 w-3.5" />
-      </TooltipTrigger>
-      <TooltipContent className="max-w-xs">{children}</TooltipContent>
-    </Tooltip>
-  );
-}
 
 /**
  * A 0-1 threshold, shown as a slider and its numeric readout together --

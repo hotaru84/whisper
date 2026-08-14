@@ -1,4 +1,5 @@
-import type { TranscriptChunk } from "./asr";
+import type { TranscriptChunk, AudioEvent } from "./asr";
+import { isNoiseOrMusicEvent } from "./audioEvents";
 
 /**
  * One contiguous piece of transcript. A recording produces one or more segments
@@ -16,6 +17,15 @@ import type { TranscriptChunk } from "./asr";
  * second pass with diarization off); `null` means it ran but found no speaker
  * overlapping this segment; a number is a cluster index, stable only within one
  * recording -- not a stable identity across recordings.
+ *
+ * `excludedReason` marks a segment that `events::classify_chunks` decided was
+ * not speech (see `segmentsFromResult`'s `excluded` parameter): `text` is
+ * always `""` for these, and `excludedReason` holds the raw AudioSet label
+ * (e.g. `"Music"`) of whichever overlapping event caused the exclusion, or is
+ * itself absent if none could be attributed. Rendered by `TranscriptPanel` as
+ * a placeholder rather than a normal line, so a listener can tell *why* a gap
+ * exists instead of the silent hole the transcript used to leave -- see the
+ * design plan.
  */
 export interface TranscriptSegment {
   id: number;
@@ -23,6 +33,7 @@ export interface TranscriptSegment {
   text: string;
   chunks: TranscriptChunk[];
   speaker?: number | null;
+  excludedReason?: string;
 }
 
 /**
@@ -56,12 +67,14 @@ export function nonBlankChunks(result: { chunks?: TranscriptChunk[] }): Transcri
  * function) -- that positional correspondence is how a speaker reaches the
  * right segment, there is no id-based matching.
  *
- * `excluded`, if given, has the same shape: `true` drops that chunk entirely
- * (no segment is produced for it) rather than keeping it with blank text, so
- * a filtered-out window leaves no trace in the transcript. This is
- * `events::classify_chunks`'s non-speech exclusion (see `events.rs`), applied
- * here rather than left to the caller so the id-gap bookkeeping below stays
- * in one place.
+ * `excluded`, if given, has the same shape: `true` turns that chunk into an
+ * `excludedReason`-tagged placeholder (blank text, timing preserved) instead
+ * of a normal transcript line. This is `events::classify_chunks`'s
+ * non-speech exclusion (see `events.rs`), applied here rather than left to
+ * the caller so the id-gap bookkeeping below stays in one place. `events`,
+ * if given, is used only to label *why* -- it must be on the same 0-based
+ * timeline as `chunks` (the same one `classify_chunks` itself used), same
+ * requirement as `speakers`/`excluded`.
  */
 export function segmentsFromResult(
   result: { text: string; chunks?: TranscriptChunk[] },
@@ -69,6 +82,7 @@ export function segmentsFromResult(
   startId: number,
   speakers?: Array<number | null>,
   excluded?: boolean[],
+  events?: AudioEvent[],
 ): TranscriptSegment[] {
   const chunks = nonBlankChunks(result);
 
@@ -83,19 +97,43 @@ export function segmentsFromResult(
 
   const segments: TranscriptSegment[] = [];
   chunks.forEach((c, i) => {
-    if (excluded?.[i]) return;
     const start = c.timestamp[0] ?? 0;
     const end = c.timestamp[1] ?? start;
+    const duration = Math.max(0, end - start);
+
+    if (excluded?.[i]) {
+      segments.push({
+        id: startId + i,
+        startOffsetSec: baseSec + start,
+        text: "",
+        chunks: [{ text: "", timestamp: [0, duration] }],
+        excludedReason: events ? findExclusionReason(start, end, events) : undefined,
+      });
+      return;
+    }
+
     const segment: TranscriptSegment = {
       id: startId + i,
       startOffsetSec: baseSec + start,
       text: c.text,
-      chunks: [{ text: c.text, timestamp: [0, Math.max(0, end - start)] as [number, number] }],
+      chunks: [{ text: c.text, timestamp: [0, duration] as [number, number] }],
     };
     if (speakers) segment.speaker = speakers[i] ?? null;
     segments.push(segment);
   });
   return segments;
+}
+
+/** The raw AudioSet name of the first noise/music-family event overlapping
+ * `[start, end)`, or `undefined` if none is found -- e.g. `events` was not
+ * given, or (in principle) the exclusion came from a since-changed pass.
+ * Mirrors `events.rs::overlap`/`is_noise_or_music_label`'s logic closely
+ * enough to attribute the same exclusion to the same event in the common
+ * case, without needing to be byte-for-byte identical: this only chooses a
+ * label to display, `classify_chunks` in Rust already made the actual
+ * exclusion decision. */
+function findExclusionReason(start: number, end: number, events: AudioEvent[]): string | undefined {
+  return events.find((e) => e.start < end && e.end > start && isNoiseOrMusicEvent(e.name))?.name;
 }
 
 /**
@@ -115,16 +153,22 @@ export function combinedText(segments: TranscriptSegment[]): string {
     .join("\n");
 }
 
-/** Flattens all segments' chunks onto the global timeline (for SRT export). */
+/** Flattens all segments' chunks onto the global timeline (for SRT export).
+ * Blank chunks (an excluded-gap placeholder's `text: ""`, see
+ * `TranscriptSegment.excludedReason`) are skipped, the same way
+ * `combinedText` drops blank segments -- an SRT cue with no text would just
+ * be an empty subtitle flashing on screen. */
 export function combinedChunks(segments: TranscriptSegment[]): TranscriptChunk[] {
   return segments.flatMap((seg) =>
-    seg.chunks.map((c) => ({
-      text: c.text,
-      timestamp: [
-        c.timestamp[0] + seg.startOffsetSec,
-        (c.timestamp[1] ?? c.timestamp[0]) + seg.startOffsetSec,
-      ] as [number, number],
-      speaker: seg.speaker,
-    })),
+    seg.chunks
+      .filter((c) => c.text.trim() !== "")
+      .map((c) => ({
+        text: c.text,
+        timestamp: [
+          c.timestamp[0] + seg.startOffsetSec,
+          (c.timestamp[1] ?? c.timestamp[0]) + seg.startOffsetSec,
+        ] as [number, number],
+        speaker: seg.speaker,
+      })),
   );
 }
