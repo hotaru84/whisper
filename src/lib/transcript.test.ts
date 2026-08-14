@@ -178,10 +178,21 @@ describe("segmentsFromResult", () => {
     expect(out[0].speaker).toBe(3);
   });
 
-  it("drops a chunk entirely when its excluded entry is true, leaving no trace", () => {
+  it("turns an excluded chunk into a blank placeholder rather than dropping it", () => {
     const out = segmentsFromResult(result, 0, 1, undefined, [true, false]);
-    expect(out).toHaveLength(1);
-    expect(out[0].text).toBe("議事録を始めます。");
+    expect(out).toHaveLength(2);
+    expect(out[0].text).toBe("");
+    expect(out[0].excludedReason).toBeUndefined();
+    expect(out[1].text).toBe("議事録を始めます。");
+  });
+
+  it("preserves an excluded chunk's timing in its placeholder", () => {
+    const out = segmentsFromResult(result, 100, 1, undefined, [true, false]);
+    expect(out[0]).toMatchObject({
+      startOffsetSec: 100,
+      text: "",
+      chunks: [{ text: "", timestamp: [0, 2] }],
+    });
   });
 
   it("keeps every chunk when excluded is not given at all", () => {
@@ -189,15 +200,38 @@ describe("segmentsFromResult", () => {
     expect(out).toHaveLength(2);
   });
 
-  it("keeps ids stable relative to the pre-filter chunk index when excluding", () => {
-    // The first chunk's id (7) is skipped entirely rather than reused by the
-    // second -- callers rely on this to keep future ids from colliding.
+  it("still assigns one id per non-blank chunk when excluding, no gaps or reuse", () => {
     const out = segmentsFromResult(result, 0, 7, undefined, [true, false]);
-    expect(out.map((s) => s.id)).toEqual([8]);
+    expect(out.map((s) => s.id)).toEqual([7, 8]);
   });
 
-  it("drops all chunks when every entry is excluded", () => {
+  it("turns every chunk into a placeholder when every entry is excluded, none dropped", () => {
     const out = segmentsFromResult(result, 0, 1, undefined, [true, true]);
-    expect(out).toEqual([]);
+    expect(out).toHaveLength(2);
+    expect(out.every((s) => s.text === "")).toBe(true);
+  });
+
+  it("labels an excluded placeholder with the overlapping noise/music event's name", () => {
+    const events = [{ start: 1.5, end: 2.5, name: "Music", index: 0, prob: 0.8 }];
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false], events);
+    expect(out[0].excludedReason).toBe("Music");
+  });
+
+  it("does not attribute a reason to a speech-only overlapping event", () => {
+    const events = [{ start: 0, end: 2, name: "Speech", index: 0, prob: 0.8 }];
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false], events);
+    expect(out[0].excludedReason).toBeUndefined();
+  });
+
+  it("ignores an event that does not overlap the excluded chunk's window", () => {
+    const events = [{ start: 10, end: 12, name: "Music", index: 0, prob: 0.8 }];
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false], events);
+    expect(out[0].excludedReason).toBeUndefined();
+  });
+
+  it("keeps combinedText/combinedChunks blind to placeholders, same as any other blank segment", () => {
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false]);
+    expect(combinedText(out)).toBe("議事録を始めます。");
+    expect(combinedChunks(out)).toEqual([{ text: "議事録を始めます。", timestamp: [2, 5] }]);
   });
 });

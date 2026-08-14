@@ -5,6 +5,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { SettingsDialog } from "./SettingsDialog";
 import { useAppStore } from "../store/appStore";
 import { useThemeStore, type ThemePreference } from "../store/themeStore";
+import { formatTimestamp } from "../lib/format";
 
 const NEXT_THEME: Record<ThemePreference, ThemePreference> = {
   system: "light",
@@ -19,15 +20,6 @@ const THEME_LABEL: Record<ThemePreference, string> = {
 };
 
 const NO_APP_TARGET = "__none__";
-
-function formatElapsed(totalSec: number): string {
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  const mm = String(m).padStart(2, "0");
-  const ss = String(s).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
-}
 
 /** Elapsed time since `recordingStatus` last became "recording", ticking
  * every half second. Local to this component -- nothing else in the app
@@ -143,7 +135,7 @@ export function StatusBar() {
           <span className="flex items-center gap-1.5 font-medium text-signal">
             <span className="h-2 w-2 animate-pulse rounded-full bg-signal motion-reduce:animate-none" aria-hidden="true" />
             録音中
-            <span className="font-mono tabular-nums">{formatElapsed(elapsed)}</span>
+            <span className="font-mono tabular-nums">{formatTimestamp(elapsed)}</span>
           </span>
         )}
         {recordingStatus === "processing" && (

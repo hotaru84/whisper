@@ -8,3 +8,5 @@ export type { AudioInputDevice } from "./devices";
 export { AppAudioClient } from "./appAudio";
 export type { AudioAppInfo } from "./appAudio";
 export { AudioMixer } from "./mixer";
+export { wavToBlobUrl, createPlaybackController } from "./playback";
+export type { PlaybackController, PlaybackSnapshot } from "./playback";

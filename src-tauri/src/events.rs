@@ -1,22 +1,44 @@
-//! Audio event detection (audio tagging) via sherpa-onnx, run over the whole
-//! finished recording. Like diarization (`diarize.rs`), this only makes sense
-//! post-hoc: telling background music from background noise from silence
-//! benefits from a wider view than the 15-second live window has, and it is
-//! extra model-load cost most recordings (plain dictation) get nothing from.
+//! Audio event detection (audio tagging) via sherpa-onnx.
+//!
+//! Two entry points share the same underlying 10-second-window inference
+//! (`tag_window`), on two different footings:
+//!
+//! - `detect_events`/`detect_audio_events`: the authoritative, whole-recording
+//!   pass, run post-hoc after the user stops recording (like diarization in
+//!   `diarize.rs`). This is what `classify_chunks`' transcript-exclusion
+//!   decision and the recording's *saved* event history are always based on
+//!   -- it sees the whole recording at once and is what gets persisted.
+//! - `detect_events_window`: a live per-window pass during an active
+//!   recording, mirroring the ASR streaming pipeline's own chunk-and-commit
+//!   windowing (`streaming.ts`). Its results are a preview only -- see
+//!   `refineRecording` on the frontend, which always overwrites whatever the
+//!   live pass produced with the post-hoc pass's output once the recording
+//!   stops. This two-layer "live preview, post-hoc authoritative" split keeps
+//!   the live path from ever needing to reconcile with or invalidate the
+//!   post-hoc one; it only ever gets replaced wholesale, the same relationship
+//!   whisper's own live/refined transcript segments already have.
+//!
+//! Unlike whisper's model (`asr::AsrState`, loaded once at startup), the
+//! audio tagger (`AudioTaggingState`) loads lazily on first use -- audio-event
+//! detection is off by default and many recordings never touch it, so it
+//! would be wasted startup cost for most sessions.
 //!
 //! Detected events are deliberately never inserted into the transcript body --
 //! a false positive there would corrupt text a reader has no easy way to
 //! distinguish from what was actually said. Instead they feed two narrower,
-//! reversible uses: a standalone timeline (the frontend's `AudioEventPanel`,
-//! built directly from `AudioEvent`), and a same-timeline "exclude" flag per
-//! whisper chunk (`classify_chunks`) for windows audio tagging is confident
-//! are not speech at all.
+//! reversible uses: a standalone timeline (the frontend's `AudioEventPanel`
+//! and `RecordingTimeline`, built directly from `AudioEvent`), and a
+//! same-timeline "exclude" flag per whisper chunk (`classify_chunks`) for
+//! windows audio tagging is confident are not speech at all.
+
+use std::sync::Mutex;
 
 use serde::Serialize;
 use sherpa_onnx::{
     AudioTagging, AudioTaggingConfig, AudioTaggingModelConfig,
     OfflineZipformerAudioTaggingModelConfig,
 };
+use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Manager};
 
 /// AudioSet clips (and so these models) are trained on 10-second windows; a
@@ -49,6 +71,20 @@ impl Default for AudioEventSettings {
     }
 }
 
+/// Holds the lazily-loaded audio tagger for the lifetime of the app, so a
+/// live recording's per-window calls (`detect_events_window`) don't reload a
+/// fresh model from disk on every single 10-second window the way calling
+/// `AudioTagging::create` per-call (what the post-hoc `detect_events` still
+/// does, since it only ever runs once per whole recording) would. `None`
+/// until the first call that needs it.
+pub struct AudioTaggingState(Mutex<Option<AudioTagging>>);
+
+impl Default for AudioTaggingState {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
 /// One detected tag on a `[start, end)` window of the recording.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +114,31 @@ pub fn detect_events(
         return Ok(Vec::new());
     }
 
+    let tagger = create_tagger(model_path, labels_path, settings.top_k.max(1))?;
+
+    let window_samples = (WINDOW_SEC * crate::wav::SAMPLE_RATE as f32).round() as usize;
+    let mut events = Vec::new();
+    for (start, end) in window_bounds(samples.len(), window_samples) {
+        let start_sec = start as f32 / crate::wav::SAMPLE_RATE as f32;
+        let end_sec = end as f32 / crate::wav::SAMPLE_RATE as f32;
+        events.extend(tag_window(
+            &tagger,
+            &samples[start..end],
+            settings.top_k,
+            settings.threshold,
+            start_sec,
+            end_sec,
+        ));
+    }
+    Ok(events)
+}
+
+/// Builds and creates a tagger from a model/labels path pair. Shared by the
+/// offline pass's per-call creation and `AudioTaggingState`'s lazy
+/// first-use creation, so the two never end up constructing the config
+/// differently. `top_k` here is only a creation-time fallback -- `tag_window`
+/// always passes its own `top_k` to `compute()`, which takes precedence.
+fn create_tagger(model_path: &str, labels_path: &str, top_k: i32) -> Result<AudioTagging, String> {
     let config = AudioTaggingConfig {
         model: AudioTaggingModelConfig {
             zipformer: OfflineZipformerAudioTaggingModelConfig {
@@ -86,41 +147,47 @@ pub fn detect_events(
             ..Default::default()
         },
         labels: Some(labels_path.to_string()),
-        top_k: settings.top_k.max(1),
+        top_k: top_k.max(1),
     };
 
     // `create` returning None means the C++ side rejected the config (most
     // commonly: a model or labels path that does not exist), the same
     // convention `OfflineSpeakerDiarization::create` uses in diarize.rs.
-    let tagger = AudioTagging::create(&config).ok_or_else(|| {
+    AudioTagging::create(&config).ok_or_else(|| {
         format!(
             "failed to create the audio tagger -- check that both files exist: \
              model={model_path:?} labels={labels_path:?}"
         )
-    })?;
+    })
+}
 
-    let window_samples = (WINDOW_SEC * crate::wav::SAMPLE_RATE as f32).round() as usize;
-    let mut events = Vec::new();
-    for (start, end) in window_bounds(samples.len(), window_samples) {
-        let stream = tagger.create_stream();
-        stream.accept_waveform(crate::wav::SAMPLE_RATE as i32, &samples[start..end]);
-        let start_sec = start as f32 / crate::wav::SAMPLE_RATE as f32;
-        let end_sec = end as f32 / crate::wav::SAMPLE_RATE as f32;
-        events.extend(
-            tagger
-                .compute(&stream, settings.top_k.max(1))
-                .into_iter()
-                .filter(|e| e.prob >= settings.threshold)
-                .map(|e| AudioEvent {
-                    start: start_sec,
-                    end: end_sec,
-                    name: e.name,
-                    index: e.index,
-                    prob: e.prob,
-                }),
-        );
-    }
-    Ok(events)
+/// Runs one window of audio tagging against an already-created tagger,
+/// producing timestamped, threshold-filtered events for `[start_sec,
+/// end_sec)`. Shared by the offline whole-recording pass (`detect_events`)
+/// and the live per-window command (`detect_events_window`) so the two can
+/// never drift in how a window's raw model output turns into `AudioEvent`s.
+fn tag_window(
+    tagger: &AudioTagging,
+    samples: &[f32],
+    top_k: i32,
+    threshold: f32,
+    start_sec: f32,
+    end_sec: f32,
+) -> Vec<AudioEvent> {
+    let stream = tagger.create_stream();
+    stream.accept_waveform(crate::wav::SAMPLE_RATE as i32, samples);
+    tagger
+        .compute(&stream, top_k.max(1))
+        .into_iter()
+        .filter(|e| e.prob >= threshold)
+        .map(|e| AudioEvent {
+            start: start_sec,
+            end: end_sec,
+            name: e.name,
+            index: e.index,
+            prob: e.prob,
+        })
+        .collect()
 }
 
 /// Splits `total_samples` into consecutive `[start, end)` windows of
@@ -247,6 +314,76 @@ pub async fn detect_audio_events(
         let exclude = classify_chunks(&chunks, &events);
 
         Ok(AudioEventResult { events, exclude })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Live counterpart to `detect_audio_events`, used while a recording is
+/// still in progress: tags exactly the one window of audio the frontend
+/// hands it (its own `AudioEventStreamer` accumulates ~10s at a time,
+/// mirroring `StreamingTranscriber`'s windowing) using the lazily-loaded
+/// resident tagger in `AudioTaggingState`, rather than reloading the model
+/// from disk on every window the way the offline pass's per-call
+/// `AudioTagging::create` would.
+///
+/// Its result is a preview only -- see this module's doc comment. `start_sec`
+/// is where this window sits on the *recording's own* 0-based timeline; the
+/// frontend is responsible for that bookkeeping, same as `transcribe_window`
+/// leaves window offsets to `StreamingTranscriber`.
+///
+/// Audio arrives as a raw IPC body rather than a JSON array, the same
+/// reasoning `transcribe_window`'s doc comment gives: a 10s window is 160k
+/// samples, and serializing that many numbers as JSON text on every window
+/// would be needless overhead compared to sending the raw bytes.
+#[tauri::command]
+pub async fn detect_events_window(
+    app: AppHandle,
+    request: Request<'_>,
+) -> Result<Vec<AudioEvent>, String> {
+    let InvokeBody::Raw(audio_bytes) = request.body() else {
+        return Err("detect_events_window expects a raw binary body".to_string());
+    };
+    let audio_bytes = audio_bytes.clone();
+
+    let header_f32 = |name: &str, default: f32| -> f32 {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(default)
+    };
+    let threshold = header_f32("X-Threshold", 0.3);
+    let top_k = header_f32("X-Top-K", 3.0).round() as i32;
+    let start_sec = header_f32("X-Start-Sec", 0.0);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        if audio_bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        // IPC bytes aren't guaranteed 4-byte aligned, so decode via
+        // from_le_bytes rather than an unsafe pointer cast (same as
+        // `transcribe_window`).
+        let samples: Vec<f32> = audio_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let state = app.state::<AudioTaggingState>();
+        let mut guard = state.0.lock().unwrap();
+        if guard.is_none() {
+            let model_path = resolve_model_path(&app)?;
+            let labels_path = resolve_labels_path(&app)?;
+            *guard = Some(create_tagger(
+                &model_path.display().to_string(),
+                &labels_path.display().to_string(),
+                top_k,
+            )?);
+        }
+        let tagger = guard.as_ref().unwrap();
+        let end_sec = start_sec + samples.len() as f32 / crate::wav::SAMPLE_RATE as f32;
+        Ok(tag_window(tagger, &samples, top_k, threshold, start_sec, end_sec))
     })
     .await
     .map_err(|e| e.to_string())?

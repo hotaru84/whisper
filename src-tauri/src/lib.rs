@@ -28,6 +28,7 @@ pub fn run() {
         .manage(asr::AsrState::default())
         .manage(capture::CaptureState::default())
         .manage(appaudio::AppAudioState::default())
+        .manage(events::AudioTaggingState::default())
         .invoke_handler(tauri::generate_handler![
             asr::init_model,
             asr::transcribe_window,
@@ -37,6 +38,7 @@ pub fn run() {
             capture::finish_capture,
             diarize::diarize_recording,
             events::detect_audio_events,
+            events::detect_events_window,
             appaudio::list_audio_apps,
             appaudio::start_app_audio_capture,
             appaudio::stop_app_audio_capture,

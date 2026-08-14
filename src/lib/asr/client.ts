@@ -266,6 +266,26 @@ export class AsrClient {
     });
   }
 
+  /**
+   * Live counterpart to `detectAudioEvents`: tags one ~10s window of
+   * already-captured PCM instead of a whole finished-recording WAV. Used by
+   * `AudioEventStreamer` while a recording is still in progress; its result
+   * is a preview only, always overwritten by `detectAudioEvents`' whole-
+   * recording pass once the recording stops -- see `events.rs`'s module doc.
+   *
+   * `startSec` is where this window sits on the recording's own 0-based
+   * timeline (the caller's bookkeeping, same as `transcribe`'s windows).
+   */
+  async detectEventsWindow(audio: Float32Array, startSec: number, settings: AudioEventSettings): Promise<AudioEvent[]> {
+    const bytes = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
+    const headers: Record<string, string> = {
+      "X-Threshold": String(settings.threshold),
+      "X-Top-K": String(settings.topK),
+      "X-Start-Sec": String(startSec),
+    };
+    return await invoke<AudioEvent[]>("detect_events_window", bytes, { headers });
+  }
+
   dispose(): void {
     for (const un of this.unlisten) un();
     this.unlisten = [];

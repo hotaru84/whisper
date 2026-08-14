@@ -6,6 +6,7 @@ import {
   DEFAULT_AUDIO_EVENT_SETTINGS,
   RecordingCapture,
   StreamingTranscriber,
+  AudioEventStreamer,
 } from "../lib/asr";
 import type {
   AsrDevice,
@@ -30,12 +31,15 @@ import {
   AppAudioClient,
   AudioMixer,
   WHISPER_SAMPLE_RATE,
+  wavToBlobUrl,
+  createPlaybackController,
 } from "../lib/audio";
 import type {
   PcmRecorderController,
   AudioLevelMeter,
   AudioInputDevice,
   AudioAppInfo,
+  PlaybackController,
 } from "../lib/audio";
 
 /**
@@ -46,6 +50,38 @@ import type {
  */
 export type RecordingStatus = "idle" | "recording" | "processing" | "refining" | "done" | "error";
 export type ModelStatus = "loading" | "ready" | "error";
+
+export interface PlaybackState {
+  recordingId: string | null;
+  loading: boolean;
+  isPlaying: boolean;
+  /** Seconds into the *loaded WAV's own* 0-based timeline -- what the
+   * `<audio>` element actually reports. */
+  currentTimeSec: number;
+  durationSec: number;
+  rate: number;
+  /**
+   * Where the loaded WAV's own timeline sits on `segments`' global timeline
+   * (see `TranscriptSegment.startOffsetSec`'s doc comment). A single history
+   * entry's segments are already 0-based, so this is 0 when browsing history;
+   * within an ongoing session with more than one take, a later take's
+   * segments are offset by however much came before it, and this is that
+   * same offset -- see `refineRecording`'s `baseSec`. Lets `TranscriptPanel`
+   * convert between "where a segment is" and "where the loaded audio is"
+   * without the two ever being confused.
+   */
+  timelineOffsetSec: number;
+}
+
+const IDLE_PLAYBACK: PlaybackState = {
+  recordingId: null,
+  loading: false,
+  isPlaying: false,
+  currentTimeSec: 0,
+  durationSec: 0,
+  rate: 1,
+  timelineOffsetSec: 0,
+};
 
 export interface AsrSettings {
   language: string;
@@ -227,6 +263,12 @@ interface AppState {
    * freshly listed set of currently-active sessions. Unrelated to whether a
    * recording is currently capturing it -- that is internal to `startRecording`. */
   appAudioTargetPid: number | null;
+  /** Playback of a finished recording's WAV -- either the one just recorded
+   * (loaded once `refineRecording` has a path) or a past one selected from
+   * history (loaded by `loadHistoryEntry`). `recordingId` is the same id
+   * `segments`/`audioEvents` are keyed by, so callers can tell whether the
+   * loaded audio actually matches what's on screen. */
+  playback: PlaybackState;
 
   initModel: () => Promise<void>;
   startRecording: () => Promise<void>;
@@ -249,6 +291,16 @@ interface AppState {
    * `refineProgress`, so the same progress UI `refineRecording` drives
    * applies here too. */
   rerunHistoryEntry: (id: string) => Promise<void>;
+  /** Loads `path`'s audio for playback, tagged with `recordingId` so the UI
+   * can tell it apart from whatever was loaded before. Replaces (and
+   * disposes) any previously loaded audio; a no-op if `recordingId` is
+   * already the one loaded. */
+  loadPlayback: (recordingId: string, path: string, timelineOffsetSec?: number) => Promise<void>;
+  unloadPlayback: () => void;
+  togglePlayback: () => void;
+  seekTo: (sec: number) => void;
+  skip: (deltaSec: number) => void;
+  setPlaybackRate: (rate: number) => void;
   clearTranscript: () => void;
   reset: () => void;
 }
@@ -256,6 +308,10 @@ interface AppState {
 let activeRecorder: PcmRecorderController | null = null;
 let activeStreamer: StreamingTranscriber | null = null;
 let activeCapture: RecordingCapture | null = null;
+// Only instantiated when audioEventSettings.enabled at recording start -- see
+// startRecording. Its output is a live preview, always overwritten by the
+// post-hoc pass once the recording stops (events.rs's module doc).
+let activeEventStreamer: AudioEventStreamer | null = null;
 // Whether the current recording has app-audio capture running, so
 // startRecording's frame callback knows whether to mix or pass mic frames
 // through untouched.
@@ -268,6 +324,11 @@ let timelineBaseSec = 0;
 // The second pass replaces everything this recording produced, so it needs both.
 let recordingBaseSec = 0;
 let segmentsBeforeRecording = 0;
+// The live `<audio>` wrapper backing `playback` state, if anything is loaded.
+// Not part of Zustand state itself -- see `createPlaybackController`'s doc
+// comment, same reasoning as `levelMeter` already being a class instance
+// rather than plain data.
+let playbackController: PlaybackController | null = null;
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -292,6 +353,16 @@ function appendStreamingSegment(seg: StreamingSegment) {
     chunks: seg.chunks,
   };
   useAppStore.setState((s) => ({ segments: [...s.segments, segment] }));
+}
+
+// Appends a live window's audio-tagging results (on the current recording's
+// own 0-based timeline) onto the global audioEvents timeline. Mirrors
+// refineRecording's own rebase of the post-hoc pass's events -- see
+// PlaybackState.timelineOffsetSec's doc comment for the same "own timeline
+// vs. global timeline" distinction.
+function appendLiveAudioEvents(events: AudioEvent[]) {
+  const rebased = events.map((e) => ({ ...e, start: e.start + recordingBaseSec, end: e.end + recordingBaseSec }));
+  useAppStore.setState((s) => ({ audioEvents: [...s.audioEvents, ...rebased] }));
 }
 
 // One instance shared by the app-list refresh and the actual capture start/stop:
@@ -406,6 +477,14 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
     return;
   }
 
+  // The WAV is fully written at this point regardless of how the accuracy
+  // pass below goes, so playback becomes available immediately rather than
+  // waiting on (possibly minutes of) diarization/audio-tagging. `baseSec` is
+  // where this take's segments start on the session's global timeline (see
+  // `PlaybackState.timelineOffsetSec`'s doc comment) -- the WAV itself is
+  // always 0-based, only the segments referring to it are shifted.
+  void useAppStore.getState().loadPlayback(idFromWavPath(path), path, baseSec);
+
   useAppStore.setState({ recordingStatus: "refining", refineProgress: 0 });
   try {
     const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
@@ -426,19 +505,22 @@ async function refineRecording(capture: RecordingCapture): Promise<void> {
       audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
     }));
 
-    const refined = segmentsFromResult(result, baseSec, nextSegmentId, speakers, excluded);
-    // segmentsFromResult can assign ids sparser than refined.length -- a chunk
-    // audio tagging excluded still consumes an id, it just produces no
-    // segment -- so advance by how many ids it could have used, not by how
-    // many segments came back, or the next recording could reuse one.
+    const refined = segmentsFromResult(result, baseSec, nextSegmentId, speakers, excluded, newEvents);
+    // One segment per non-blank chunk, always -- an excluded chunk becomes a
+    // blank placeholder rather than being dropped (see
+    // TranscriptSegment.excludedReason), so refined.length === targets.length
+    // whenever there were any chunks to begin with.
     if (targets.length > 0) {
       nextSegmentId += targets.length;
     } else if (refined.length > 0) {
       nextSegmentId += refined.length;
     }
-    // An empty second pass means something went wrong upstream, not that the
-    // meeting was silent -- the live pass already found speech in this audio.
-    if (refined.length > 0) {
+    // An empty (or all-excluded-placeholder) second pass means something went
+    // wrong upstream, not that the meeting was silent -- the live pass
+    // already found speech in this audio. Checked by actual text rather than
+    // refined.length, since a recording audio-tagging excluded *everything*
+    // from now produces only placeholders, not an empty array.
+    if (refined.some((s) => s.text.trim() !== "")) {
       useAppStore.setState((s) => ({
         segments: [...s.segments.slice(0, keptSegments), ...refined],
       }));
@@ -501,6 +583,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   audioInputDevices: [],
   appAudioApps: [],
   appAudioTargetPid: null,
+  playback: IDLE_PLAYBACK,
 
   initModel: async () => {
     try {
@@ -571,6 +654,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         recordingStatus: "done",
         refineNotice: null,
       });
+      void get().loadPlayback(id, await wavPath(id));
     } catch (err) {
       set({ errorMessage: toErrorMessage(err) });
     }
@@ -579,6 +663,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   deleteHistoryEntry: async (id) => {
     try {
       await deleteRecording(id);
+      if (get().playback.recordingId === id) get().unloadPlayback();
       set((s) => ({
         recordingHistory: s.recordingHistory.filter((r) => r.id !== id),
         // Deleting the entry currently being viewed leaves its content on
@@ -614,13 +699,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       // ids -- this entry has no "session" of its own to rebase onto, and
       // saveRecordingHistory always stores under that same convention (see
       // refineRecording's persistence step).
-      const refined = segmentsFromResult(result, 0, 1, speakers, excluded);
-      if (refined.length === 0) {
-        // Mirrors refineRecording's own guard: an empty result is far more
-        // likely a setting change gone wrong (wrong language, an overly
-        // strict threshold) than "this recording legitimately has nothing
-        // in it now" -- the existing history entry is worth more than a
-        // result this suspicious.
+      const refined = segmentsFromResult(result, 0, 1, speakers, excluded, newEvents);
+      if (!refined.some((s) => s.text.trim() !== "")) {
+        // Mirrors refineRecording's own guard: an empty (or all-excluded-
+        // placeholder) result is far more likely a setting change gone wrong
+        // (wrong language, an overly strict threshold) than "this recording
+        // legitimately has nothing in it now" -- the existing history entry
+        // is worth more than a result this suspicious.
         set({
           refineNotice:
             "この設定では文字起こし結果が0件になったため、履歴は上書きしていません。設定を確認してから再度お試しください。",
@@ -654,7 +739,58 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  loadPlayback: async (recordingId, path, timelineOffsetSec = 0) => {
+    if (get().playback.recordingId === recordingId) return;
+    playbackController?.dispose();
+    playbackController = null;
+    set({ playback: { ...IDLE_PLAYBACK, recordingId, timelineOffsetSec, loading: true } });
+    try {
+      const url = await wavToBlobUrl(path);
+      // The user may have switched away (a new recording, a different
+      // history entry) while the file was being read -- don't let a slow
+      // load clobber whatever is current by the time it resolves.
+      if (get().playback.recordingId !== recordingId) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      playbackController = createPlaybackController(url, (snapshot) => {
+        set((s) => (s.playback.recordingId === recordingId ? { playback: { ...s.playback, ...snapshot } } : {}));
+      });
+      set((s) => (s.playback.recordingId === recordingId ? { playback: { ...s.playback, loading: false } } : {}));
+    } catch (err) {
+      console.warn("[playback] failed to load recording audio:", err);
+      set((s) => (s.playback.recordingId === recordingId ? { playback: IDLE_PLAYBACK } : {}));
+    }
+  },
+
+  unloadPlayback: () => {
+    playbackController?.dispose();
+    playbackController = null;
+    set({ playback: IDLE_PLAYBACK });
+  },
+
+  togglePlayback: () => {
+    if (!playbackController) return;
+    if (get().playback.isPlaying) playbackController.pause();
+    else playbackController.play();
+  },
+
+  seekTo: (sec) => playbackController?.seekTo(sec),
+
+  skip: (deltaSec) => {
+    const { currentTimeSec } = get().playback;
+    playbackController?.seekTo(currentTimeSec + deltaSec);
+  },
+
+  setPlaybackRate: (rate) => {
+    playbackController?.setRate(rate);
+    set((s) => ({ playback: { ...s.playback, rate } }));
+  },
+
   startRecording: async () => {
+    // Whatever was loaded for playback (a past recording, or the previous
+    // take) no longer corresponds to what's about to be on screen.
+    get().unloadPlayback();
     try {
       // Transcribe on the fly: the recorder streams PCM frames into the streaming
       // transcriber, which commits transcript segments while recording continues.
@@ -662,6 +798,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         (audio) => asrClient.transcribe(audio, get().settings),
         appendStreamingSegment,
       );
+
+      // Live audio-event preview, only when the feature is on -- see
+      // events.rs's module doc for why this is a preview the post-hoc pass
+      // always overwrites, never the authoritative result.
+      const audioEventSettings = get().audioEventSettings;
+      const eventStreamer = audioEventSettings.enabled
+        ? new AudioEventStreamer(
+            (audio, startSec) => asrClient.detectEventsWindow(audio, startSec, get().audioEventSettings),
+            appendLiveAudioEvents,
+          )
+        : null;
 
       // The same frames also go to disk, for the second pass after stop. If that
       // cannot be started, record anyway: a live-only transcript beats no
@@ -707,10 +854,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       const controller = await startPcmRecording((frame) => {
         const mixed = appAudioActive ? mixer.mix(frame) : frame;
         streamer.pushFrame(mixed);
+        eventStreamer?.pushFrame(mixed);
         if (captureStarted) capture.push(mixed);
       }, get().settings.inputDeviceId || undefined);
       activeRecorder = controller;
       activeStreamer = streamer;
+      activeEventStreamer = eventStreamer;
       activeCapture = captureStarted ? capture : null;
       recordingBaseSec = timelineBaseSec;
       segmentsBeforeRecording = get().segments.length;
@@ -739,6 +888,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       activeRecorder = null;
       activeStreamer = null;
+      activeEventStreamer = null;
       activeCapture = null;
       if (appAudioActive) {
         appAudioActive = false;
@@ -751,10 +901,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   stopRecording: async () => {
     const controller = activeRecorder;
     const streamer = activeStreamer;
+    const eventStreamer = activeEventStreamer;
     const capture = activeCapture;
     if (!controller || !streamer) return;
     activeRecorder = null;
     activeStreamer = null;
+    activeEventStreamer = null;
     activeCapture = null;
     get().levelMeter?.dispose();
     if (appAudioActive) {
@@ -767,6 +919,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       const totalSamples = await controller.stop();
       // Flush any audio not yet committed by the streaming pass.
       await streamer.finish();
+      // Best-effort: a live preview window failing to flush must never hold
+      // up the recording finishing, or (worse) block the post-hoc pass that
+      // is about to supersede it anyway.
+      await eventStreamer?.finish().catch((err) => {
+        console.warn("[audio-events] failed to flush the final live window:", err);
+      });
       timelineBaseSec = recordingBaseSec + totalSamples / WHISPER_SAMPLE_RATE;
       set({ recordingStatus: "done" });
     } catch (err) {
@@ -816,6 +974,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     timelineBaseSec = 0;
     recordingBaseSec = 0;
     segmentsBeforeRecording = 0;
+    get().unloadPlayback();
     set({
       segments: [],
       audioEvents: [],
@@ -827,7 +986,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
-  reset: () => set({ recordingStatus: "idle", errorMessage: null, refineNotice: null }),
+  reset: () => {
+    get().unloadPlayback();
+    set({ recordingStatus: "idle", errorMessage: null, refineNotice: null });
+  },
 }));
 
 // Dev-only diagnostic: transcribe an audio file from a URL through the exact

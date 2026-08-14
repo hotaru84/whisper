@@ -61,3 +61,27 @@ export function isNoiseOrMusicEvent(name: string): boolean {
   const lower = name.toLowerCase();
   return lower.includes("music") || lower.includes("noise") || lower === "static";
 }
+
+/**
+ * Coarse buckets an `AudioEvent.name` (an AudioSet class) sorts into, purely
+ * for picking an icon in `AudioEventPanel`. Deliberately broader/fuzzier than
+ * `is_speech_label`/`is_noise_or_music_label` in `events.rs` -- those decide
+ * whether a transcript chunk gets dropped and have to be conservative, this
+ * one only decides which glyph to draw and can afford to guess.
+ */
+export type AudioEventCategory = "music" | "noise" | "applause" | "speech" | "typing" | "alert" | "other";
+
+export function audioEventCategory(name: string): AudioEventCategory {
+  const n = name.toLowerCase();
+  if (n.includes("music")) return "music";
+  if (n.includes("noise") || n === "static") return "noise";
+  if (n.includes("applause") || n.includes("clap") || n.includes("cheer")) return "applause";
+  if (n.includes("speech") || n.includes("conversation") || n.includes("narration") || n.includes("babbl")) {
+    return "speech";
+  }
+  if (n.includes("typ") || n.includes("keyboard")) return "typing";
+  if (n.includes("alarm") || n.includes("ring") || n.includes("bell") || n.includes("knock") || n.includes("door")) {
+    return "alert";
+  }
+  return "other";
+}

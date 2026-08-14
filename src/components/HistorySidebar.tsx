@@ -13,6 +13,7 @@ import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
+import { formatTimestamp } from "../lib/format";
 
 function formatDateTime(date: Date): { day: string; time: string } {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -20,12 +21,6 @@ function formatDateTime(date: Date): { day: string; time: string } {
     day: `${date.getMonth() + 1}/${date.getDate()}`,
     time: `${p(date.getHours())}:${p(date.getMinutes())}`,
   };
-}
-
-function formatDuration(durationSec: number): string {
-  const m = Math.floor(durationSec / 60);
-  const s = Math.floor(durationSec % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 /** Feature badges are icon-only (no label) to keep each row to one line --
@@ -81,7 +76,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             {day} {time}
           </span>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
-            {formatDuration(meta.durationSec)}
+            {formatTimestamp(meta.durationSec)}
           </span>
         </div>
         {meta.preview && <p className="line-clamp-2 text-xs text-foreground">{meta.preview}</p>}
