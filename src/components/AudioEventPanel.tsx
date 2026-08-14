@@ -5,19 +5,18 @@ import { audioEventLabelJa, audioEventCategory, isNoiseOrMusicEvent } from "../l
 import { AUDIO_EVENT_CATEGORY_ICON } from "../lib/audioEventIcons";
 
 /**
- * Standalone timeline of detected audio events (music, noise, applause, ...).
- * Deliberately separate from `TranscriptPanel`: audio tagging is never
- * inserted into the transcript body -- see `events.rs`'s module doc for why
- * -- so this is the only place its output is shown at all. Noise/music
- * entries are additionally marked "聞き直し推奨" here, which is where use
- * case 3 (the "worth a re-listen" marker) lives; there is no separate
- * per-segment flag on the transcript itself.
+ * Detected audio events (music, noise, applause, ...), shown on its own tab
+ * (see `TranscriptTabs`). Deliberately separate from `TranscriptPanel`: audio
+ * tagging is never inserted into the transcript body -- see `events.rs`'s
+ * module doc for why -- so this is the only place its output is shown at all.
+ * Noise/music entries are additionally marked "聞き直し推奨" here, which is
+ * where use case 3 (the "worth a re-listen" marker) lives; there is no
+ * separate per-segment flag on the transcript itself.
  *
- * Unlike a floating panel that vanishes when there is nothing to show, this
- * always renders its shell: the previous "return null when disabled or
- * empty" behavior caused layout shift every time detection toggled state,
- * and gave the feature no discoverability path (a user who never happened to
- * trigger a detection would never see the panel exists at all).
+ * Always renders its content area rather than returning null when disabled or
+ * empty: doing that used to cause layout shift every time detection toggled
+ * state, and gave the feature no discoverability path (a user who never
+ * happened to trigger a detection would never see it exists at all).
  */
 export function AudioEventPanel() {
   const audioEvents = useAppStore((s) => s.audioEvents);
@@ -29,9 +28,7 @@ export function AudioEventPanel() {
   const hasEvents = audioEvents.length > 0;
 
   return (
-    <div className="flex w-full flex-col gap-2 rounded-lg border border-border p-4">
-      <h2 className="text-sm font-semibold text-foreground">音響イベント</h2>
-
+    <div className="flex w-full flex-1 flex-col gap-2">
       {!audioEventSettings.enabled ? (
         <p className="text-xs text-muted-foreground">音響イベント検出は無効です — 設定から有効にできます。</p>
       ) : hasEvents ? (

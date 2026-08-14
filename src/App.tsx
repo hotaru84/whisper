@@ -6,8 +6,7 @@ import { ModelLoadingOverlay } from "./components/ModelLoadingOverlay";
 import { RecordButton } from "./components/RecordButton";
 import { LevelMeter } from "./components/LevelMeter";
 import { RecordingTimeline } from "./components/RecordingTimeline";
-import { TranscriptPanel } from "./components/TranscriptPanel";
-import { AudioEventPanel } from "./components/AudioEventPanel";
+import { TranscriptTabs } from "./components/TranscriptTabs";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useAppStore, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
 
@@ -136,8 +135,7 @@ function App() {
             </div>
 
             <RecordingTimeline />
-            <TranscriptPanel />
-            <AudioEventPanel />
+            <TranscriptTabs />
           </main>
         </div>
       </div>
