@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus, Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal } from "lucide-react";
+import { Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal } from "lucide-react";
 import { Button } from "./ui/button";
 import {
   DropdownMenu,
@@ -144,41 +144,13 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
  */
 export function HistorySidebar({ width }: { width: number }) {
   const recordingHistory = useAppStore((s) => s.recordingHistory);
-  const clearTranscript = useAppStore((s) => s.clearTranscript);
-  const startRecording = useAppStore((s) => s.startRecording);
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
-  const modelStatus = useAppStore((s) => s.modelStatus);
-  const busy = recordingStatus === "recording" || recordingStatus === "processing" || recordingStatus === "refining";
 
   return (
     <div
       className="flex h-full shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
       style={{ width }}
     >
-      <div className="p-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="w-full justify-start"
-          disabled={busy || modelStatus !== "ready"}
-          // The label promises a new recording, so it starts one -- not just
-          // clears the view (that silently did nothing when there was
-          // nothing to clear, which a user reported as "the button doesn't
-          // do anything"). Clearing first discards whatever is currently
-          // shown (live transcript or a loaded history entry) so the new
-          // recording starts from a blank transcript rather than appending
-          // onto it.
-          onClick={() => {
-            clearTranscript();
-            void startRecording();
-          }}
-        >
-          <Plus className="h-3.5 w-3.5" />
-          新規録音
-        </Button>
-      </div>
-      <ScrollArea className="flex-1 px-2">
+      <ScrollArea className="flex-1 px-2 pt-2">
         {recordingHistory.length === 0 ? (
           <p className="p-2 text-xs text-muted-foreground">録音履歴はまだありません。</p>
         ) : (
