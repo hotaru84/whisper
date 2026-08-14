@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Moon, Sun, MonitorCog, Cpu, Zap, Mic, Cast } from "lucide-react";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { SettingsDialog } from "./SettingsDialog";
-import { useAppStore } from "../store/appStore";
+import { useAppStore, type RecordingPhase } from "../store/appStore";
 import { useThemeStore, type ThemePreference } from "../store/themeStore";
 import { formatTimestamp } from "../lib/format";
 
@@ -21,21 +21,38 @@ const THEME_LABEL: Record<ThemePreference, string> = {
 
 const NO_APP_TARGET = "__none__";
 
-/** Elapsed time since `recordingStatus` last became "recording", ticking
- * every half second. Local to this component -- nothing else in the app
- * needs a live clock, so it isn't worth a store field. */
-function useElapsedRecordingSec(recordingStatus: string): number {
+/**
+ * How long the current take has actually been capturing, ticking every half
+ * second. Local to this component -- nothing else in the app needs a live
+ * clock, so it isn't worth a store field.
+ *
+ * Sums only the *active* spans rather than measuring from a single start
+ * timestamp: paused time is not recorded, so counting it would make the
+ * display disagree with the WAV's real duration and with every segment offset.
+ * Accumulating across spans is also what keeps a resume from resetting the
+ * readout to 0:00, which a plain `Date.now() - startedAt` keyed on the phase
+ * would do every time.
+ */
+function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
   const [elapsed, setElapsed] = useState(0);
+  const activeSecRef = useRef(0);
 
   useEffect(() => {
-    if (recordingStatus !== "recording") {
+    if (recordingPhase === "stopped") {
+      activeSecRef.current = 0;
       setElapsed(0);
       return;
     }
-    const startedAt = Date.now();
-    const id = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 500);
-    return () => clearInterval(id);
-  }, [recordingStatus]);
+    if (recordingPhase === "paused") return; // freeze, keeping the accumulated total
+
+    const spanStart = Date.now();
+    const base = activeSecRef.current;
+    const id = setInterval(() => setElapsed(Math.floor(base + (Date.now() - spanStart) / 1000)), 500);
+    return () => {
+      activeSecRef.current = base + (Date.now() - spanStart) / 1000;
+      clearInterval(id);
+    };
+  }, [recordingPhase]);
 
   return elapsed;
 }
@@ -57,10 +74,15 @@ function InputControls() {
   const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
   const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
+  // Both pickers only take effect at `startRecording`, so leaving them live
+  // mid-take would let the user change a setting that silently does nothing
+  // until the next recording.
+  const locked = useAppStore((s) => s.recordingPhase) !== "stopped";
 
   return (
     <div className="flex items-center gap-1">
       <Select
+        disabled={locked}
         value={settings.inputDeviceId || "__default__"}
         onValueChange={(v) => updateSettings({ inputDeviceId: v === "__default__" ? "" : v })}
       >
@@ -79,6 +101,7 @@ function InputControls() {
       </Select>
 
       <Select
+        disabled={locked}
         value={appAudioTargetPid != null ? String(appAudioTargetPid) : NO_APP_TARGET}
         onValueChange={(v) => setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))}
         onOpenChange={(open) => {
@@ -118,43 +141,53 @@ function InputControls() {
  * ambient parts of that into one persistent strip.
  */
 export function StatusBar() {
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const modelDevice = useAppStore((s) => s.modelDevice);
   const refineProgress = useAppStore((s) => s.refineProgress);
   const preference = useThemeStore((s) => s.preference);
   const setPreference = useThemeStore((s) => s.setPreference);
-  const elapsed = useElapsedRecordingSec(recordingStatus);
+  const elapsed = useElapsedRecordingSec(recordingPhase);
+
+  // One slot, four mutually exclusive occupants: the take's own state wins
+  // while one exists, then the post-stop pipeline, then the idle device chip.
+  const showDeviceChip = recordingPhase === "stopped" && processing === null && modelStatus === "ready" && modelDevice;
 
   return (
     <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-2 text-sm">
       <div className="flex items-center gap-3">
         <InputControls />
 
-        {recordingStatus === "recording" && (
+        {recordingPhase === "recording" && (
           <span className="flex items-center gap-1.5 font-medium text-signal">
             <span className="h-2 w-2 animate-pulse rounded-full bg-signal motion-reduce:animate-none" aria-hidden="true" />
             録音中
             <span className="font-mono tabular-nums">{formatTimestamp(elapsed)}</span>
           </span>
         )}
-        {recordingStatus === "processing" && (
-          <span className="text-muted-foreground">文字起こし処理中…</span>
+        {recordingPhase === "paused" && (
+          // Same signal red (a take is still open) but a static dot, matching
+          // the record button's pulse/no-pulse split for the same two states.
+          <span className="flex items-center gap-1.5 font-medium text-signal">
+            <span className="h-2 w-2 rounded-full bg-signal" aria-hidden="true" />
+            一時停止中
+            <span className="font-mono tabular-nums">{formatTimestamp(elapsed)}</span>
+          </span>
         )}
-        {recordingStatus === "refining" && (
+        {processing === "transcribing" && <span className="text-muted-foreground">文字起こし処理中…</span>}
+        {processing === "refining" && (
           <span className="flex items-center gap-1.5 text-muted-foreground">
             精度向上パス実行中…
             <span className="font-mono tabular-nums">{Math.round(refineProgress ?? 0)}%</span>
           </span>
         )}
-        {(recordingStatus === "idle" || recordingStatus === "done" || recordingStatus === "error") &&
-          modelStatus === "ready" &&
-          modelDevice && (
-            <span className="flex items-center gap-1 text-xs text-muted-foreground">
-              {modelDevice === "vulkan" ? <Zap className="h-3 w-3" /> : <Cpu className="h-3 w-3" />}
-              {modelDevice === "vulkan" ? "Vulkan (GPU)" : "CPU"}
-            </span>
-          )}
+        {showDeviceChip && (
+          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            {modelDevice === "vulkan" ? <Zap className="h-3 w-3" /> : <Cpu className="h-3 w-3" />}
+            {modelDevice === "vulkan" ? "Vulkan (GPU)" : "CPU"}
+          </span>
+        )}
       </div>
 
       <div className="flex items-center gap-1">

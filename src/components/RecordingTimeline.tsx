@@ -113,8 +113,13 @@ export function RecordingTimeline() {
   const seekTo = useAppStore((s) => s.seekTo);
   const skip = useAppStore((s) => s.skip);
   const setPlaybackRate = useAppStore((s) => s.setPlaybackRate);
+  // Playback is a stopped-only capability. `startRecording` also unloads
+  // whatever was loaded, so this is belt-and-braces -- but relying on that
+  // side effect alone is what previously left the Space/arrow shortcuts live
+  // during a take.
+  const stopped = useAppStore((s) => s.recordingPhase) === "stopped";
 
-  const loaded = playback.recordingId != null && !playback.loading;
+  const loaded = stopped && playback.recordingId != null && !playback.loading;
 
   // Space / ←→ per the reference spec's keyboard shortcut table, scoped to
   // whenever a recording is actually loaded for playback so these keys don't
@@ -138,7 +143,7 @@ export function RecordingTimeline() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [loaded, togglePlayback, skip]);
 
-  if (playback.recordingId == null) return null;
+  if (!stopped || playback.recordingId == null) return null;
 
   return (
     <div className="flex w-full flex-col gap-2 rounded-lg border border-border p-4">

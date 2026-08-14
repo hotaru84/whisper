@@ -27,7 +27,7 @@ const idleHistory = () => Array.from({ length: BAR_COUNT }, () => 0);
  * benefit over mutating a handful of already-mounted `<div>`s.
  */
 export function LevelMeter() {
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
   const barRefs = useRef<(HTMLDivElement | null)[]>([]);
   const history = useRef<number[]>(idleHistory());
 
@@ -41,7 +41,10 @@ export function LevelMeter() {
       }
     };
 
-    if (recordingStatus !== "recording") {
+    // Paused included: the mic stream is still open and would keep reporting a
+    // live level, but nothing is being captured, so animating would claim
+    // otherwise.
+    if (recordingPhase !== "recording") {
       paintIdle();
       return;
     }
@@ -63,7 +66,7 @@ export function LevelMeter() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [recordingStatus]);
+  }, [recordingPhase]);
 
   return (
     <div className="flex h-8 w-full items-end gap-0.5" role="img" aria-label="音声レベル">

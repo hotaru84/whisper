@@ -80,7 +80,6 @@ function App() {
   const refreshAudioInputDevices = useAppStore((s) => s.refreshAudioInputDevices);
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
   const refreshRecordingHistory = useAppStore((s) => s.refreshRecordingHistory);
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
   const errorMessage = useAppStore((s) => s.errorMessage);
   const { width: sidebarWidth, onDragHandleDown } = useSidebarWidth();
 
@@ -125,7 +124,7 @@ function App() {
             <div className="w-1 bg-transparent transition-colors group-hover:bg-border group-active:bg-border" />
           </div>
           <main className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
-            {recordingStatus === "error" && errorMessage && (
+            {errorMessage && (
               <p className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{errorMessage}</p>
             )}
 

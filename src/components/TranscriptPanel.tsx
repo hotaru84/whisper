@@ -10,7 +10,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
-import { useAppStore } from "../store/appStore";
+import { useAppStore, selectCapabilities } from "../store/appStore";
 import { combinedText, type TranscriptSegment } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
 import { audioEventLabelJa } from "../lib/audioEvents";
@@ -151,7 +151,9 @@ function getViewport(container: HTMLDivElement | null): HTMLElement | null {
 
 export function TranscriptPanel() {
   const segments = useAppStore((s) => s.segments);
-  const recordingStatus = useAppStore((s) => s.recordingStatus);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
+  const modelStatus = useAppStore((s) => s.modelStatus);
   const refineNotice = useAppStore((s) => s.refineNotice);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
@@ -163,7 +165,8 @@ export function TranscriptPanel() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
-  const prevStatusRef = useRef(recordingStatus);
+  const prevPhaseRef = useRef(recordingPhase);
+  const can = selectCapabilities({ recordingPhase, processing, modelStatus });
 
   const viewingHistory = recordingHistory.find((r) => r.id === selectedHistoryId);
   // Whatever recording is currently loaded for playback -- set both when
@@ -174,11 +177,10 @@ export function TranscriptPanel() {
 
   const hasTranscript = segments.length > 0;
   const text = combinedText(segments);
-  const isRefining = recordingStatus === "refining";
-  const isLive = recordingStatus === "recording" || recordingStatus === "processing";
-  // The transcript is mid-replacement while refining, and the file is still open
-  // while processing, so both have to hold off destructive and export actions.
-  const busy = recordingStatus === "recording" || recordingStatus === "processing" || isRefining;
+  const isRefining = processing === "refining";
+  // "More text is still on its way": a take is open (recording or paused, since
+  // pausing flushes but does not end it), or the final flush is running.
+  const isLive = recordingPhase !== "stopped" || processing === "transcribing";
 
   // Whether `segment` falls inside whatever recording is currently loaded for
   // playback -- see `PlaybackState.timelineOffsetSec`'s doc comment. Only
@@ -203,12 +205,15 @@ export function TranscriptPanel() {
 
   // A fresh recording starts back at the bottom, even if the previous one
   // left auto-scroll suspended (the user had scrolled up to re-read it).
+  // Resuming from a pause deliberately does not reset it: the user very likely
+  // scrolled up to read something during the pause, which is the whole point
+  // of being able to pause.
   useEffect(() => {
-    if (recordingStatus === "recording" && prevStatusRef.current !== "recording") {
+    if (recordingPhase === "recording" && prevPhaseRef.current === "stopped") {
       setAutoScroll(true);
     }
-    prevStatusRef.current = recordingStatus;
-  }, [recordingStatus]);
+    prevPhaseRef.current = recordingPhase;
+  }, [recordingPhase]);
 
   // Track whether the user is at the bottom/away-from-the-playhead, so a
   // manual scroll suspends auto-scroll instead of fighting it on every new
@@ -227,10 +232,10 @@ export function TranscriptPanel() {
   // Follow new segments to the bottom while recording, as long as the user
   // hasn't scrolled away to read something earlier.
   useEffect(() => {
-    if (recordingStatus !== "recording" || !autoScroll) return;
+    if (recordingPhase !== "recording" || !autoScroll) return;
     const viewport = getViewport(scrollContainerRef.current);
     viewport?.scrollTo({ top: viewport.scrollHeight });
-  }, [segments.length, recordingStatus, autoScroll]);
+  }, [segments.length, recordingPhase, autoScroll]);
 
   // Follow the playhead during playback, same escape hatch: a manual scroll
   // (tracked by the same `autoScroll` flag) leaves it wherever the user put it.
@@ -291,7 +296,7 @@ export function TranscriptPanel() {
               variant="outline"
               size="sm"
               onClick={() => void rerunHistoryEntry(currentRecordingId)}
-              disabled={busy}
+              disabled={!can.reanalyze}
               title="現在の設定（話者分離・VAD・音響イベント）でこの録音のパス2（精度向上パス）を再分析し、履歴を上書きします"
             >
               <RotateCw className="h-4 w-4" />
@@ -304,6 +309,7 @@ export function TranscriptPanel() {
               variant="outline"
               size="sm"
               onClick={() => void deleteHistoryEntry(viewingHistory.id)}
+              disabled={!can.browseHistory}
               title="この録音履歴を削除"
             >
               <Trash2 className="h-4 w-4" />
@@ -374,7 +380,7 @@ export function TranscriptPanel() {
           </div>
         )}
 
-        {recordingStatus === "recording" && !autoScroll && (
+        {recordingPhase === "recording" && !autoScroll && (
           <Button
             type="button"
             variant="outline"

@@ -8,8 +8,20 @@ const WORKLET_URL = "/pcm-capture-worklet.js";
 export interface PcmRecorderController {
   /** Stops recording and resolves with the total number of samples captured. */
   stop: () => Promise<number>;
-  /** Stops recording and discards the result. */
-  cancel: () => void;
+  /**
+   * Suspends/resumes frame collection without tearing anything down.
+   *
+   * While paused, frames are dropped *and not counted*, so the paused span is
+   * absent from the recording rather than being captured as silence. Both
+   * halves matter: dropping the frames but still counting them would make
+   * `stop()`'s sample total exceed what actually reached the WAV, and every
+   * downstream timeline (`timelineBaseSec`, segment offsets) is derived from
+   * that total.
+   *
+   * The mic track stays open, so the OS recording indicator does not go off --
+   * this is "stop collecting", not "release the microphone".
+   */
+  setPaused: (paused: boolean) => void;
   /** The live microphone stream, e.g. for driving a level meter. */
   stream: MediaStream;
   /**
@@ -61,7 +73,9 @@ export async function startPcmRecording(
   const node = new AudioWorkletNode(audioCtx, "pcm-capture");
 
   let totalSamples = 0;
+  let paused = false;
   node.port.onmessage = (event: MessageEvent<Float32Array>) => {
+    if (paused) return;
     const frame = event.data;
     totalSamples += frame.length;
     onFrame(frame);
@@ -83,12 +97,12 @@ export async function startPcmRecording(
   return {
     stream,
     usedFallbackDevice,
+    setPaused: (next: boolean) => {
+      paused = next;
+    },
     stop: async () => {
       teardown();
       return totalSamples;
-    },
-    cancel: () => {
-      teardown();
     },
   };
 }
