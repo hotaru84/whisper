@@ -153,7 +153,6 @@ export function TranscriptPanel() {
   const segments = useAppStore((s) => s.segments);
   const recordingStatus = useAppStore((s) => s.recordingStatus);
   const refineNotice = useAppStore((s) => s.refineNotice);
-  const clearTranscript = useAppStore((s) => s.clearTranscript);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
@@ -299,17 +298,6 @@ export function TranscriptPanel() {
               パス2を再分析
             </Button>
           )}
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={clearTranscript}
-            disabled={!hasTranscript || busy}
-            title="文字起こしをすべて消して新規に開始"
-          >
-            <Trash2 className="h-4 w-4" />
-            新規
-          </Button>
           {viewingHistory && (
             <Button
               type="button"

@@ -273,6 +273,7 @@ interface AppState {
   initModel: () => Promise<void>;
   startRecording: () => Promise<void>;
   stopRecording: () => Promise<void>;
+  cancelRecording: () => void;
   updateSettings: (partial: Partial<AsrSettings>) => void;
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
@@ -939,6 +940,44 @@ export const useAppStore = create<AppState>((set, get) => ({
     // windows produced. Runs after the live result is already on screen, so the
     // user has a transcript throughout.
     if (capture) await refineRecording(capture);
+  },
+
+  /**
+   * Aborts the in-progress recording outright: stops capturing immediately
+   * and discards everything this take produced, as if it never started --
+   * no flush, no second pass, no history entry. Unlike `stopRecording`, the
+   * WAV capture is simply abandoned rather than finished; `capture.rs`'s
+   * `start_capture` doc explains why that costs nothing (the next
+   * recording's own `start_capture` drops whatever was left open).
+   */
+  cancelRecording: () => {
+    const controller = activeRecorder;
+    const streamer = activeStreamer;
+    if (!controller || !streamer) return;
+    activeRecorder = null;
+    activeStreamer = null;
+    activeEventStreamer = null;
+    activeCapture = null;
+    controller.cancel();
+    get().levelMeter?.dispose();
+    if (appAudioActive) {
+      appAudioActive = false;
+      void appAudioClient.stopCapture();
+    }
+
+    const keptSegments = segmentsBeforeRecording;
+    const baseSec = recordingBaseSec;
+    set((s) => ({
+      segments: s.segments.slice(0, keptSegments),
+      audioEvents: s.audioEvents.filter((e) => e.start < baseSec),
+      levelMeter: null,
+      // Whatever was on screen before this take started -- a blank slate if
+      // it was the first recording, or the previous take/history entry
+      // otherwise (see `recordingBaseSec`/`segmentsBeforeRecording`'s doc
+      // comment above their declaration).
+      recordingStatus: keptSegments > 0 ? "done" : "idle",
+      errorMessage: null,
+    }));
   },
 
   updateSettings: (partial) =>
