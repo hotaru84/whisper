@@ -258,11 +258,15 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
         segments: localSegments,
         audioEvents: newEvents,
       });
-      void useAppStore.getState().refreshRecordingHistory();
-      // Only now does this take actually have a history entry to be
-      // "viewed" -- marking it any earlier (e.g. right after the WAV was
-      // ready) would claim a delete/reanalyze button for something not
-      // yet in `recordingHistory`.
+      // Awaited, not fire-and-forget: only once `recordingHistory` actually
+      // contains this entry does `markRecordingViewed` below have anything
+      // for `TranscriptPanel`/`HistorySidebar` to find by id. A `void` here
+      // let `viewedRecordingId` become "correct" a beat before the sidebar
+      // list caught up, so the delete button and the "履歴を表示中" banner
+      // both failed their lookup for the length of that IPC round-trip --
+      // the same bug `finishRecordOnly` (this function's record-only
+      // counterpart) already avoids by awaiting the equivalent call.
+      await useAppStore.getState().refreshRecordingHistory();
       markRecordingViewed(recordingId);
       // Only worth surfacing when the live pass actually had something the
       // second pass then lost -- a genuinely silent recording ending up

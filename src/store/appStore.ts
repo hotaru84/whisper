@@ -5,7 +5,6 @@ import {
   AudioEventStreamer,
 } from "../lib/asr";
 import type {
-  AsrDevice,
   DiarizeSettings,
   VadSettings,
   AudioEventSettings,
@@ -16,7 +15,7 @@ import type {
 import type { TranscriptSegment } from "../lib/transcript";
 import { segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording, wavPath } from "../lib/history";
-import type { RecordingHistoryMeta } from "../lib/history";
+import type { RecordingHistoryMeta, RecordingHistoryEntry } from "../lib/history";
 import {
   startPcmRecording,
   decodeAudioToPcm16k,
@@ -92,7 +91,6 @@ interface AppState {
   /** The post-stop pipeline, orthogonal to `recordingPhase`. */
   processing: ProcessingPhase;
   modelStatus: ModelStatus;
-  modelDevice: AsrDevice | null;
   /** Accumulated transcript. Grows across start/stop cycles. */
   segments: TranscriptSegment[];
   /**
@@ -224,6 +222,31 @@ interface AppState {
 }
 
 /**
+ * Fields above that must change *together*, and where that's enforced. Every
+ * bug found in this store so far (see git history around `viewedRecordingId`,
+ * `resetToBlankSession`, `markRecordingViewed`) was one of these clusters
+ * drifting out of sync because a call site updated only some of its members.
+ * Before adding a new `set()`/`setState()` call that touches any field
+ * listed below, check whether it belongs in one of these groups instead.
+ *
+ * - `segments` / `audioEvents` / `viewedRecordingId` / `playback.recordingId`
+ *   -- together represent "what recording is currently on screen". Write
+ *   through `resetToBlankSession` (leaving), `viewLoadedRecording` (opening
+ *   a past entry), or `markRecordingViewed` (a just-finished take claiming
+ *   the entry it was just filed under) -- never a bespoke `set()`.
+ * - `recordingPhase` / `processing` / `modelStatus` -- deliberately
+ *   orthogonal axes (see each field's own doc comment and `capabilities.ts`),
+ *   not a cluster in the same sense, but any transition that changes more
+ *   than one of them must do so in a single `set()` call so a reader never
+ *   observes a combination that shouldn't exist.
+ * - `refineProgress` -- only meaningful while `processing === "refining"`;
+ *   every writer (both in this file, plus `clients.ts`'s `onRefineProgress`
+ *   handler for the one write site outside it) must check that before
+ *   applying an update, since the backend event feeding it isn't guaranteed
+ *   to stop arriving the instant the frontend moves on.
+ */
+
+/**
  * `selectCapabilities` against the store's own shape, so the actions below
  * don't each have to remember that `recordOnly` lives one level down inside
  * `recordingMode`. Components build the argument themselves instead, because
@@ -259,6 +282,33 @@ function resetToBlankSession(
     segments: [],
     audioEvents: [],
     viewedRecordingId: null,
+    refineNotice: null,
+    errorMessage: null,
+  });
+}
+
+/**
+ * Loads a past recording's own content as what's now on screen --
+ * `resetToBlankSession`'s counterpart on the "entering" side for
+ * `loadHistoryEntry`. Rebases the module-level timeline counters (`timeline.ts`)
+ * onto this entry the same way `resetToBlankSession` does when leaving one,
+ * so a browsed entry's segments/audio events land at the right offsets
+ * whether or not the user goes on to press record afterward.
+ *
+ * `loadPlayback` is deliberately left to the caller, same as
+ * `resetToBlankSession` leaves `unloadPlayback` to itself rather than a
+ * separate helper -- both are one line, and keeping them inline next to
+ * their one call site is clearer than a wrapper with a single caller.
+ */
+function viewLoadedRecording(set: Parameters<StateCreator<AppState>>[0], entry: RecordingHistoryEntry): void {
+  setNextSegmentId(entry.segments.length + 1);
+  setTimelineBaseSec(entry.durationSec);
+  setRecordingBaseSec(entry.durationSec);
+  setSegmentsBeforeRecording(entry.segments.length);
+  set({
+    segments: entry.segments,
+    audioEvents: entry.audioEvents,
+    viewedRecordingId: entry.id,
     refineNotice: null,
     errorMessage: null,
   });
@@ -316,7 +366,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   // mode never does, and starting in "loading" would put the blocking overlay
   // on screen for a load that is never going to happen.
   modelStatus: "idle",
-  modelDevice: null,
   segments: [],
   audioEvents: [],
   recordingHistory: [],
@@ -390,32 +439,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   loadHistoryEntry: async (id) => {
-    // Loading an entry rewrites `segments` and every timeline counter below,
-    // so doing it mid-take would leave the running recorder writing against
-    // the history entry's offsets -- the transcript would then be truncated
-    // at the wrong point when the take stops.
+    // Loading an entry rewrites `segments` and every timeline counter
+    // `viewLoadedRecording` sets, so doing it mid-take would leave the
+    // running recorder writing against the history entry's offsets -- the
+    // transcript would then be truncated at the wrong point when the take
+    // stops.
     if (!capabilitiesOf(get()).browseHistory) return;
     try {
       const entry = await loadRecording(id);
-      // Replaces what's on screen the same way starting fresh does, except the
-      // fresh state is the loaded history entry instead of an empty transcript.
-      // These counters matter only while merely browsing -- if the user goes on
-      // to press record, `startRecording` resets them (and clears `segments`)
-      // to start a genuinely new session rather than appending after this entry.
-      setNextSegmentId(entry.segments.length + 1);
-      setTimelineBaseSec(entry.durationSec);
-      setRecordingBaseSec(entry.durationSec);
-      setSegmentsBeforeRecording(entry.segments.length);
-      set({
-        segments: entry.segments,
-        audioEvents: entry.audioEvents,
-        viewedRecordingId: id,
-        refineNotice: null,
-        // The banner is now driven by `errorMessage` alone, so a previous
-        // failure has to be cleared by the next thing that succeeds -- it
-        // would otherwise sit there describing something already recovered from.
-        errorMessage: null,
-      });
+      // These counters matter only while merely browsing -- if the user goes
+      // on to press record, `startRecording` resets them (and clears
+      // `segments`) to start a genuinely new session rather than appending
+      // after this entry.
+      viewLoadedRecording(set, entry);
       void get().loadPlayback(id, await wavPath(id));
     } catch (err) {
       set({ errorMessage: toErrorMessage(err) });

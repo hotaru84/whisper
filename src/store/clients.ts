@@ -22,10 +22,18 @@ import { useAppStore } from "./appStore";
 export const appAudioClient = new AppAudioClient();
 
 export const asrClient = new AsrClient({
-  onDeviceInfo: (device) => useAppStore.setState({ modelDevice: device }),
   onModelReady: () => useAppStore.setState({ modelStatus: "ready" }),
   onError: (message) => useAppStore.setState({ modelStatus: "error", errorMessage: message }),
-  onRefineProgress: (percent) => useAppStore.setState({ refineProgress: percent }),
+  // `refineProgress` only means anything while `processing === "refining"`
+  // (see appStore.ts's field-cluster doc comment) -- this event isn't
+  // guaranteed to stop arriving the instant the frontend's own `finally`
+  // block resets both to null, so a late/stray one must not resurrect
+  // `refineProgress` on its own.
+  onRefineProgress: (percent) => {
+    if (useAppStore.getState().processing === "refining") {
+      useAppStore.setState({ refineProgress: percent });
+    }
+  },
 });
 
 // Keeps the settings dropdown in sync when a microphone is plugged or
