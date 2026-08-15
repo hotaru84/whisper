@@ -33,7 +33,7 @@ import {
   getRecordingBaseSec,
   getSegmentsBeforeRecording,
 } from "./timeline";
-import { useAppStore } from "./appStore";
+import { useAppStore, markRecordingViewed } from "./appStore";
 
 /** The filename stem `capture.rs` uses for both the WAV and (once
  * `history.ts` writes it) its sidecar JSON, extracted from the full path
@@ -203,46 +203,85 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
     } else if (refined.length > 0) {
       consumeSegmentIds(refined.length);
     }
+
+    const recordingId = idFromWavPath(path);
     // An empty (or all-excluded-placeholder) second pass means something went
     // wrong upstream, not that the meeting was silent -- the live pass
     // already found speech in this audio. Checked by actual text rather than
     // refined.length, since a recording audio-tagging excluded *everything*
     // from now produces only placeholders, not an empty array.
-    if (refined.some((s) => s.text.trim() !== "")) {
+    const secondPassUsable = refined.some((s) => s.text.trim() !== "");
+
+    if (secondPassUsable) {
       useAppStore.setState((s) => ({
         segments: [...s.segments.slice(0, keptSegments), ...refined],
       }));
-
-      // Persisted on the recording's own 0-based timeline (not the session's
-      // global one) and with freshly sequential ids, so a history entry looks
-      // identical whether it was the first or the fifth recording of its
-      // original session -- see history.ts's module doc.
-      const localSegments = refined.map((s, i) => ({
-        ...s,
-        id: i + 1,
-        startOffsetSec: s.startOffsetSec - baseSec,
-      }));
-      try {
-        await saveRecordingHistory(idFromWavPath(path), {
-          durationSec: recordingDurationSec,
-          language: settings.language,
-          transcribed: true,
-          usedDiarize: diarizeSettings.enabled,
-          usedVad: vadSettings.enabled,
-          usedAudioEvents: audioEventSettings.enabled,
-          segments: localSegments,
-          audioEvents: newEvents,
-        });
-        void useAppStore.getState().refreshRecordingHistory();
-      } catch (err) {
-        // The transcript on screen (and its place in this session) is
-        // unaffected -- only future browsing of it from the history sidebar
-        // is lost, which is a much smaller loss than any other failure path
-        // in this function.
+    }
+    // The live pass's own segments for this take -- already on screen, and
+    // (unlike `refined`) never replaced when the second pass comes back
+    // suspicious. Sliced out here regardless of `secondPassUsable`, since
+    // whether it has anything in it also distinguishes two very different
+    // reasons `refined` might be empty: something went wrong upstream (this
+    // has text -- fall back to it below), versus the recording was
+    // genuinely silent throughout (this is empty too -- nothing went wrong,
+    // there's just nothing to transcribe).
+    const liveSegments = useAppStore.getState().segments.slice(keptSegments);
+    const liveHasText = liveSegments.some((s) => s.text.trim() !== "");
+    // Whichever segments are now this take's authoritative record -- the
+    // second pass's, if it produced anything usable, otherwise the live
+    // pass's -- always get saved. This used to be conditional on
+    // `secondPassUsable`, which meant an empty second pass made the take
+    // vanish from history for good: the WAV stayed valid on disk, but with
+    // no sidecar `listRecordings` could never find it again -- exactly the
+    // one thing `finishRecordOnly`'s own doc comment says this feature must
+    // never do to a take. Persisted on the recording's own 0-based timeline
+    // (not the session's global one) and with freshly sequential ids, so a
+    // history entry looks identical whether it was the first or the fifth
+    // recording of its original session -- see history.ts's module doc.
+    const localSegments = (secondPassUsable ? refined : liveSegments).map((s, i) => ({
+      ...s,
+      id: i + 1,
+      startOffsetSec: s.startOffsetSec - baseSec,
+    }));
+    try {
+      await saveRecordingHistory(recordingId, {
+        durationSec: recordingDurationSec,
+        language: settings.language,
+        transcribed: true,
+        // Speaker labels and VAD-based exclusion only ever land on the
+        // second pass's own segments -- claiming them here when the live
+        // pass's segments are what actually got saved would describe data
+        // that isn't there.
+        usedDiarize: secondPassUsable && diarizeSettings.enabled,
+        usedVad: secondPassUsable && vadSettings.enabled,
+        usedAudioEvents: audioEventSettings.enabled,
+        segments: localSegments,
+        audioEvents: newEvents,
+      });
+      void useAppStore.getState().refreshRecordingHistory();
+      // Only now does this take actually have a history entry to be
+      // "viewed" -- marking it any earlier (e.g. right after the WAV was
+      // ready) would claim a delete/reanalyze button for something not
+      // yet in `recordingHistory`.
+      markRecordingViewed(recordingId);
+      // Only worth surfacing when the live pass actually had something the
+      // second pass then lost -- a genuinely silent recording ending up
+      // with an empty transcript both times is not a failure worth
+      // reporting as one.
+      if (!secondPassUsable && liveHasText) {
         useAppStore.setState({
-          refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+          refineNotice:
+            "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離・VAD は未適用です）。設定を確認のうえ「再解析」をお試しください。",
         });
       }
+    } catch (err) {
+      // The transcript on screen (and its place in this session) is
+      // unaffected -- only future browsing of it from the history sidebar
+      // is lost, which is a much smaller loss than any other failure path
+      // in this function.
+      useAppStore.setState({
+        refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+      });
     }
   } catch (err) {
     useAppStore.setState({
@@ -288,6 +327,15 @@ export async function finishRecordOnly(capture: RecordingCapture): Promise<void>
       audioEvents: [],
     });
     await useAppStore.getState().refreshRecordingHistory();
+    // Marks this recording as the one being viewed, same as clicking it in
+    // the sidebar would -- without this, the entry existed on disk and was
+    // loaded for playback, but nothing about the screen said so: no delete
+    // button, and the transcript area still showed the "start a recording"
+    // placeholder instead of this one's (empty, since nothing has
+    // transcribed it yet) content. See `markRecordingViewed`'s doc comment
+    // for why this needs its own guard even though nothing can race the
+    // *recording* itself in record-only mode.
+    markRecordingViewed(id);
   } catch (err) {
     useAppStore.setState({
       refineNotice: `録音の保存に失敗したため、履歴に残せませんでした: ${toErrorMessage(err)}`,

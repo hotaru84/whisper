@@ -32,14 +32,18 @@ function MicPicker() {
           <Mic className="h-3.5 w-3.5" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-auto min-w-56 max-w-80">
+      <DropdownMenuContent align="start" collisionPadding={8} className="w-auto min-w-56 max-w-96">
         <DropdownMenuRadioGroup
           value={currentValue}
           onValueChange={(v) => updateSettings({ inputDeviceId: v === "__default__" ? "" : v })}
         >
           <DropdownMenuRadioItem value="__default__">既定のマイク</DropdownMenuRadioItem>
+          {/* Wrapped, not truncated: a cut-off device name is exactly the
+              ambiguity this menu exists to resolve (which physical mic is
+              which), so a long label grows the row instead of hiding its
+              own tail behind an ellipsis. */}
           {audioInputDevices.map((d) => (
-            <DropdownMenuRadioItem key={d.deviceId} value={d.deviceId} className="truncate">
+            <DropdownMenuRadioItem key={d.deviceId} value={d.deviceId} className="whitespace-normal break-words">
               {d.label}
             </DropdownMenuRadioItem>
           ))}
@@ -87,15 +91,15 @@ function TargetAppPicker() {
           )}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-auto min-w-56 max-w-80">
+      <DropdownMenuContent align="start" collisionPadding={8} className="w-auto min-w-56 max-w-96">
         <DropdownMenuRadioGroup
           value={currentValue}
           onValueChange={(v) => setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))}
         >
           <DropdownMenuRadioItem value={NO_APP_TARGET}>対象アプリなし（マイクのみ）</DropdownMenuRadioItem>
           {appAudioApps.map((a) => (
-            <DropdownMenuRadioItem key={a.processId} value={String(a.processId)} className="truncate">
-              <span className="flex items-center gap-1.5">
+            <DropdownMenuRadioItem key={a.processId} value={String(a.processId)}>
+              <span className="flex items-center gap-1.5 whitespace-normal break-words">
                 {a.icon ? (
                   <img src={a.icon} alt="" className="h-4 w-4 shrink-0" />
                 ) : (
@@ -157,10 +161,14 @@ export function TitleBarControls() {
       {/* Labelled, not icon-only, unlike the pickers above: their effect is
           their own current value, but this one's effect is an *absence* (no
           live transcript appears) that no icon conveys on its own. The
-          tooltip carries the why; the label carries the what. */}
+          tooltip carries the why; the label carries the what.
+          `default` (a solid filled pill), not `secondary`, when active --
+          `secondary`'s fill sits only a few percent off the titlebar's own
+          background, which read as barely-there in practice. A full fill is
+          the only treatment unambiguous at this button's size. */}
       <Button
         type="button"
-        variant={recordOnly ? "secondary" : "ghost"}
+        variant={recordOnly ? "default" : "ghost"}
         size="sm"
         disabled={modeLocked}
         aria-pressed={recordOnly}

@@ -65,9 +65,12 @@ function App() {
   const takeOpen = recordingPhase !== "stopped";
   // Nothing to show on the right at all: no transcript, no loaded audio, no
   // pass running. Only then does the record button become the panel's whole
-  // content. Note this is *not* the same as "no history entry selected" --
-  // `selectedHistoryId` stays null right after a recording finishes, but by
-  // then `segments` and/or `playback.recordingId` are populated.
+  // content. Note this is *not* the same as "no recording currently viewed"
+  // (`viewedRecordingId == null`) -- that field only catches up to a
+  // just-finished take once its post-stop pipeline resolves (see
+  // `markRecordingViewed`), so checking it here instead would flash the
+  // hero button for the gap while `segments`/`playback.recordingId` are
+  // already populated but the entry isn't "viewed" yet.
   const idleEmpty = !takeOpen && processing === null && segmentCount === 0 && playbackRecordingId == null;
 
   useEffect(() => {

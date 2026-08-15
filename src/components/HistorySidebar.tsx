@@ -1,4 +1,13 @@
-import { Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal, FileAudio } from "lucide-react";
+import {
+  Trash2,
+  Users,
+  Wand2,
+  AudioLines,
+  Copy,
+  Download,
+  MoreHorizontal,
+  FileAudio,
+} from "lucide-react";
 import { Button } from "./ui/button";
 import {
   DropdownMenu,
@@ -34,7 +43,9 @@ function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
     <span className="flex items-center gap-1 text-muted-foreground">
       {meta.usedDiarize && <Users className="h-3 w-3" aria-label="話者分離" />}
       {meta.usedVad && <Wand2 className="h-3 w-3" aria-label="VAD" />}
-      {meta.usedAudioEvents && <AudioLines className="h-3 w-3" aria-label="音響イベント検出" />}
+      {meta.usedAudioEvents && (
+        <AudioLines className="h-3 w-3" aria-label="音響イベント検出" />
+      )}
     </span>
   );
 }
@@ -57,25 +68,32 @@ function useHistoryRowActions(id: string) {
 }
 
 function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
-  const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
+  const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
+  const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
-  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
+  const can = selectCapabilities({
+    recordingPhase,
+    processing,
+    modelStatus,
+    recordOnly,
+  });
   // Opening an entry replaces the on-screen transcript and every timeline
   // counter, so it is a stopped-only action -- the store enforces this too,
   // but a dead-looking click is worse than a disabled control.
   const browsable = recordingPhase === "stopped";
-  const { confirming: confirmingDelete, onClick: onDeleteClick } = useConfirmClick(() => {
-    void deleteHistoryEntry(meta.id);
-  });
+  const { confirming: confirmingDelete, onClick: onDeleteClick } =
+    useConfirmClick(() => {
+      void deleteHistoryEntry(meta.id);
+    });
   const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
-  const selected = selectedHistoryId === meta.id;
+  const selected = viewedRecordingId === meta.id;
 
   return (
     <div
@@ -89,7 +107,15 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
         type="button"
         className="flex flex-col gap-1 text-left"
         disabled={!browsable}
-        onClick={() => void loadHistoryEntry(meta.id)}
+        aria-pressed={selected}
+        title={selected ? "選択を解除" : undefined}
+        // Clicking the already-selected row again backs out to the blank
+        // "record to begin" screen instead of doing nothing -- otherwise
+        // browsing history was a one-way door with no way back short of
+        // starting a new recording or picking a different entry.
+        onClick={() =>
+          selected ? deselectHistoryEntry() : void loadHistoryEntry(meta.id)
+        }
       >
         <div className="flex items-center justify-between gap-2">
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
@@ -100,7 +126,11 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           </span>
         </div>
         {meta.transcribed ? (
-          meta.preview && <p className="line-clamp-2 text-xs text-foreground">{meta.preview}</p>
+          meta.preview && (
+            <p className="line-clamp-2 text-xs text-foreground">
+              {meta.preview}
+            </p>
+          )
         ) : (
           <p className="flex items-center gap-1 text-xs text-muted-foreground">
             <FileAudio className="h-3 w-3" aria-hidden="true" />
@@ -143,7 +173,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
               variant="ghost"
               size="sm"
               className="h-6 px-2 opacity-0 group-hover:opacity-100"
-              aria-label="コピー・保存"
+              aria-label="保存"
               onClick={(e) => e.stopPropagation()}
             >
               <MoreHorizontal className="h-3 w-3" />
@@ -153,15 +183,24 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             {/* Copying/exporting an unanalyzed entry would silently produce an
                 empty file -- disabled rather than hidden, so the row's actions
                 stay in the same place regardless of transcription state. */}
-            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleCopy()}>
+            <DropdownMenuItem
+              disabled={!meta.transcribed}
+              onSelect={() => void handleCopy()}
+            >
               <Copy className="h-4 w-4" />
               コピー
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleExport("txt")}>
+            <DropdownMenuItem
+              disabled={!meta.transcribed}
+              onSelect={() => void handleExport("txt")}
+            >
               <Download className="h-4 w-4" />
               .txt として保存
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={!meta.transcribed} onSelect={() => void handleExport("srt")}>
+            <DropdownMenuItem
+              disabled={!meta.transcribed}
+              onSelect={() => void handleExport("srt")}
+            >
               <Download className="h-4 w-4" />
               .srt として保存
             </DropdownMenuItem>
@@ -177,7 +216,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           onClick={onDeleteClick}
         >
           <Trash2 className="h-3 w-3" />
-          {confirmingDelete ? "本当に削除" : "削除"}
+          {confirmingDelete ? "本当に削除?" : "削除"}
         </Button>
       </div>
     </div>
@@ -213,7 +252,9 @@ export function HistorySidebar({ width }: { width: number }) {
       <div className="min-h-0 flex-1 pt-2 pl-2">
         <ScrollArea className="h-full">
           {recordingHistory.length === 0 ? (
-            <p className="p-2 text-xs text-muted-foreground">録音履歴はまだありません。</p>
+            <p className="p-2 text-xs text-muted-foreground">
+              録音履歴はまだありません。
+            </p>
           ) : (
             <div className="flex flex-col gap-1 pb-2">
               {recordingHistory.map((meta) => (

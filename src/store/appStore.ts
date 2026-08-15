@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create, type StateCreator } from "zustand";
 import {
   RecordingCapture,
   StreamingTranscriber,
@@ -108,9 +108,24 @@ interface AppState {
    * delete. Metadata only -- opening one reads its full content on demand
    * via `loadHistoryEntry`, see `lib/history.ts`. */
   recordingHistory: RecordingHistoryMeta[];
-  /** The history entry currently shown in `segments`/`audioEvents`, if any.
-   * `null` means the live/current session, not "no recordings exist". */
-  selectedHistoryId: string | null;
+  /**
+   * The id of whichever specific saved recording `segments`/`audioEvents`/
+   * `playback` currently represent, if any -- regardless of how it got
+   * there: picked from the sidebar, or just finished (live or record-only).
+   * `null` means the live/in-progress session, not "no recordings exist".
+   *
+   * This is the single field every "is recording X currently on screen"
+   * question should be answered from (the sidebar's row highlight, the
+   * transcript panel's delete/reanalyze buttons, `rerunHistoryEntry`'s
+   * "refresh what's shown"). It used to be narrower (`selectedHistoryId`,
+   * set only by `loadHistoryEntry`) and every other "here's a recording to
+   * show" call site had to remember to update it by hand -- one didn't
+   * (`finishRecordOnly`), which is what let a record-only take finish into a
+   * screen with no delete button and no indication anything was selected.
+   * Writes go through `markRecordingViewed`/`resetToBlankSession` (both
+   * below) rather than ad hoc `set()` calls, so that can't happen again.
+   */
+  viewedRecordingId: string | null;
   errorMessage: string | null;
   /**
    * Why the second pass did not happen, when the live transcript is still good.
@@ -184,6 +199,10 @@ interface AppState {
   refreshAppAudioApps: () => Promise<void>;
   refreshRecordingHistory: () => Promise<void>;
   loadHistoryEntry: (id: string) => Promise<void>;
+  /** Backs out of viewing whatever recording is currently shown (browsed
+   * from the sidebar, or just finished) to the same blank state a fresh
+   * session starts in -- no-op if nothing is being viewed. */
+  deselectHistoryEntry: () => void;
   deleteHistoryEntry: (id: string) => Promise<void>;
   /** Re-runs the accuracy pass (transcribe + diarize + audio-tag, per
    * whatever is currently enabled in settings) against a past recording's
@@ -220,6 +239,53 @@ function capabilitiesOf(s: Pick<AppState, "recordingPhase" | "processing" | "mod
   });
 }
 
+/**
+ * Clears whatever recording -- the live/just-finished one, or a past entry
+ * loaded from history -- is currently on screen, back to the same blank
+ * state a fresh session starts in. Shared by `deselectHistoryEntry` (an
+ * explicit "stop browsing this" click) and `deleteHistoryEntry` (when the
+ * entry being deleted is the one currently shown): both are "nothing valid
+ * is left to display" moments, and leaving the old segments/audio in view
+ * after either would show content that no longer corresponds to anything on
+ * disk.
+ */
+function resetToBlankSession(
+  set: Parameters<StateCreator<AppState>>[0],
+  get: Parameters<StateCreator<AppState>>[1],
+): void {
+  resetTimeline();
+  get().unloadPlayback();
+  set({
+    segments: [],
+    audioEvents: [],
+    viewedRecordingId: null,
+    refineNotice: null,
+    errorMessage: null,
+  });
+}
+
+/**
+ * Marks `id` as the recording `segments`/`audioEvents`/`playback` now
+ * represent -- `resetToBlankSession`'s counterpart on the "entering" side,
+ * for the two places (`refineRecording`, `finishRecordOnly`) that finish
+ * filing a just-recorded take into history and need to say so.
+ *
+ * `loadHistoryEntry` does not go through this: it sets `viewedRecordingId`
+ * synchronously as part of its own single `set()`, before `playback.
+ * recordingId` has caught up (`loadPlayback` runs after, fire-and-forget),
+ * so the guard below would reject it. The guard exists for the other two
+ * callers specifically because they call this *after* an `await` (saving to
+ * disk) -- `browseHistory` is gated on `recordingPhase` alone, not
+ * `processing`, so picking a *different* entry from the sidebar while a save
+ * is still in flight is reachable. Without the guard, the stale call
+ * resolving afterwards would stomp that new selection back to the take that
+ * just finished.
+ */
+export function markRecordingViewed(id: string): void {
+  if (useAppStore.getState().playback.recordingId !== id) return;
+  useAppStore.setState({ viewedRecordingId: id });
+}
+
 let activeRecorder: PcmRecorderController | null = null;
 let activeStreamer: StreamingTranscriber | null = null;
 let activeCapture: RecordingCapture | null = null;
@@ -254,7 +320,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   segments: [],
   audioEvents: [],
   recordingHistory: [],
-  selectedHistoryId: null,
+  viewedRecordingId: null,
   errorMessage: null,
   refineNotice: null,
   refineProgress: null,
@@ -343,7 +409,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({
         segments: entry.segments,
         audioEvents: entry.audioEvents,
-        selectedHistoryId: id,
+        viewedRecordingId: id,
         refineNotice: null,
         // The banner is now driven by `errorMessage` alone, so a previous
         // failure has to be cleared by the next thing that succeeds -- it
@@ -356,20 +422,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  deselectHistoryEntry: () => {
+    if (!capabilitiesOf(get()).browseHistory) return;
+    if (get().viewedRecordingId === null) return;
+    resetToBlankSession(set, get);
+  },
+
   deleteHistoryEntry: async (id) => {
     if (!capabilitiesOf(get()).browseHistory) return;
     try {
       await deleteRecording(id);
-      if (get().playback.recordingId === id) get().unloadPlayback();
+      // `viewedRecordingId` alone would almost always be enough, but this is
+      // reachable (`browseHistory` is gated on `recordingPhase`, not
+      // `processing`) during the narrow async window inside
+      // `refineRecording`/`finishRecordOnly` between `loadPlayback` setting
+      // `playback.recordingId` and `markRecordingViewed` catching up to it --
+      // keeping both checks means a delete landing in that window still
+      // triggers the reset instead of leaving orphaned segments/playback
+      // behind.
+      const wasShown = get().viewedRecordingId === id || get().playback.recordingId === id;
       set((s) => ({
         recordingHistory: s.recordingHistory.filter((r) => r.id !== id),
-        // Deleting the entry currently being viewed leaves its content on
-        // screen (nothing forces the user back to a blank state), but it no
-        // longer corresponds to anything on disk -- clear the selection so a
-        // later reload doesn't try to fetch a file that is gone.
-        selectedHistoryId: s.selectedHistoryId === id ? null : s.selectedHistoryId,
         errorMessage: null,
       }));
+      if (wasShown) resetToBlankSession(set, get);
     } catch (err) {
       set({ errorMessage: toErrorMessage(err) });
     }
@@ -436,15 +512,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       await get().refreshRecordingHistory();
 
       // Refresh what's on screen too, if this is the recording currently
-      // shown. Deliberately `playback.recordingId`, not `selectedHistoryId`:
-      // a take just finished (record-only or not) loads its own playback via
-      // `loadPlayback` without ever setting `selectedHistoryId` -- that field
-      // means "browsing a *past* entry from the sidebar", which this isn't.
-      // Checking it here left the transcript panel stuck showing nothing
-      // (or stale content) after running 解析/詳細解析 on a take that had
-      // never been opened from history -- the primary way this feature is
-      // used in record-only mode, where it's the very first analysis pass.
-      if (get().playback.recordingId === id) {
+      // shown. Safe to gate on `viewedRecordingId` alone here (unlike
+      // `deleteHistoryEntry`'s equivalent check): `reanalyze` requires
+      // `idle` (`processing === null`), which only becomes true again after
+      // `markRecordingViewed` has already run for a just-finished take, so
+      // there's no async window where the two fields could disagree.
+      if (get().viewedRecordingId === id) {
         set({ segments: localSegments, audioEvents: newEvents });
       }
       if (notices.length > 0) {
@@ -473,9 +546,24 @@ export const useAppStore = create<AppState>((set, get) => ({
     // one -- its frames would keep arriving forever, and `capture.start()`
     // would drop the old WAV writer out from under it.
     if (!capabilitiesOf(get()).startRecording) return;
-    // Whatever was loaded for playback (a past recording, or the previous
-    // take) no longer corresponds to what's about to be on screen.
-    get().unloadPlayback();
+    // Leaving whatever was being viewed -- a past entry, or a just-finished
+    // take -- happens atomically, in this one synchronous tick, before any
+    // of the async device/capture setup below even starts: `playback`,
+    // `segments`, `audioEvents`, and `viewedRecordingId` all clear together.
+    // They used to clear at different points in time (`unloadPlayback` here
+    // immediately, `segments`/`audioEvents` only after several `await`s
+    // below had already resolved, `viewedRecordingId` later still, in the
+    // final `set()`), which left the screen showing an inconsistent mix for
+    // however long the device/capture setup below took: a delete button and
+    // "履歴を表示中" header for an entry whose audio had already been
+    // unloaded, transcript rows that looked seekable but no longer were,
+    // and no `RecordingTimeline` at all (it hides once `playback.
+    // recordingId` is null, whether or not something is still "viewed").
+    //
+    // Not called unconditionally: a second take in an already-live session
+    // (`viewedRecordingId === null`, nothing being "viewed") must append to
+    // `segments`, not wipe them -- see "Existing segments are kept" below.
+    if (get().viewedRecordingId !== null) resetToBlankSession(set, get);
     // Frozen for the whole take -- see `recordingRecordOnly`.
     const recordOnly = get().recordingMode.recordOnly;
     recordingRecordOnly = recordOnly;
@@ -573,17 +661,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeEventStreamer = eventStreamer;
       activeCapture = captureStarted ? capture : null;
       recordingPaused = false;
-      // A recording started while browsing a past entry begins a new,
-      // unrelated session, not a continuation of what's on screen -- without
-      // this, that entry's old transcript would keep sitting there (with the
-      // new take's segments silently appended after it, per its stale
-      // timeline) until the live pass produced its first result. The
-      // segments themselves are safe either way: they're already durable in
-      // that entry's own sidecar JSON, this only clears what's displayed.
-      if (get().selectedHistoryId !== null) {
-        resetTimeline();
-        set({ segments: [], audioEvents: [] });
-      }
       setRecordingBaseSec(getTimelineBaseSec());
       setSegmentsBeforeRecording(get().segments.length);
       const levelMeter = createAudioLevelMeter(controller.stream);
@@ -599,14 +676,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         appAudioNotice,
       ].filter((n): n is string => n !== null);
       // Existing segments are kept: a new recording appends to the transcript.
-      // Once real new content starts accumulating, this is no longer "viewing
-      // a history entry" even if it started from one -- see loadHistoryEntry.
+      // `viewedRecordingId` is set to null again here even though the reset
+      // above already did it: `browseHistory` stays true (it only checks
+      // `recordingPhase`, still "stopped" until this very `set()`) for the
+      // whole async setup this take just went through, so the user picking
+      // a *different* history entry in that window is reachable -- this is
+      // what makes sure a take actually starting always wins that race.
       set({
         recordingPhase: "recording",
         errorMessage: null,
         refineNotice: notices.length > 0 ? notices.join(" ") : null,
         levelMeter,
-        selectedHistoryId: null,
+        viewedRecordingId: null,
       });
     } catch (err) {
       activeRecorder = null;

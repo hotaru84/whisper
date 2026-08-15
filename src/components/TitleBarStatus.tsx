@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Cpu, Zap, FileAudio } from "lucide-react";
+import { FileAudio } from "lucide-react";
 import { useAppStore, type RecordingPhase } from "../store/appStore";
 import { formatTimestamp } from "../lib/format";
 
@@ -50,19 +50,16 @@ function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
 export function TitleBarStatus() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
-  const modelStatus = useAppStore((s) => s.modelStatus);
-  const modelDevice = useAppStore((s) => s.modelDevice);
   const refineProgress = useAppStore((s) => s.refineProgress);
   const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
   const elapsed = useElapsedRecordingSec(recordingPhase);
 
-  // One slot, five mutually exclusive occupants: the take's own state wins
-  // while one exists, then the post-stop pipeline, then the idle chip -- which
-  // is the mode chip in record-only mode and the device chip otherwise. The
-  // two can't collide: record-only mode never loads a model, so
-  // `showDeviceChip`'s "ready" requirement already fails there.
+  // One slot, four mutually exclusive occupants: the take's own state wins
+  // while one exists, then the post-stop pipeline, then the record-only idle
+  // chip. There used to be a fifth (a CPU/Vulkan device chip) but which
+  // backend loaded the model is an implementation detail with no bearing on
+  // anything the user can act on, so it was dropped rather than moved here.
   const idleChip = recordingPhase === "stopped" && processing === null;
-  const showDeviceChip = idleChip && modelStatus === "ready" && modelDevice;
 
   return (
     <div className="pointer-events-none flex min-w-0 items-center justify-center gap-3 text-xs">
@@ -94,12 +91,6 @@ export function TitleBarStatus() {
         <span className="flex items-center gap-1 truncate text-muted-foreground">
           <FileAudio className="h-3 w-3 shrink-0" />
           録音のみ（文字起こしはあとで）
-        </span>
-      )}
-      {showDeviceChip && !recordOnly && (
-        <span className="flex items-center gap-1 truncate text-muted-foreground">
-          {modelDevice === "vulkan" ? <Zap className="h-3 w-3 shrink-0" /> : <Cpu className="h-3 w-3 shrink-0" />}
-          {modelDevice === "vulkan" ? "Vulkan (GPU)" : "CPU"}
         </span>
       )}
     </div>

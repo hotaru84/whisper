@@ -16,7 +16,7 @@ export function TranscriptPanel() {
   const modelStatus = useAppStore((s) => s.modelStatus);
   const refineNotice = useAppStore((s) => s.refineNotice);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
-  const selectedHistoryId = useAppStore((s) => s.selectedHistoryId);
+  const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const playback = useAppStore((s) => s.playback);
@@ -30,8 +30,8 @@ export function TranscriptPanel() {
     recordOnly,
   });
 
-  const viewingHistory = recordingHistory.find(
-    (r) => r.id === selectedHistoryId,
+  const viewedRecording = recordingHistory.find(
+    (r) => r.id === viewedRecordingId,
   );
   // Whatever recording is currently loaded for playback -- set both when
   // browsing a history entry and right after a live recording's second pass
@@ -103,25 +103,25 @@ export function TranscriptPanel() {
             : undefined
         }
         deleteHistory={
-          viewingHistory
+          viewedRecording
             ? {
-                id: viewingHistory.id,
-                onClick: () => void deleteHistoryEntry(viewingHistory.id),
+                id: viewedRecording.id,
+                onClick: () => void deleteHistoryEntry(viewedRecording.id),
                 disabled: !can.browseHistory,
               }
             : undefined
         }
       />
 
-      {viewingHistory && (
+      {viewedRecording && (
         <p className="text-xs text-muted-foreground">
           履歴を表示中 —{" "}
           <span className="font-mono">
-            {viewingHistory.createdAt.getFullYear()}-
-            {String(viewingHistory.createdAt.getMonth() + 1).padStart(2, "0")}-
-            {String(viewingHistory.createdAt.getDate()).padStart(2, "0")}{" "}
-            {String(viewingHistory.createdAt.getHours()).padStart(2, "0")}:
-            {String(viewingHistory.createdAt.getMinutes()).padStart(2, "0")}
+            {viewedRecording.createdAt.getFullYear()}-
+            {String(viewedRecording.createdAt.getMonth() + 1).padStart(2, "0")}-
+            {String(viewedRecording.createdAt.getDate()).padStart(2, "0")}{" "}
+            {String(viewedRecording.createdAt.getHours()).padStart(2, "0")}:
+            {String(viewedRecording.createdAt.getMinutes()).padStart(2, "0")}
           </span>
         </p>
       )}

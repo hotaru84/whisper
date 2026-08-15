@@ -1,4 +1,11 @@
-import { ChevronDown, Copy, Download, Check, Trash2, RotateCw } from "lucide-react";
+import {
+  ChevronDown,
+  Copy,
+  Download,
+  Check,
+  Trash2,
+  RotateCw,
+} from "lucide-react";
 import { Button } from "./ui/button";
 import {
   DropdownMenu,
@@ -15,7 +22,13 @@ import { useConfirmClick } from "./useConfirmClick";
  * called from a conditionally rendered position -- and being keyed on the
  * recording's id, switching to a different history entry disarms it.
  */
-function DeleteHistoryButton({ onClick: onDelete, disabled }: { onClick: () => void; disabled: boolean }) {
+function DeleteHistoryButton({
+  onClick: onDelete,
+  disabled,
+}: {
+  onClick: () => void;
+  disabled: boolean;
+}) {
   const { confirming, onClick } = useConfirmClick(onDelete);
   return (
     <Button
@@ -27,7 +40,7 @@ function DeleteHistoryButton({ onClick: onDelete, disabled }: { onClick: () => v
       title="この録音履歴を削除"
     >
       <Trash2 className="h-4 w-4" />
-      {confirming ? "本当に削除" : "履歴を削除"}
+      {confirming ? "本当に削除?" : "削除"}
     </Button>
   );
 }
@@ -59,9 +72,18 @@ export function TranscriptToolbar({
     <div className="flex justify-end gap-2">
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button type="button" variant="outline" size="sm" disabled={!hasTranscript}>
-            {copied ? <Check className="h-4 w-4" /> : <Download className="h-4 w-4" />}
-            コピー・保存
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={!hasTranscript}
+          >
+            {copied ? (
+              <Check className="h-4 w-4" />
+            ) : (
+              <Download className="h-4 w-4" />
+            )}
+            保存
             <ChevronDown className="h-3.5 w-3.5" />
           </Button>
         </DropdownMenuTrigger>

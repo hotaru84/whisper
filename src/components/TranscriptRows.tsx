@@ -52,7 +52,12 @@ export function SegmentRow({
       className={cn(
         "flex items-start gap-2 rounded-sm border-l-2 py-1 pl-2 transition-colors",
         !hasSpeaker && "border-l-border",
-        active && "bg-accent",
+        // `bg-accent` used to carry this alone, but `--accent` sits only a
+        // few points of lightness from `--muted` (the scroll area's own
+        // background), so the "currently playing" row was nearly invisible
+        // against it. A tinted ring plus a stronger wash reads clearly
+        // regardless of theme or the row's own speaker-color border.
+        active && "bg-primary/10 ring-1 ring-inset ring-primary/20",
       )}
       style={strokeStyle}
     >

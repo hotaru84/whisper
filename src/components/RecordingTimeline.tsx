@@ -59,18 +59,35 @@ function EventBand({
   // Only events overlapping the recording currently loaded -- see
   // PlaybackState.timelineOffsetSec's doc comment for why an event from an
   // earlier take in the same session must not be drawn on this axis.
-  const visible = events.filter(
-    (e) => e.end > playback.timelineOffsetSec && e.start < playback.timelineOffsetSec + duration,
-  );
+  //
+  // Sorted by start, then packed left-to-right so no two blocks ever share
+  // pixels: `MIN_SEGMENT_WIDTH_PCT` guarantees every block a minimum width
+  // regardless of its real duration, which is exactly what makes two events
+  // close together in time overlap once both get floored up to that width.
+  // `left` is clamped to start no earlier than the previous block's right
+  // edge, and `prevRight` advances past whichever number (natural or
+  // clamped) actually got used, so the whole run stays visually distinct
+  // -- their icons stop drawing on top of each other -- at the cost of a
+  // clamped block's position drifting slightly later than its real time.
+  const visible = events
+    .filter((e) => e.end > playback.timelineOffsetSec && e.start < playback.timelineOffsetSec + duration)
+    .sort((a, b) => a.start - b.start);
   const playheadPct = Math.min(100, Math.max(0, (playback.currentTimeSec / duration) * 100));
+
+  let prevRightPct = 0;
+  const laidOut = visible.map((e) => {
+    const localStart = Math.max(0, e.start - playback.timelineOffsetSec);
+    const localEnd = Math.min(duration, e.end - playback.timelineOffsetSec);
+    const naturalLeft = (localStart / duration) * 100;
+    const width = Math.max(((localEnd - localStart) / duration) * 100, MIN_SEGMENT_WIDTH_PCT);
+    const left = Math.min(Math.max(naturalLeft, prevRightPct), 100 - width);
+    prevRightPct = left + width;
+    return { event: e, localStart, left, width };
+  });
 
   return (
     <div className="relative h-6 w-full overflow-hidden rounded-sm bg-muted">
-      {visible.map((e, i) => {
-        const localStart = Math.max(0, e.start - playback.timelineOffsetSec);
-        const localEnd = Math.min(duration, e.end - playback.timelineOffsetSec);
-        const left = (localStart / duration) * 100;
-        const width = Math.max(((localEnd - localStart) / duration) * 100, MIN_SEGMENT_WIDTH_PCT);
+      {laidOut.map(({ event: e, localStart, left, width }, i) => {
         const noisy = isNoiseOrMusicEvent(e.name);
         const Icon = AUDIO_EVENT_CATEGORY_ICON[audioEventCategory(e.name)];
         return (
