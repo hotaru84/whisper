@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WhisperScribe app icon: the Pulse Bars waveform mark, single source of truth
+  for every generated icon (see `npm run icons`).
+
+  The bars deliberately avoid the app's ink token (#1B1D1B): on a dark taskbar
+  or a dark-mode tray the mark all but disappeared, leaving only the green
+  centre bar visible. #7E857D sits at a luminance that keeps roughly 3.8:1
+  against white and 4.3:1 against Windows' #202020 dark chrome, so the
+  silhouette reads either way. The centre bar stays the trace accent (#4C9A6A).
+
+  Geometry matches the previous mark exactly (7 bars, 87 wide, 131.5 pitch,
+  heights 204/410/656/900); only the colour of the outer bars changed.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>WhisperScribe</title>
+  <g fill="#7E857D">
+    <rect x="74"  y="410" width="87" height="204" rx="43.5" />
+    <rect x="205.5" y="307" width="87" height="410" rx="43.5" />
+    <rect x="337" y="184" width="87" height="656" rx="43.5" />
+    <rect x="600" y="184" width="87" height="656" rx="43.5" />
+    <rect x="731.5" y="307" width="87" height="410" rx="43.5" />
+    <rect x="863" y="410" width="87" height="204" rx="43.5" />
+  </g>
+  <rect x="468.5" y="62" width="87" height="900" rx="43.5" fill="#4C9A6A" />
+</svg>
