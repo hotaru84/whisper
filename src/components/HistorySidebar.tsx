@@ -8,6 +8,8 @@ import {
 } from "./ui/dropdown-menu";
 import { ScrollArea } from "./ui/scroll-area";
 import { useConfirmClick } from "./useConfirmClick";
+import { ThemeToggle } from "./ThemeToggle";
+import { SettingsDialog } from "./SettingsDialog";
 import { useAppStore, selectCapabilities } from "../store/appStore";
 import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
@@ -25,8 +27,8 @@ function formatDateTime(date: Date): { day: string; time: string } {
 }
 
 /** Feature badges are icon-only (no label) to keep each row to one line --
- * the icons mirror the ones used for the same features elsewhere (StatusBar,
- * RecordingTimeline's event band) so their meaning is learned once. */
+ * each carries its own `aria-label` rather than relying on a label learned
+ * elsewhere. */
 function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
   return (
     <span className="flex items-center gap-1 text-muted-foreground">
@@ -184,7 +186,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
 
 /**
  * Browses past recordings -- the "content of interest" pane, kept separate
- * from the always-visible StatusBar (operating state) and the on-demand
+ * from the always-visible titlebar (operating state) and the on-demand
  * SettingsDialog (configuration) per the design plan. Selecting an entry
  * replaces the main view's transcript/audio-events; see
  * `appStore.loadHistoryEntry`.
@@ -220,6 +222,17 @@ export function HistorySidebar({ width }: { width: number }) {
             </div>
           )}
         </ScrollArea>
+      </div>
+
+      {/* App-wide settings, not history-browsing actions -- placed here
+          rather than the titlebar because both are consulted occasionally,
+          not per-recording (see TitleBar.tsx's doc comment). -mr-2 pr-4
+          extends the border-t past the root's own pr-2 (reserved for the
+          ScrollArea's scrollbar gutter above), so the rule reaches the
+          panel's actual right edge instead of stopping 8px short. */}
+      <div className="-mr-2 flex shrink-0 items-center gap-1 border-t border-sidebar-border px-2 py-1.5 pr-4">
+        <ThemeToggle />
+        <SettingsDialog />
       </div>
     </div>
   );

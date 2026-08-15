@@ -127,10 +127,10 @@ export function TranscriptPanel() {
       )}
 
       {isRefining && (
-        // The numeric progress and "what's happening" text live in StatusBar
-        // (always visible regardless of scroll position); this is only the
-        // one thing StatusBar can't say, since it's specific to what's shown
-        // below.
+        // The numeric progress and "what's happening" text live in the
+        // titlebar's status readout (always visible regardless of scroll
+        // position); this is only the one thing it can't say, since it's
+        // specific to what's shown below.
         <p className="text-xs text-muted-foreground">
           録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
         </p>

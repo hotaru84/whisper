@@ -98,9 +98,9 @@ export function SettingsPanel() {
     // find. Splitting into categories organizes them but must not hide any
     // of them behind a second click by default -- a user reported not being
     // able to find a setting for exactly this reason when this had three
-    // categories (the third, mic/app-audio, has since moved to the toolbar --
-    // see StatusBar.tsx -- since those are switched often enough to want
-    // one click, not two). Anyone who wants a quieter view can still
+    // categories (the third, mic/app-audio, has since moved to the titlebar --
+    // see TitleBarControls.tsx -- since those are switched often enough to
+    // want one click, not two). Anyone who wants a quieter view can still
     // collapse a category; this only changes the starting state.
     <Accordion
       type="multiple"

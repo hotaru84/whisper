@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
+import { TitleBarControls } from "./TitleBarControls";
+import { TitleBarStatus } from "./TitleBarStatus";
 
 const appWindow = getCurrentWindow();
 
@@ -11,6 +13,16 @@ const appWindow = getCurrentWindow();
  * Windows 11's snap-layout flyout (hovering the native maximize button)
  * cannot be reproduced for a custom-drawn button with the window APIs Tauri
  * exposes -- accepted, see the design plan.
+ *
+ * Doubles as the app's only top bar: there used to be a second strip
+ * (StatusBar) below this one carrying every global control and the live
+ * "what is the app doing" readout. That duplicated this bar's real estate
+ * for no reason a title-only titlebar could explain, so its contents moved
+ * up here -- `TitleBarControls` (sidebar toggle, mic, target app, recording
+ * mode) on the left, `TitleBarStatus` centered where the app name used to
+ * sit. Theme and settings did *not* move here; they live in the sidebar's
+ * footer instead, since they're consulted rarely enough not to need a
+ * titlebar slot that's otherwise reserved for per-recording controls.
  */
 export function TitleBar() {
   const [isMaximized, setIsMaximized] = useState(false);
@@ -37,11 +49,11 @@ export function TitleBar() {
       // silently unclickable, landing on the dialog's backdrop instead). The
       // window controls this replaces were never something web content could
       // cover, dialog or not.
-      className="relative z-[60] flex h-9 shrink-0 items-center justify-between border-b border-border bg-background pl-3 text-foreground select-none"
+      className="relative z-[60] flex h-9 shrink-0 items-center gap-1 border-b border-border bg-background pl-1 text-foreground select-none"
     >
-      <div data-tauri-drag-region className="flex items-center gap-2 text-xs font-medium">
-        <span className="h-2 w-2 rounded-full bg-signal" aria-hidden="true" />
-        WhisperScribe
+      <TitleBarControls />
+      <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center justify-center px-2">
+        <TitleBarStatus />
       </div>
       <div className="flex h-full items-stretch">
         <button

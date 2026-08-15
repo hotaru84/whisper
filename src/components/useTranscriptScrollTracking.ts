@@ -23,7 +23,7 @@ function getViewport(container: HTMLDivElement | null): HTMLElement | null {
  * following new segments while recording, following the playhead during
  * playback, jumping to an explicit seek, and the "user scrolled away, stop
  * auto-following" escape hatch all four of those share. Pulled into its own
- * hook the same way `StatusBar.tsx`'s `useElapsedRecordingSec` is: the effects
+ * hook the same way `TitleBarStatus.tsx`'s `useElapsedRecordingSec` is: the effects
  * only make sense read together, and inlining them left `TranscriptPanel`'s
  * render logic sandwiched between five independent `useEffect`s.
  */

@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import { TitleBar } from "./components/TitleBar";
-import { StatusBar } from "./components/StatusBar";
 import { HistorySidebar } from "./components/HistorySidebar";
 import { ModelLoadingOverlay } from "./components/ModelLoadingOverlay";
 import { RecordButton } from "./components/RecordButton";
@@ -81,7 +80,7 @@ function App() {
     // Listable (with placeholder labels) even before microphone permission is
     // granted, so the settings dropdown isn't empty on a first visit.
     void refreshAudioInputDevices();
-    // Toolbar dropdown also refreshes itself on open (see StatusBar.tsx), but
+    // Titlebar dropdown also refreshes itself on open (see TitleBarControls.tsx), but
     // this fills it in for the case where the user never opens it before
     // hitting record with a target already in mind.
     void refreshAppAudioApps();
@@ -100,7 +99,6 @@ function App() {
       <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
         <TitleBar />
         <ModelLoadingOverlay />
-        <StatusBar />
         <div className="flex flex-1 overflow-hidden">
           {sidebar.visible && (
             <>

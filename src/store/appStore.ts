@@ -126,8 +126,8 @@ interface AppState {
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
   /** History sidebar width/visibility. Layout, not behaviour, but it lives
-   * here because the toggle (StatusBar) and the panel itself (App) are
-   * siblings with no common owner below the root. */
+   * here because the toggle (TitleBarControls) and the panel itself (App)
+   * are siblings with no common owner below the root. */
   sidebar: SidebarSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
