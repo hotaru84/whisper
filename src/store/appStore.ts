@@ -1,9 +1,5 @@
 import { create } from "zustand";
 import {
-  AsrClient,
-  DEFAULT_DIARIZE_SETTINGS,
-  DEFAULT_VAD_SETTINGS,
-  DEFAULT_AUDIO_EVENT_SETTINGS,
   RecordingCapture,
   StreamingTranscriber,
   AudioEventStreamer,
@@ -14,12 +10,11 @@ import type {
   VadSettings,
   AudioEventSettings,
   AudioEvent,
-  TranscriptionTask,
   TranscribeResult,
   StreamingSegment,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
-import { nonBlankChunks, segmentsFromResult } from "../lib/transcript";
+import { segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording, wavPath } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import {
@@ -27,25 +22,52 @@ import {
   decodeAudioToPcm16k,
   createAudioLevelMeter,
   listAudioInputDevices,
-  onAudioDeviceChange,
-  AppAudioClient,
   AudioMixer,
   WHISPER_SAMPLE_RATE,
-  wavToBlobUrl,
-  createPlaybackController,
 } from "../lib/audio";
-import type {
-  PcmRecorderController,
-  AudioLevelMeter,
-  AudioInputDevice,
-  AudioAppInfo,
-  PlaybackController,
-} from "../lib/audio";
+import type { PcmRecorderController, AudioLevelMeter, AudioInputDevice, AudioAppInfo } from "../lib/audio";
+import { asrClient, appAudioClient } from "./clients";
+import { loadPlayback, unloadPlayback, togglePlayback, seekTo, skip, setPlaybackRate, IDLE_PLAYBACK } from "./playback";
+import type { PlaybackState } from "./playback";
 // The state axes and `selectCapabilities` live in their own import-free module
 // so they can be unit-tested without dragging in the Tauri client and the
 // audio stack -- see capabilities.ts.
 import { selectCapabilities } from "./capabilities";
 import type { RecordingPhase, ProcessingPhase, ModelStatus } from "./capabilities";
+import { toErrorMessage } from "../lib/errors";
+import {
+  loadSettings,
+  saveSettings,
+  loadDiarizeSettings,
+  saveDiarizeSettings,
+  loadVadSettings,
+  saveVadSettings,
+  loadAudioEventSettings,
+  saveAudioEventSettings,
+  loadRecordingMode,
+  saveRecordingMode,
+  loadSidebarSettings,
+  saveSidebarSettings,
+  clampSidebarWidth,
+} from "./persistedSettings";
+import type { AsrSettings, RecordingModeSettings, SidebarSettings } from "./persistedSettings";
+import {
+  setNextSegmentId,
+  getTimelineBaseSec,
+  setTimelineBaseSec,
+  getRecordingBaseSec,
+  setRecordingBaseSec,
+  setSegmentsBeforeRecording,
+  resetTimeline,
+} from "./timeline";
+import {
+  runAccuracyPipeline,
+  refineRecording,
+  finishRecordOnly,
+  ensureModelReady,
+  appendStreamingSegment,
+  appendLiveAudioEvents,
+} from "./recordingPipeline";
 
 // Re-exported because this is where every consumer already imports them from.
 export {
@@ -56,188 +78,13 @@ export {
   type Capabilities,
   type CapabilityInputs,
 } from "./capabilities";
-
-export interface PlaybackState {
-  recordingId: string | null;
-  loading: boolean;
-  isPlaying: boolean;
-  /** Seconds into the *loaded WAV's own* 0-based timeline -- what the
-   * `<audio>` element actually reports. */
-  currentTimeSec: number;
-  durationSec: number;
-  rate: number;
-  /**
-   * Where the loaded WAV's own timeline sits on `segments`' global timeline
-   * (see `TranscriptSegment.startOffsetSec`'s doc comment). A single history
-   * entry's segments are already 0-based, so this is 0 when browsing history;
-   * within an ongoing session with more than one take, a later take's
-   * segments are offset by however much came before it, and this is that
-   * same offset -- see `refineRecording`'s `baseSec`. Lets `TranscriptPanel`
-   * convert between "where a segment is" and "where the loaded audio is"
-   * without the two ever being confused.
-   */
-  timelineOffsetSec: number;
-  /**
-   * Bumped by every explicit seek (`seekTo`, `skip`) -- never by the ordinary
-   * ticking of `currentTimeSec` during playback. `TranscriptPanel` watches
-   * this to jump the transcript to the seeked-to segment unconditionally,
-   * distinct from its "follow the playhead while playing" effect, which
-   * deliberately backs off once the user has scrolled away to read something
-   * else. An explicit seek -- the timeline slider, a segment's own timestamp,
-   * an audio-event block -- is a "take me there" action that should win over
-   * that escape hatch; a `currentTimeSec` change from a tick should not.
-   */
-  seekSeq: number;
-}
-
-const IDLE_PLAYBACK: PlaybackState = {
-  recordingId: null,
-  loading: false,
-  isPlaying: false,
-  currentTimeSec: 0,
-  durationSec: 0,
-  rate: 1,
-  timelineOffsetSec: 0,
-  seekSeq: 0,
-};
-
-export interface AsrSettings {
-  language: string;
-  task: TranscriptionTask;
-  /**
-   * Terminology the model should be primed with: product names, jargon, people —
-   * anything it would otherwise mis-hear. Passed to whisper as `initial_prompt`.
-   *
-   * A soft bias, not a constraint, and a small budget: ~224 tokens, which for
-   * Japanese is roughly 200 characters. Text past that is silently dropped.
-   */
-  glossary: string;
-  /** `deviceId` of the microphone to record from. Empty string = system default. */
-  inputDeviceId: string;
-}
-
-/**
- * Shared shape behind every `settings-key -> localStorage` pair below: read
- * back whatever JSON is there, field-validate it against `defaults` (so a
- * stale/foreign shape can't leak wrong types into state), and never let a
- * corrupt or unavailable `localStorage` stop the app from starting. `sanitize`
- * carries the one part that legitimately differs per settings type -- which
- * fields exist and what counts as valid.
- */
-function loadPersistedSettings<T>(key: string, defaults: T, sanitize: (parsed: Partial<T>, defaults: T) => T): T {
-  try {
-    const stored = globalThis.localStorage?.getItem(key);
-    if (!stored) return defaults;
-    return sanitize(JSON.parse(stored) as Partial<T>, defaults);
-  } catch {
-    return defaults;
-  }
-}
-
-function savePersistedSettings<T>(key: string, settings: T): void {
-  try {
-    globalThis.localStorage?.setItem(key, JSON.stringify(settings));
-  } catch {
-    // Persistence is a convenience; losing it is not worth surfacing an error.
-  }
-}
-
-const SETTINGS_KEY = "asr-settings";
-
-/**
- * Settings survive restarts, which matters most for the glossary: retyping it
- * every session would make the feature not worth using.
- */
-function loadSettings(): AsrSettings {
-  const defaults: AsrSettings = { language: "ja", task: "transcribe", glossary: "", inputDeviceId: "" };
-  return loadPersistedSettings(SETTINGS_KEY, defaults, (parsed, d) => ({
-    language: typeof parsed.language === "string" ? parsed.language : d.language,
-    task: parsed.task === "translate" ? "translate" : "transcribe",
-    glossary: typeof parsed.glossary === "string" ? parsed.glossary : d.glossary,
-    inputDeviceId: typeof parsed.inputDeviceId === "string" ? parsed.inputDeviceId : d.inputDeviceId,
-  }));
-}
-
-function saveSettings(settings: AsrSettings): void {
-  savePersistedSettings(SETTINGS_KEY, settings);
-}
-
-const DIARIZE_SETTINGS_KEY = "diarize-settings";
-
-/** Same persistence shape as `loadSettings`/`saveSettings`, kept separate: this
- * is a different concern (a post-hoc model pass, not a decoding parameter). */
-function loadDiarizeSettings(): DiarizeSettings {
-  return loadPersistedSettings(DIARIZE_SETTINGS_KEY, DEFAULT_DIARIZE_SETTINGS, (parsed, d) => ({
-    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
-    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
-    numSpeakers: typeof parsed.numSpeakers === "number" ? parsed.numSpeakers : d.numSpeakers,
-    minDurationOn: typeof parsed.minDurationOn === "number" ? parsed.minDurationOn : d.minDurationOn,
-    minDurationOff: typeof parsed.minDurationOff === "number" ? parsed.minDurationOff : d.minDurationOff,
-  }));
-}
-
-function saveDiarizeSettings(settings: DiarizeSettings): void {
-  savePersistedSettings(DIARIZE_SETTINGS_KEY, settings);
-}
-
-const VAD_SETTINGS_KEY = "vad-settings";
-
-function loadVadSettings(): VadSettings {
-  return loadPersistedSettings(VAD_SETTINGS_KEY, DEFAULT_VAD_SETTINGS, (parsed, d) => ({
-    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
-    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
-  }));
-}
-
-function saveVadSettings(settings: VadSettings): void {
-  savePersistedSettings(VAD_SETTINGS_KEY, settings);
-}
-
-const AUDIO_EVENT_SETTINGS_KEY = "audio-event-settings";
-
-function loadAudioEventSettings(): AudioEventSettings {
-  return loadPersistedSettings(AUDIO_EVENT_SETTINGS_KEY, DEFAULT_AUDIO_EVENT_SETTINGS, (parsed, d) => ({
-    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
-    threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
-    topK: typeof parsed.topK === "number" ? parsed.topK : d.topK,
-  }));
-}
-
-function saveAudioEventSettings(settings: AudioEventSettings): void {
-  savePersistedSettings(AUDIO_EVENT_SETTINGS_KEY, settings);
-}
-
-export interface RecordingModeSettings {
-  /**
-   * Record the audio and nothing else: no model load, no live transcription,
-   * no audio tagging. The WAV still lands on disk exactly as it always does,
-   * and the take shows up in history as an unanalyzed entry the user can
-   * transcribe later (`rerunHistoryEntry`, which loads the model on demand).
-   *
-   * Named for what it *does* rather than for its effect: "power saving"
-   * describes the outcome, but what the user needs to know before flipping it
-   * is that transcription will not run.
-   */
-  recordOnly: boolean;
-}
-
-const RECORDING_MODE_KEY = "recording-mode-settings";
-
-export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false };
-
-/** Same persistence shape as the settings above. Worth persisting because the
- * whole point is that a session started in this mode never loads the model at
- * all -- a setting that reset on launch would load it before the user could
- * say otherwise, which is exactly the cost being avoided. */
-function loadRecordingMode(): RecordingModeSettings {
-  return loadPersistedSettings(RECORDING_MODE_KEY, DEFAULT_RECORDING_MODE, (parsed, d) => ({
-    recordOnly: typeof parsed.recordOnly === "boolean" ? parsed.recordOnly : d.recordOnly,
-  }));
-}
-
-function saveRecordingMode(settings: RecordingModeSettings): void {
-  savePersistedSettings(RECORDING_MODE_KEY, settings);
-}
+export {
+  type AsrSettings,
+  type RecordingModeSettings,
+  type SidebarSettings,
+  DEFAULT_RECORDING_MODE,
+} from "./persistedSettings";
+export { type PlaybackState } from "./playback";
 
 interface AppState {
   /** What the recorder is doing. The primary state everything else keys off. */
@@ -278,6 +125,10 @@ interface AppState {
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
+  /** History sidebar width/visibility. Layout, not behaviour, but it lives
+   * here because the toggle (StatusBar) and the panel itself (App) are
+   * siblings with no common owner below the root. */
+  sidebar: SidebarSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
    * ("マイク N") until the first successful getUserMedia call in this session. */
@@ -322,6 +173,12 @@ interface AppState {
    * model being ready outside this mode, so without it the button would sit
    * disabled with nothing on screen explaining why. */
   updateRecordingMode: (partial: Partial<RecordingModeSettings>) => void;
+  /** Live width during a resize drag. Deliberately does *not* persist: this
+   * fires on every pointermove, and the drag's final width is committed once
+   * on release via `persistSidebarSettings`. */
+  setSidebarWidth: (width: number) => void;
+  persistSidebarSettings: () => void;
+  toggleSidebar: () => void;
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
@@ -385,331 +242,6 @@ let recordingPaused = false;
 // there would let a mode change land between start and stop and send a
 // record-only take down the refine path (or worse, the reverse).
 let recordingRecordOnly = false;
-// Monotonic segment id and the running timeline position where the *next*
-// recording's audio begins, so appended segments keep a continuous timeline.
-let nextSegmentId = 1;
-let timelineBaseSec = 0;
-// Where the current recording starts, on the timeline and in the segment list.
-// The second pass replaces everything this recording produced, so it needs both.
-let recordingBaseSec = 0;
-let segmentsBeforeRecording = 0;
-// The live `<audio>` wrapper backing `playback` state, if anything is loaded.
-// Not part of Zustand state itself -- see `createPlaybackController`'s doc
-// comment, same reasoning as `levelMeter` already being a class instance
-// rather than plain data.
-let playbackController: PlaybackController | null = null;
-
-function toErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** The filename stem `capture.rs` uses for both the WAV and (once
- * `history.ts` writes it) its sidecar JSON, extracted from the full path
- * `capture.finish()` returns. Handles both path separator styles since the
- * Rust side reports a native (backslash, on Windows) path. */
-function idFromWavPath(path: string): string {
-  const base = path.split(/[/\\]/).pop() ?? path;
-  return base.replace(/\.wav$/i, "");
-}
-
-// Appends a streaming segment (offset relative to the current recording) onto the
-// global transcript timeline.
-function appendStreamingSegment(seg: StreamingSegment) {
-  const segment: TranscriptSegment = {
-    id: nextSegmentId++,
-    startOffsetSec: timelineBaseSec + seg.offsetSec,
-    text: seg.text,
-    chunks: seg.chunks,
-  };
-  useAppStore.setState((s) => ({ segments: [...s.segments, segment] }));
-}
-
-// Appends a live window's audio-tagging results (on the current recording's
-// own 0-based timeline) onto the global audioEvents timeline. Mirrors
-// refineRecording's own rebase of the post-hoc pass's events -- see
-// PlaybackState.timelineOffsetSec's doc comment for the same "own timeline
-// vs. global timeline" distinction.
-function appendLiveAudioEvents(events: AudioEvent[]) {
-  const rebased = events.map((e) => ({ ...e, start: e.start + recordingBaseSec, end: e.end + recordingBaseSec }));
-  useAppStore.setState((s) => ({ audioEvents: [...s.audioEvents, ...rebased] }));
-}
-
-// One instance shared by the app-list refresh and the actual capture start/stop:
-// listing apps touches neither the Channel nor the error listener the capture
-// methods manage, so the two uses never interfere with each other.
-const appAudioClient = new AppAudioClient();
-
-const asrClient = new AsrClient({
-  onDeviceInfo: (device) => useAppStore.setState({ modelDevice: device }),
-  onModelReady: () => useAppStore.setState({ modelStatus: "ready" }),
-  onError: (message) => useAppStore.setState({ modelStatus: "error", errorMessage: message }),
-  onRefineProgress: (percent) => useAppStore.setState({ refineProgress: percent }),
-});
-
-// Keeps the settings dropdown in sync when a microphone is plugged or
-// unplugged, without the UI needing to poll for it.
-onAudioDeviceChange(() => {
-  void useAppStore.getState().refreshAudioInputDevices();
-});
-
-/** What `runAccuracyPipeline` produces: the re-transcription, plus whatever
- * diarization/audio-tagging managed to add, plus any user-facing notices
- * about the parts that did not go perfectly (never a hard failure -- see the
- * function's own doc). */
-interface AccuracyPipelineResult {
-  result: TranscribeResult;
-  speakers?: Array<number | null>;
-  excluded?: boolean[];
-  newEvents: AudioEvent[];
-  notices: string[];
-}
-
-/**
- * The re-transcribe/diarize/audio-tag sequence shared by `refineRecording`
- * (a just-finished live recording) and `rerunHistoryEntry` (any past one,
- * typically after the user changed a setting). Everything here operates on
- * `path`'s own 0-based timeline; rebasing onto a session's global timeline
- * (if the caller even has one -- `rerunHistoryEntry` does not) is the
- * caller's job, same as `nonBlankChunks`' doc comment already describes.
- *
- * Diarization/audio-tagging failures are collected as notices rather than
- * thrown: a transcript without speaker labels or event filtering is still
- * the whole point of this pass, so losing the transcript over either would
- * be a much worse trade than just not having that one extra.
- */
-async function runAccuracyPipeline(
-  path: string,
-  settings: AsrSettings,
-  vadSettings: VadSettings,
-  diarizeSettings: DiarizeSettings,
-  audioEventSettings: AudioEventSettings,
-): Promise<AccuracyPipelineResult> {
-  const notices: string[] = [];
-  const result = await asrClient.transcribeRecording(path, settings, vadSettings);
-  if (result.vadUnavailable) {
-    notices.push(
-      "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
-    );
-  }
-
-  // Diarization and audio tagging both read the same WAV on its own 0-based
-  // timeline, so they have to run on result.chunks *before* segmentsFromResult
-  // rebases anything -- see nonBlankChunks' doc comment.
-  const targets = nonBlankChunks(result).map((c) => c.timestamp);
-
-  let speakers: Array<number | null> | undefined;
-  if (diarizeSettings.enabled && targets.length > 0) {
-    try {
-      speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
-    } catch (err) {
-      notices.push(`話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
-    }
-  }
-
-  let excluded: boolean[] | undefined;
-  let newEvents: AudioEvent[] = [];
-  if (audioEventSettings.enabled && targets.length > 0) {
-    try {
-      const eventResult = await asrClient.detectAudioEvents(path, targets, audioEventSettings);
-      excluded = eventResult.exclude;
-      newEvents = eventResult.events;
-    } catch (err) {
-      notices.push(`音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
-    }
-  }
-
-  return { result, speakers, excluded, newEvents, notices };
-}
-
-/**
- * Re-transcribes the finished recording as one continuous piece and swaps the
- * result in for the segments the live pass produced.
- *
- * Every failure path here keeps the live transcript. The second pass is an
- * improvement on something the user already has; losing it costs accuracy, while
- * discarding the live result would cost them the meeting.
- */
-async function refineRecording(capture: RecordingCapture): Promise<void> {
-  const keptSegments = segmentsBeforeRecording;
-  const baseSec = recordingBaseSec;
-
-  let path: string;
-  let recordingDurationSec: number;
-  try {
-    const info = await capture.finish();
-    path = info.path;
-    recordingDurationSec = info.durationSec;
-  } catch (err) {
-    // `stopRecording` handed over still in a processing phase (so the gap
-    // before "refining" could not be mistaken for idle), so this bail-out has
-    // to be the one to clear it.
-    useAppStore.setState({
-      processing: null,
-      refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
-    });
-    return;
-  }
-
-  // The WAV is fully written at this point regardless of how the accuracy
-  // pass below goes, so playback becomes available immediately rather than
-  // waiting on (possibly minutes of) diarization/audio-tagging. `baseSec` is
-  // where this take's segments start on the session's global timeline (see
-  // `PlaybackState.timelineOffsetSec`'s doc comment) -- the WAV itself is
-  // always 0-based, only the segments referring to it are shifted.
-  void useAppStore.getState().loadPlayback(idFromWavPath(path), path, baseSec);
-
-  useAppStore.setState({ processing: "refining", refineProgress: 0 });
-  try {
-    const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
-    const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
-      path,
-      settings,
-      vadSettings,
-      diarizeSettings,
-      audioEventSettings,
-    );
-    if (notices.length > 0) {
-      useAppStore.setState({ refineNotice: notices.join(" ") });
-    }
-
-    const targets = nonBlankChunks(result).map((c) => c.timestamp);
-    const rebasedEvents = newEvents.map((e) => ({ ...e, start: e.start + baseSec, end: e.end + baseSec }));
-    useAppStore.setState((s) => ({
-      audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
-    }));
-
-    const refined = segmentsFromResult(result, baseSec, nextSegmentId, speakers, excluded, newEvents);
-    // One segment per non-blank chunk, always -- an excluded chunk becomes a
-    // blank placeholder rather than being dropped (see
-    // TranscriptSegment.excludedReason), so refined.length === targets.length
-    // whenever there were any chunks to begin with.
-    if (targets.length > 0) {
-      nextSegmentId += targets.length;
-    } else if (refined.length > 0) {
-      nextSegmentId += refined.length;
-    }
-    // An empty (or all-excluded-placeholder) second pass means something went
-    // wrong upstream, not that the meeting was silent -- the live pass
-    // already found speech in this audio. Checked by actual text rather than
-    // refined.length, since a recording audio-tagging excluded *everything*
-    // from now produces only placeholders, not an empty array.
-    if (refined.some((s) => s.text.trim() !== "")) {
-      useAppStore.setState((s) => ({
-        segments: [...s.segments.slice(0, keptSegments), ...refined],
-      }));
-
-      // Persisted on the recording's own 0-based timeline (not the session's
-      // global one) and with freshly sequential ids, so a history entry looks
-      // identical whether it was the first or the fifth recording of its
-      // original session -- see history.ts's module doc.
-      const localSegments = refined.map((s, i) => ({
-        ...s,
-        id: i + 1,
-        startOffsetSec: s.startOffsetSec - baseSec,
-      }));
-      try {
-        await saveRecordingHistory(idFromWavPath(path), {
-          durationSec: recordingDurationSec,
-          language: settings.language,
-          transcribed: true,
-          usedDiarize: diarizeSettings.enabled,
-          usedVad: vadSettings.enabled,
-          usedAudioEvents: audioEventSettings.enabled,
-          segments: localSegments,
-          audioEvents: newEvents,
-        });
-        void useAppStore.getState().refreshRecordingHistory();
-      } catch (err) {
-        // The transcript on screen (and its place in this session) is
-        // unaffected -- only future browsing of it from the history sidebar
-        // is lost, which is a much smaller loss than any other failure path
-        // in this function.
-        useAppStore.setState({
-          refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
-        });
-      }
-    }
-  } catch (err) {
-    useAppStore.setState({
-      refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
-    });
-  } finally {
-    useAppStore.setState({ processing: null, refineProgress: null });
-  }
-}
-
-/**
- * `refineRecording`'s record-only counterpart: close the WAV, make it playable,
- * and file it in history -- with no transcription, diarization or audio
- * tagging, none of which ran (and none of which could, since the model was
- * never loaded).
- *
- * The sidecar is written even though it holds no segments. Without it the
- * recording would be invisible: `listRecordings` enumerates sidecars, not
- * WAVs, so a take with no JSON is a file the user can neither find nor ask to
- * be transcribed later -- which is the whole promise of this mode.
- *
- * Failure is reported the same way every other post-stop failure is: a
- * `refineNotice`, not an error. The WAV is valid on disk at every moment (see
- * `wav::Writer`), so even a failure here costs only the history entry.
- */
-async function finishRecordOnly(capture: RecordingCapture): Promise<void> {
-  const baseSec = recordingBaseSec;
-  try {
-    const { path, durationSec } = await capture.finish();
-    const id = idFromWavPath(path);
-    void useAppStore.getState().loadPlayback(id, path, baseSec);
-    await saveRecordingHistory(id, {
-      durationSec,
-      language: useAppStore.getState().settings.language,
-      transcribed: false,
-      // All three passes are part of the analysis this mode defers, so none of
-      // them describe this recording yet. They get their real values when the
-      // user runs `rerunHistoryEntry` on it.
-      usedDiarize: false,
-      usedVad: false,
-      usedAudioEvents: false,
-      segments: [],
-      audioEvents: [],
-    });
-    await useAppStore.getState().refreshRecordingHistory();
-  } catch (err) {
-    useAppStore.setState({
-      refineNotice: `録音の保存に失敗したため、履歴に残せませんでした: ${toErrorMessage(err)}`,
-    });
-  } finally {
-    useAppStore.setState({ processing: null });
-  }
-}
-
-/**
- * Loads the model if it isn't loaded yet and resolves once it actually is.
- *
- * `asrClient.init()` only *starts* the load -- readiness arrives later on the
- * `asr:model-ready` event (see client.ts), so awaiting it is not enough. This
- * waits on the state that event drives instead.
- *
- * Resolves `false` rather than throwing when the model cannot be loaded: the
- * one caller (`rerunHistoryEntry`) reports that as a notice next to a history
- * entry that is still perfectly intact, not as a failure of the app.
- */
-async function ensureModelReady(): Promise<boolean> {
-  const { modelStatus, initModel } = useAppStore.getState();
-  if (modelStatus === "ready") return true;
-  if (modelStatus === "error") return false;
-  if (modelStatus === "idle") void initModel();
-  return new Promise((resolve) => {
-    const unsubscribe = useAppStore.subscribe((s) => {
-      if (s.modelStatus === "ready") {
-        unsubscribe();
-        resolve(true);
-      } else if (s.modelStatus === "error") {
-        unsubscribe();
-        resolve(false);
-      }
-    });
-  });
-}
 
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
@@ -731,6 +263,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vadSettings: loadVadSettings(),
   audioEventSettings: loadAudioEventSettings(),
   recordingMode: loadRecordingMode(),
+  sidebar: loadSidebarSettings(),
   levelMeter: null,
   audioInputDevices: [],
   appAudioApps: [],
@@ -803,10 +336,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       // These counters matter only while merely browsing -- if the user goes on
       // to press record, `startRecording` resets them (and clears `segments`)
       // to start a genuinely new session rather than appending after this entry.
-      nextSegmentId = entry.segments.length + 1;
-      timelineBaseSec = entry.durationSec;
-      recordingBaseSec = entry.durationSec;
-      segmentsBeforeRecording = entry.segments.length;
+      setNextSegmentId(entry.segments.length + 1);
+      setTimelineBaseSec(entry.durationSec);
+      setRecordingBaseSec(entry.durationSec);
+      setSegmentsBeforeRecording(entry.segments.length);
       set({
         segments: entry.segments,
         audioEvents: entry.audioEvents,
@@ -924,65 +457,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  loadPlayback: async (recordingId, path, timelineOffsetSec = 0) => {
-    if (get().playback.recordingId === recordingId) return;
-    playbackController?.dispose();
-    playbackController = null;
-    set({ playback: { ...IDLE_PLAYBACK, recordingId, timelineOffsetSec, loading: true } });
-    try {
-      const url = await wavToBlobUrl(path);
-      // The user may have switched away (a new recording, a different
-      // history entry) while the file was being read -- don't let a slow
-      // load clobber whatever is current by the time it resolves.
-      if (get().playback.recordingId !== recordingId) {
-        URL.revokeObjectURL(url);
-        return;
-      }
-      playbackController = createPlaybackController(url, (snapshot) => {
-        set((s) => (s.playback.recordingId === recordingId ? { playback: { ...s.playback, ...snapshot } } : {}));
-      });
-      set((s) => (s.playback.recordingId === recordingId ? { playback: { ...s.playback, loading: false } } : {}));
-    } catch (err) {
-      console.warn("[playback] failed to load recording audio:", err);
-      set((s) => (s.playback.recordingId === recordingId ? { playback: IDLE_PLAYBACK } : {}));
-    }
-  },
-
-  unloadPlayback: () => {
-    playbackController?.dispose();
-    playbackController = null;
-    set({ playback: IDLE_PLAYBACK });
-  },
-
-  togglePlayback: () => {
-    if (!playbackController) return;
-    if (get().playback.isPlaying) playbackController.pause();
-    else playbackController.play();
-  },
-
-  // Bumps `seekSeq` so `TranscriptPanel` can jump to the seeked-to segment --
-  // see its doc comment. `playbackController.seekTo` already updates
-  // `currentTimeSec` synchronously (through its own `emit()`), so by the time
-  // this second `set` runs, `activeSegmentId` derived from it is already
-  // correct for whichever row the effect ends up scrolling to.
-  seekTo: (sec) => {
-    playbackController?.seekTo(sec);
-    set((s) => ({ playback: { ...s.playback, seekSeq: s.playback.seekSeq + 1 } }));
-  },
-
-  // Routed through `seekTo` itself (rather than calling
-  // `playbackController.seekTo` directly, as this used to) so a skip bumps
-  // `seekSeq` exactly like any other seek -- the ←/→ keys and the 10s buttons
-  // are just as much a "take me there" action as dragging the slider.
-  skip: (deltaSec) => {
-    const { currentTimeSec } = get().playback;
-    get().seekTo(currentTimeSec + deltaSec);
-  },
-
-  setPlaybackRate: (rate) => {
-    playbackController?.setRate(rate);
-    set((s) => ({ playback: { ...s.playback, rate } }));
-  },
+  // Implementations live in playback.ts, which is self-contained enough
+  // (nothing outside it ever touches `playbackController`) to not need the
+  // rest of this store's `set`/`get` closures -- see that file.
+  loadPlayback,
+  unloadPlayback,
+  togglePlayback,
+  seekTo,
+  skip,
+  setPlaybackRate,
 
   startRecording: async () => {
     // Without this, a second call while a take is live would overwrite
@@ -1098,12 +581,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       // segments themselves are safe either way: they're already durable in
       // that entry's own sidecar JSON, this only clears what's displayed.
       if (get().selectedHistoryId !== null) {
-        nextSegmentId = 1;
-        timelineBaseSec = 0;
+        resetTimeline();
         set({ segments: [], audioEvents: [] });
       }
-      recordingBaseSec = timelineBaseSec;
-      segmentsBeforeRecording = get().segments.length;
+      setRecordingBaseSec(getTimelineBaseSec());
+      setSegmentsBeforeRecording(get().segments.length);
       const levelMeter = createAudioLevelMeter(controller.stream);
       // getUserMedia grants permission (if not already granted), which is also
       // when real device labels first become available -- refresh so the
@@ -1212,7 +694,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await eventStreamer?.finish().catch((err) => {
         console.warn("[audio-events] failed to flush the final live window:", err);
       });
-      timelineBaseSec = recordingBaseSec + totalSamples / WHISPER_SAMPLE_RATE;
+      setTimelineBaseSec(getRecordingBaseSec() + totalSamples / WHISPER_SAMPLE_RATE);
       // Stay in a processing phase if the accuracy pass is about to run:
       // clearing it here first would briefly re-enable "start a new recording"
       // in the gap before `refineRecording` sets "refining", and a take
@@ -1275,6 +757,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     // exactly as the startup load's do.
     if (!recordingMode.recordOnly) void ensureModelReady();
   },
+
+  setSidebarWidth: (width) =>
+    set((s) => ({ sidebar: { ...s.sidebar, width: clampSidebarWidth(width) } })),
+
+  persistSidebarSettings: () => saveSidebarSettings(get().sidebar),
+
+  toggleSidebar: () =>
+    set((s) => {
+      const sidebar = { ...s.sidebar, visible: !s.sidebar.visible };
+      saveSidebarSettings(sidebar);
+      return { sidebar };
+    }),
 
 }));
 

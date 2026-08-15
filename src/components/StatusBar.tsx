@@ -1,5 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { Moon, Sun, MonitorCog, Cpu, Zap, Mic, Cast, FileAudio } from "lucide-react";
+import {
+  Moon,
+  Sun,
+  MonitorCog,
+  Cpu,
+  Zap,
+  Mic,
+  Cast,
+  FileAudio,
+  PanelLeftClose,
+  PanelLeftOpen,
+} from "lucide-react";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { SettingsDialog } from "./SettingsDialog";
@@ -172,9 +183,12 @@ export function StatusBar() {
   const modelDevice = useAppStore((s) => s.modelDevice);
   const refineProgress = useAppStore((s) => s.refineProgress);
   const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const sidebarVisible = useAppStore((s) => s.sidebar.visible);
+  const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const preference = useThemeStore((s) => s.preference);
   const setPreference = useThemeStore((s) => s.setPreference);
   const elapsed = useElapsedRecordingSec(recordingPhase);
+  const sidebarLabel = sidebarVisible ? "履歴パネルを隠す" : "履歴パネルを表示";
 
   // One slot, five mutually exclusive occupants: the take's own state wins
   // while one exists, then the post-stop pipeline, then the idle chip -- which
@@ -187,6 +201,21 @@ export function StatusBar() {
   return (
     <div className="flex h-10 shrink-0 items-center justify-between border-b border-border px-2 text-sm">
       <div className="flex items-center gap-3">
+        {/* Outside InputControls on purpose: that group is what the *next*
+            recording will capture, and is locked mid-take. This only changes
+            what is on screen, so it stays live at every phase. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          aria-label={sidebarLabel}
+          aria-pressed={sidebarVisible}
+          title={sidebarLabel}
+          onClick={toggleSidebar}
+        >
+          {sidebarVisible ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeftOpen className="h-4 w-4" />}
+        </Button>
+
         <InputControls />
 
         {recordingPhase === "recording" && (

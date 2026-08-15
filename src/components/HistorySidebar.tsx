@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Trash2, Users, Wand2, AudioLines, Copy, Download, MoreHorizontal, FileAudio } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -8,6 +7,7 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { ScrollArea } from "./ui/scroll-area";
+import { useConfirmClick } from "./useConfirmClick";
 import { useAppStore, selectCapabilities } from "../store/appStore";
 import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
@@ -68,7 +68,9 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   // counter, so it is a stopped-only action -- the store enforces this too,
   // but a dead-looking click is worse than a disabled control.
   const browsable = recordingPhase === "stopped";
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const { confirming: confirmingDelete, onClick: onDeleteClick } = useConfirmClick(() => {
+    void deleteHistoryEntry(meta.id);
+  });
   const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
   const selected = selectedHistoryId === meta.id;
@@ -170,15 +172,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 data-[confirming=true]:opacity-100"
           data-confirming={confirmingDelete}
           disabled={!browsable}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (!confirmingDelete) {
-              setConfirmingDelete(true);
-              setTimeout(() => setConfirmingDelete(false), 3000);
-              return;
-            }
-            void deleteHistoryEntry(meta.id);
-          }}
+          onClick={onDeleteClick}
         >
           <Trash2 className="h-3 w-3" />
           {confirmingDelete ? "本当に削除" : "削除"}
@@ -199,21 +193,34 @@ export function HistorySidebar({ width }: { width: number }) {
   const recordingHistory = useAppStore((s) => s.recordingHistory);
 
   return (
+    // No border-r: the divider between this and the main area is drawn by the
+    // resize handle in App.tsx, so that the line and the thing you grab to move
+    // it are the same element rather than two rules a few pixels apart.
+    //
+    // pr-2 keeps the ScrollArea's own scrollbar clear of that handle, which
+    // overlaps this panel's right 8px -- without the gutter the scrollbar sits
+    // flush against the edge and is unreachable under a col-resize cursor.
     <div
-      className="flex h-full shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
+      className="flex h-full shrink-0 flex-col overflow-hidden bg-sidebar pr-2 text-sidebar-foreground"
       style={{ width }}
     >
-      <ScrollArea className="flex-1 px-2 pt-2">
-        {recordingHistory.length === 0 ? (
-          <p className="p-2 text-xs text-muted-foreground">録音履歴はまだありません。</p>
-        ) : (
-          <div className="flex flex-col gap-1 pb-2">
-            {recordingHistory.map((meta) => (
-              <HistoryRow key={meta.id} meta={meta} />
-            ))}
-          </div>
-        )}
-      </ScrollArea>
+      {/* min-h-0 is what makes the list scroll at all: without it this flex
+          child keeps `min-height: auto` and grows to its content, so the
+          ScrollArea's viewport is never shorter than what's inside it and has
+          nothing to scroll. Same wrapper pattern as TranscriptPanel's. */}
+      <div className="min-h-0 flex-1 pt-2 pl-2">
+        <ScrollArea className="h-full">
+          {recordingHistory.length === 0 ? (
+            <p className="p-2 text-xs text-muted-foreground">録音履歴はまだありません。</p>
+          ) : (
+            <div className="flex flex-col gap-1 pb-2">
+              {recordingHistory.map((meta) => (
+                <HistoryRow key={meta.id} meta={meta} />
+              ))}
+            </div>
+          )}
+        </ScrollArea>
+      </div>
     </div>
   );
 }

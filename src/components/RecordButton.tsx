@@ -5,8 +5,16 @@ import { cn } from "../lib/utils";
 
 /** Both buttons are the same circle, so the pair reads as one control rather
  * than a big button with a stray secondary bolted on. Emphasis comes from the
- * fill, not the size. */
-const CIRCLE = "h-16 w-16 rounded-full p-0";
+ * fill, not the size.
+ *
+ * "hero" is the button as the panel's whole content (nothing recorded yet);
+ * "fab" is the same control floating over a transcript, slightly smaller and
+ * lifted off the surface so it reads as being *above* the content rather than
+ * part of it. */
+const CIRCLE = {
+  hero: "h-16 w-16 rounded-full p-0",
+  fab: "h-14 w-14 rounded-full p-0 shadow-lg",
+} as const;
 
 /**
  * The record transport, one matched pair of circular buttons.
@@ -16,8 +24,13 @@ const CIRCLE = "h-16 w-16 rounded-full p-0";
  * so "a recording exists right now" is legible at a glance in both the
  * recording and paused states. The pulse is what separates them: live pulses,
  * paused is static.
+ *
+ * `placement` only sizes the circles. An open take always renders the pair at
+ * "hero" size regardless (App never asks for a FAB while one is in progress),
+ * so in practice only the start button is ever drawn as a FAB.
  */
-export function RecordButton() {
+export function RecordButton({ placement = "hero" }: { placement?: keyof typeof CIRCLE }) {
+  const circle = CIRCLE[placement];
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
@@ -36,7 +49,7 @@ export function RecordButton() {
         size="lg"
         disabled={!can.startRecording}
         onClick={() => void startRecording()}
-        className={CIRCLE}
+        className={circle}
         aria-label={label}
         title={label}
       >
@@ -58,7 +71,7 @@ export function RecordButton() {
         // the transport's primary gets the app's full --signal red instead,
         // the same fill the recording indicator uses.
         className={cn(
-          CIRCLE,
+          circle,
           "bg-signal text-white hover:bg-signal/90",
           !paused && "animate-pulse motion-reduce:animate-none",
         )}
@@ -73,7 +86,7 @@ export function RecordButton() {
         size="lg"
         variant="outline"
         onClick={() => void stopRecording()}
-        className={CIRCLE}
+        className={circle}
         aria-label="停止して保存"
         title="停止して保存"
       >

@@ -1,0 +1,35 @@
+/**
+ * The two Tauri IPC client singletons the store drives, plus the one piece of
+ * global wiring (`onAudioDeviceChange`) that reaches into the store on its
+ * own rather than through a store action. Kept apart from `appStore.ts` so
+ * "which external client does this" has one obvious home; the recording
+ * lifecycle (`appStore.ts`) and the accuracy pipeline (`recordingPipeline.ts`)
+ * both import from here.
+ *
+ * `useAppStore` is imported for the callbacks below to call, not at module
+ * top level -- each callback only runs after the whole module graph
+ * (including `appStore.ts`'s own `create()` call) has finished initializing,
+ * so this is safe despite `appStore.ts` importing `asrClient`/`appAudioClient`
+ * back from here.
+ */
+import { AsrClient } from "../lib/asr";
+import { AppAudioClient, onAudioDeviceChange } from "../lib/audio";
+import { useAppStore } from "./appStore";
+
+// One instance shared by the app-list refresh and the actual capture start/stop:
+// listing apps touches neither the Channel nor the error listener the capture
+// methods manage, so the two uses never interfere with each other.
+export const appAudioClient = new AppAudioClient();
+
+export const asrClient = new AsrClient({
+  onDeviceInfo: (device) => useAppStore.setState({ modelDevice: device }),
+  onModelReady: () => useAppStore.setState({ modelStatus: "ready" }),
+  onError: (message) => useAppStore.setState({ modelStatus: "error", errorMessage: message }),
+  onRefineProgress: (percent) => useAppStore.setState({ refineProgress: percent }),
+});
+
+// Keeps the settings dropdown in sync when a microphone is plugged or
+// unplugged, without the UI needing to poll for it.
+onAudioDeviceChange(() => {
+  void useAppStore.getState().refreshAudioInputDevices();
+});

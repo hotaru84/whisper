@@ -170,7 +170,7 @@ export function RecordingTimeline() {
   if (!stopped || playback.recordingId == null) return null;
 
   return (
-    <div className="flex w-full flex-col gap-2 rounded-lg border border-border p-4">
+    <div className="flex w-full shrink-0 flex-col gap-2 rounded-lg border border-border p-4">
       <EventBand events={audioEvents} playback={playback} onSeek={seekTo} />
 
       <div className="flex items-center gap-3">

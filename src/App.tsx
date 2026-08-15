@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { TitleBar } from "./components/TitleBar";
 import { StatusBar } from "./components/StatusBar";
 import { HistorySidebar } from "./components/HistorySidebar";
@@ -10,35 +10,17 @@ import { TranscriptPanel } from "./components/TranscriptPanel";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useAppStore, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
 
-const SIDEBAR_WIDTH_KEY = "sidebar-width";
-const MIN_SIDEBAR_WIDTH = 180;
-const MAX_SIDEBAR_WIDTH = 420;
-const DEFAULT_SIDEBAR_WIDTH = 224;
-
-function clampSidebarWidth(width: number): number {
-  return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
-}
-
-function loadSidebarWidth(): number {
-  try {
-    const stored = globalThis.localStorage?.getItem(SIDEBAR_WIDTH_KEY);
-    const width = stored ? Number(stored) : NaN;
-    return Number.isFinite(width) ? clampSidebarWidth(width) : DEFAULT_SIDEBAR_WIDTH;
-  } catch {
-    return DEFAULT_SIDEBAR_WIDTH;
-  }
-}
-
 /** Drag-to-resize for the history sidebar. The sidebar is the flex row's
  * first child starting at the window's left edge, so the pointer's own
  * clientX already *is* the desired width -- no extra offset bookkeeping
  * needed. Width is only persisted on release, not on every pointermove, so
  * dragging doesn't spam localStorage. */
-function useSidebarWidth(): { width: number; onDragHandleDown: (e: React.PointerEvent) => void } {
-  const [width, setWidth] = useState(loadSidebarWidth);
+function useSidebarDrag(): (e: React.PointerEvent) => void {
+  const setSidebarWidth = useAppStore((s) => s.setSidebarWidth);
+  const persistSidebarSettings = useAppStore((s) => s.persistSidebarSettings);
   const draggingRef = useRef(false);
 
-  const onDragHandleDown = (e: React.PointerEvent) => {
+  return (e: React.PointerEvent) => {
     e.preventDefault();
     draggingRef.current = true;
     // Without this, dragging across the transcript panel selects its text
@@ -51,27 +33,18 @@ function useSidebarWidth(): { width: number; onDragHandleDown: (e: React.Pointer
 
     const onMove = (ev: PointerEvent) => {
       if (!draggingRef.current) return;
-      setWidth(clampSidebarWidth(ev.clientX));
+      setSidebarWidth(ev.clientX);
     };
     const onUp = () => {
       draggingRef.current = false;
       document.body.style.userSelect = previousUserSelect;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      setWidth((current) => {
-        try {
-          globalThis.localStorage?.setItem(SIDEBAR_WIDTH_KEY, String(current));
-        } catch {
-          // Persistence is a convenience; losing it is not worth surfacing an error.
-        }
-        return current;
-      });
+      persistSidebarSettings();
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   };
-
-  return { width, onDragHandleDown };
 }
 
 function App() {
@@ -80,7 +53,23 @@ function App() {
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
   const refreshRecordingHistory = useAppStore((s) => s.refreshRecordingHistory);
   const errorMessage = useAppStore((s) => s.errorMessage);
-  const { width: sidebarWidth, onDragHandleDown } = useSidebarWidth();
+  const sidebar = useAppStore((s) => s.sidebar);
+  const recordingPhase = useAppStore((s) => s.recordingPhase);
+  const processing = useAppStore((s) => s.processing);
+  const segmentCount = useAppStore((s) => s.segments.length);
+  const playbackRecordingId = useAppStore((s) => s.playback.recordingId);
+  const onDragHandleDown = useSidebarDrag();
+
+  // A take is open (recording or paused). Both keep the transport as a centered
+  // pair with the level meter under it -- pausing does not end the take, so the
+  // layout should not change out from under the user mid-recording.
+  const takeOpen = recordingPhase !== "stopped";
+  // Nothing to show on the right at all: no transcript, no loaded audio, no
+  // pass running. Only then does the record button become the panel's whole
+  // content. Note this is *not* the same as "no history entry selected" --
+  // `selectedHistoryId` stays null right after a recording finishes, but by
+  // then `segments` and/or `playback.recordingId` are populated.
+  const idleEmpty = !takeOpen && processing === null && segmentCount === 0 && playbackRecordingId == null;
 
   useEffect(() => {
     // Skipped entirely in record-only mode -- loading the model is the cost
@@ -113,34 +102,76 @@ function App() {
         <ModelLoadingOverlay />
         <StatusBar />
         <div className="flex flex-1 overflow-hidden">
-          <HistorySidebar width={sidebarWidth} />
-          {/* w-1.5 visual line inside a wider w-2.5 hit target -- a 4px-wide
-              click target is uncomfortably thin for a real cursor (verified
-              by hand: easy to miss and select the transcript text behind it
-              instead), so the interactive area is wider than what's drawn. */}
-          <div
-            onPointerDown={onDragHandleDown}
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="履歴パネルの幅を調整"
-            className="group flex w-4 shrink-0 cursor-col-resize touch-none items-stretch justify-center"
-          >
-            <div className="w-1 bg-transparent transition-colors group-hover:bg-border group-active:bg-border" />
-          </div>
-          <main className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
+          {sidebar.visible && (
+            <>
+              <HistorySidebar width={sidebar.width} />
+              {/* The divider and the thing you grab to move it are the same
+                  element: -mx-2 takes the handle out of the layout entirely
+                  (zero width contributed), so its 16px hit area straddles the
+                  line it draws instead of sitting beside it. A 1px-wide click
+                  target is unusable with a real cursor, hence the hit area
+                  being much wider than what's drawn. */}
+              <div
+                onPointerDown={onDragHandleDown}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="履歴パネルの幅を調整"
+                className="group relative z-20 -mx-2 flex w-4 shrink-0 cursor-col-resize touch-none items-stretch justify-center"
+              >
+                <div className="w-px bg-sidebar-border transition-[width,background-color] group-hover:w-0.5 group-hover:bg-ring group-active:bg-ring" />
+              </div>
+            </>
+          )}
+          {/* overflow-hidden + min-h-0 (rather than overflow-y-auto) so this
+              column itself never scrolls -- only TranscriptPanel's own
+              transcript list does. Everything else here (the error banner,
+              record button, timeline) is shrink-0 fixed content; TranscriptPanel
+              is the sole flex-1 min-h-0 child that absorbs the remaining
+              height and hands it to its internal ScrollArea. `relative` is the
+              positioning context for the FAB below. */}
+          <main className="relative flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4">
             {errorMessage && (
-              <p className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">{errorMessage}</p>
+              <p className="shrink-0 rounded-md bg-destructive/10 p-3 text-sm text-destructive">{errorMessage}</p>
             )}
 
-            <div className="flex flex-col items-center gap-3">
-              <RecordButton />
-              <div className="w-full max-w-sm">
-                <LevelMeter />
+            {idleEmpty ? (
+              // Nothing recorded and nothing selected: the one thing that can
+              // be done here owns the panel, instead of a big button sitting
+              // above an empty transcript box saying the same thing.
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4">
+                <RecordButton />
+                <p className="text-sm text-muted-foreground">
+                  録音を開始すると、ここに文字起こし結果が表示されます。
+                </p>
               </div>
-            </div>
+            ) : (
+              <>
+                {takeOpen && (
+                  <div className="flex shrink-0 flex-col items-center gap-3">
+                    <RecordButton />
+                    <div className="w-full max-w-sm">
+                      <LevelMeter />
+                    </div>
+                  </div>
+                )}
 
-            <RecordingTimeline />
-            <TranscriptPanel />
+                <RecordingTimeline />
+                <TranscriptPanel />
+
+                {/* Stopped with something on screen: the transcript is what the
+                    user came for, so the transport shrinks to a FAB rather than
+                    holding a full row at the top. right-8 clears the transcript
+                    panel's own scrollbar; z-20 keeps it under the loading
+                    overlay (z-40), dialogs (z-50) and the titlebar (z-[60]).
+                    The level meter is dropped here -- with no take open it
+                    would only ever draw silence. */}
+                {!takeOpen && (
+                  <div className="absolute right-8 bottom-6 z-20">
+                    <RecordButton placement="fab" />
+                  </div>
+                )}
+              </>
+            )}
           </main>
         </div>
       </div>
