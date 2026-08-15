@@ -29,6 +29,12 @@ src-tauri/fixtures/*
 # CER harness output
 cer-*.json
 
+# Physical home for the Cargo target dir. C:\wsbuild (see .cargo/config.toml)
+# is an NTFS junction pointing here, keeping the literal path cargo/CMake see
+# short (avoids MAX_PATH issues in whisper.cpp's nested vulkan-shaders-gen
+# build) while the actual build output lives inside the project.
+.wsbuild/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
