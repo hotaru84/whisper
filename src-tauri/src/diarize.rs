@@ -75,15 +75,35 @@ pub fn diarize(
     segmentation_model: &str,
     embedding_model: &str,
 ) -> Result<Vec<SpeakerSegment>, String> {
+    // sherpa-onnx's own default is `num_threads: 1`: fine for a live per-window
+    // pass sharing the CPU with whisper, wrong for this one -- diarization only
+    // ever runs once, offline, over the whole recording (see the module doc),
+    // so there's nothing else competing for the core count. Reusing whisper's
+    // `available_parallelism().min(8)` heuristic here isn't about ggml's
+    // barrier cost (which doesn't apply to ONNX Runtime's threading model),
+    // just a shared "don't oversubscribe past 8" default.
+    let num_threads = crate::asr::default_n_threads();
+    // "directml" is the exact provider string sherpa-onnx's C++ session setup
+    // matches (`Provider::kDirectML` in provider.cc). If the shipped
+    // sherpa-onnx-c-api/onnxruntime DLLs weren't built with
+    // SHERPA_ONNX_ENABLE_DIRECTML, or DirectML has nothing compatible to bind
+    // to on this machine, sherpa-onnx's own session setup already falls back
+    // to CPU and keeps working -- it just logs "Fallback to cpu" to stderr.
+    // Nothing on the Rust side needs to detect or handle that fallback.
+    let provider = "directml";
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
                 model: Some(segmentation_model.to_string()),
             },
+            num_threads,
+            provider: Some(provider.to_string()),
             ..Default::default()
         },
         embedding: SpeakerEmbeddingExtractorConfig {
             model: Some(embedding_model.to_string()),
+            num_threads,
+            provider: Some(provider.to_string()),
             ..Default::default()
         },
         clustering: FastClusteringConfig {

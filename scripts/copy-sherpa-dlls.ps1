@@ -38,4 +38,18 @@ foreach ($dll in $dlls) {
     }
     Copy-Item $src (Join-Path $destDir $dll) -Force
 }
+
+# DirectML.dll only exists in $releaseDir when the build was pointed at a
+# sherpa-onnx built from source with -DSHERPA_ONNX_ENABLE_DIRECTML=ON (via the
+# SHERPA_ONNX_LIB_DIR env var -- see win-build-env.bat and README). Optional,
+# not required: without it, diarization/audio-tagging's "directml" provider
+# request just falls back to CPU inside sherpa-onnx itself (see the comment on
+# `provider` in diarize.rs), so a normal build without a DirectML-enabled
+# sherpa-onnx must not fail here.
+$directmlDll = Join-Path $releaseDir "DirectML.dll"
+if (Test-Path $directmlDll) {
+    Copy-Item $directmlDll (Join-Path $destDir "DirectML.dll") -Force
+    Write-Host "[copy-sherpa-dlls] copied DirectML.dll to $destDir"
+}
+
 Write-Host "[copy-sherpa-dlls] copied $($dlls.Count) DLLs to $destDir"

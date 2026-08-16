@@ -109,6 +109,43 @@ Invoke-WebRequest -Uri "https://github.com/k2-fsa/sherpa-onnx/releases/download/
 から `src-tauri/resources/bin/` へコピーしてから `bundle.resources` の対象に含めている。この一連の流れは
 `npm run tauri build` の中で自動的に走るため、手動での追加操作は不要。
 
+**話者分離と音響イベント検出（停止後の全体パス）は `num_threads` とプロバイダを明示している。** `sherpa-onnx`
+crate の `Default` はどちらも `num_threads: 1` かつ `provider: "cpu"` で、これをそのまま `..Default::default()`
+で使うと、録音全体を舐めるこの2つのパスがシングルスレッド CPU 実行になってしまう（`num_threads` は
+`asr::default_n_threads()` を流用。ggml のバリア特性ではなく単に「8スレッドまでに留める」という一般的な
+上限として再利用しているだけ）。録音中にライブで動く音響イベントの per-window 経路（`events::AudioTaggingState`）
+だけは、streaming whisper と CPU/GPU を奪い合わないよう `num_threads: 1` / `provider: "cpu"` のまま据え置いている。
+
+プロバイダは `"directml"` を指定している（`sherpa-onnx` の C++ 側 `provider.cc` が受け付ける文字列そのもの）。
+ただし現状同梱している `onnxruntime.dll`/`sherpa-onnx-c-api.dll` は DirectML 対応でビルドされていない
+**GitHub リリースのプリビルド版**なので、`"directml"` を指定しても sherpa-onnx 自身が内部で CPU に
+フォールバックする（`session.cc` が無条件に stderr へ `"Fallback to cpu"` と出す。`debug` フラグには
+連動しないので、有効になったかどうかは常にこのログで確認できる）。実際に DirectML を効かせるには、
+`k2-fsa/sherpa-onnx` の `v1.13.5` タグ相当を自前でビルドする必要がある（プリビルドの DirectML 版は
+配布されていない。CI ワークフローにも存在しない）:
+
+```powershell
+cmake -A x64 `
+  -D SHERPA_ONNX_ENABLE_DIRECTML=ON `
+  -D BUILD_SHARED_LIBS=ON `
+  -D SHERPA_ONNX_USE_STATIC_CRT=ON `
+  -D CMAKE_BUILD_TYPE=Release `
+  -D CMAKE_INSTALL_PREFIX=./install `
+  -D SHERPA_ONNX_ENABLE_PORTAUDIO=OFF `
+  ..
+cmake --build . --config Release --target install
+```
+
+`SHERPA_ONNX_USE_STATIC_CRT=ON` は必須 — これを外すと動的 CRT（`/MD`）でビルドされ、上で触れた
+「VS2019 の静的 CRT ではない DLL がリンクできない」問題を DirectML 版でも踏む。このビルドは DirectML 対応の
+`onnxruntime.dll`（`microsoft.ml.onnxruntime.directml` 1.14.1）と `DirectML.dll`（`Microsoft.AI.DirectML`
+1.15.0）を **NuGet から**自動取得する（Vulkan SDK と違い、ここだけ GitHub ではなく NuGet への到達性が要る）。
+できた `install/lib` を環境変数 `SHERPA_ONNX_LIB_DIR` に指定してこのリポジトリをビルドすると、
+`sherpa-onnx-sys` の build script が GitHub からのダウンロードを飛ばしてそちらをリンクする
+（`scripts/win-build-env.bat` が設定されていれば表示するだけで、必須にはしていない — 通常のビルドは
+今までどおり CPU 版で問題なく動くため）。`scripts/copy-sherpa-dlls.ps1` は `DirectML.dll` が存在すれば
+追加でコピーする（無くてもエラーにはしない）。
+
 ### VAD モデルの配置（任意機能・既定で有効）
 
 停止後の精度向上パスで無音区間を除く音声区間検出（VAD）に使う。**設定パネルでは既定オン**だが、モデルファイル
@@ -202,7 +239,8 @@ npm run tauri build
 ```
 
 `C:\wsbuild\release\bundle\nsis\` に生成される。モデル（q5_0、約574MB）を同梱するためインストーラサイズは
-600〜650MB 程度になる。
+600〜650MB 程度になる。`SHERPA_ONNX_LIB_DIR` で DirectML 対応の sherpa-onnx をリンクした場合は
+`DirectML.dll`（数MB程度）が追加で同梱される。
 
 `tauri.conf.json` の `bundle.targets` は `["nsis"]` に絞ってある。既定の `"all"` は MSI も作るため WiX
 ツールセットのダウンロードが走るが、ここでは NSIS で用が足りる。日常的な動作確認には上の `--no-bundle` を使う。
@@ -375,6 +413,19 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   依存するため、ここの精度がそのまま効いてくる。制約: DTW は `flash_attn` と併用不可、`new_segment_callback` の
   呼び出しが不整合になるとされているが、**このアプリはどちらも使っていないため影響なし**。
   コストは実測で軽微（40秒音声・Vulkan、3回平均で DTW 無し約3.3秒 → 有り約3.5秒、+4〜5%）。
+  - **有効化していたが、しばらくの間その結果は使われていなかった。** whisper.cpp のソースを確認すると、
+    セグメントの `t0`/`t1` は DTW を計算するブロックより**前**に、単一タイムスタンプトークンから確定してしまう。
+    DTW が書き込むのは各トークンの `t_dtw`（`whisper_full_get_token_data` 経由でしか読めない）だけで、
+    `asr::collect_segments` は元々セグメント単位の `start_timestamp()`/`end_timestamp()` しか見ていなかった
+    ため、上記の +4〜5% のコストを払いながら精度への寄与はゼロだった。今は `collect_segments` が各セグメントの
+    テキストトークン（タイムスタンプトークン自身は対象外。`t_dtw` の初期値は未計算を表す `-1` のセンチネル）
+    の `t_dtw` から最小・最大を取り、セグメント境界としている。DTW が計算されていない場合（トークンが1つも
+    無い等）は従来どおりのセグメント境界にフォールバックする。
+  - **flash attention（`flash_attn: true`）とは今回も採用しなかった。** これを有効にすれば全 GPU バックエンドで
+    アテンション計算自体が速くなるが、DTW とは原理的に両立しない（DTW は復号中のアテンション行列を保持する
+    必要があるが、flash attention はその行列を一度も具現化しないことで速度を稼ぐ）。今回は「DTW を活かして
+    タイムスタンプ精度を上げる」方を優先したため見送った。速度を優先する場面になれば、`init_model` の
+    `dtw_parameters` を外して `flash_attn: true` に置き換え、`collect_segments` の DTW 読み出しを外せば切り替えられる。
 - **言語は既定で日本語。** whisper.cpp は `"auto"` 指定で真の言語自動検出をサポートする（設定パネルの
   「自動検出」）。既定言語は `src/store/appStore.ts` で ISO 639-1 コード `"ja"` に設定している。
 - **マイクは設定パネルから選べる。** `navigator.mediaDevices.enumerateDevices()`（`src/lib/audio/devices.ts`）で
@@ -471,6 +522,21 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   | **Vulkan GPU**          | **約 2 秒** |
 
   30秒の音声を約2秒で処理できるため、録音しながらの逐次文字起こしが十分な余裕を持って成立する。
+
+- **faster-whisper (CTranslate2) と sherpa-onnx の ONNX Whisper は、文字起こし本体の置き換え候補として
+  検討して不採用にした。** どちらも ONNX Runtime / DirectML の活用を目的に調査したが、配布先が任意の
+  Windows PC（NVIDIA とは限らない）という制約と、精度・機能を落とさないという制約のどちらとも噛み合わなかった。
+  - **faster-whisper / CTranslate2**: GPU バックエンドが CUDA のみで、AMD/Intel GPU への対応が無い。配布先の
+    大半を占える Intel/AMD 内蔵 GPU 機では CPU 実行に落ち、上の表の「CPU・最適化修正後 27秒」相当まで後退する
+    ため、Vulkan より確実に遅くなる。NVIDIA 機のみを主要ターゲットにする方針に変わるのであれば、`ct2rs` で
+    CTranslate2 をソースビルドするより `whisper-rs` の `cuda` feature（whisper.cpp 自身の CUDA バックエンド）
+    の方が、既存の Vulkan ビルドと共存でき、追加のビルド系統も要らない分安い。
+  - **sherpa-onnx の ONNX Whisper**（`OfflineWhisperModelConfig`）: `initial_prompt` に相当する設定項目が無く、
+    上で説明した用語集機能を渡す先が無い。デコードも greedy 固定で、temperature フォールバックや
+    `entropy_thold` による反復ガードも無い。
+  DirectML 自体は無駄にはしていない — 話者分離と音響イベント検出（どちらも `sherpa-onnx` の ONNX Runtime を
+  使う停止後の別パス）ではモデル・デコードを変えずに実行プロバイダだけ切り替えられるため、精度リスクなしで
+  適用している。詳細は「話者分離モデルの配置」節を参照。
 
 - **whisper.cpp / ggml のネイティブログは既定で抑制している。** 放っておくとモデル情報の羅列に加え、
   ウィンドウごとに `whisper_init_state:` が7行ずつ出て有用な情報が埋もれる。`whisper_rs::install_logging_hooks()`

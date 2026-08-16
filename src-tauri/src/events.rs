@@ -119,7 +119,17 @@ pub fn detect_events(
         return Ok(Vec::new());
     }
 
-    let tagger = create_tagger(model_path, labels_path, settings.top_k.max(1))?;
+    // This is the offline, whole-recording pass -- it runs once, after the
+    // user stops, with nothing else competing for the CPU or GPU (unlike the
+    // live per-window path below, which shares both with streaming whisper
+    // inference and stays on sherpa-onnx's single-threaded CPU default).
+    let tagger = create_tagger(
+        model_path,
+        labels_path,
+        settings.top_k.max(1),
+        crate::asr::default_n_threads(),
+        "directml",
+    )?;
 
     let window_samples = (WINDOW_SEC * crate::wav::SAMPLE_RATE as f32).round() as usize;
     let mut events = Vec::new();
@@ -144,12 +154,33 @@ pub fn detect_events(
 /// first-use creation, so the two never end up constructing the config
 /// differently. `top_k` here is only a creation-time fallback -- `tag_window`
 /// always passes its own `top_k` to `compute()`, which takes precedence.
-fn create_tagger(model_path: &str, labels_path: &str, top_k: i32) -> Result<AudioTagging, String> {
+///
+/// `num_threads` and `provider` are caller-chosen rather than fixed constants
+/// precisely because the two callers have opposite constraints: the offline
+/// pass has the CPU and GPU to itself and should use both, while the live
+/// pass runs alongside streaming whisper inference and must not take
+/// resources away from it -- it passes `"cpu"` and 1 thread, matching
+/// sherpa-onnx's own defaults.
+///
+/// `"directml"` is the exact provider string sherpa-onnx's C++ session setup
+/// matches; if the shipped DLLs weren't built with DirectML support, or no
+/// compatible GPU is available, sherpa-onnx's own session setup already falls
+/// back to CPU and keeps working (logging "Fallback to cpu" to stderr), so
+/// there is no CPU fallback to implement here.
+fn create_tagger(
+    model_path: &str,
+    labels_path: &str,
+    top_k: i32,
+    num_threads: i32,
+    provider: &str,
+) -> Result<AudioTagging, String> {
     let config = AudioTaggingConfig {
         model: AudioTaggingModelConfig {
             zipformer: OfflineZipformerAudioTaggingModelConfig {
                 model: Some(model_path.to_string()),
             },
+            num_threads,
+            provider: Some(provider.to_string()),
             ..Default::default()
         },
         labels: Some(labels_path.to_string()),
@@ -386,10 +417,17 @@ pub async fn detect_events_window(
         if guard.is_none() {
             let model_path = resolve_model_path(&app)?;
             let labels_path = resolve_labels_path(&app)?;
+            // Single-threaded CPU on purpose: this runs during an active
+            // recording, concurrently with streaming whisper inference on the
+            // same machine's CPU and GPU, and must not compete with it the
+            // way the offline pass's higher thread count and DirectML
+            // provider would.
             *guard = Some(create_tagger(
                 &model_path.display().to_string(),
                 &labels_path.display().to_string(),
                 top_k,
+                1,
+                "cpu",
             )?);
         }
         let tagger = guard.as_ref().unwrap();
