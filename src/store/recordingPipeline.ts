@@ -164,6 +164,7 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
     });
     return;
   }
+  const recordingId = idFromWavPath(path);
 
   // The WAV is fully written at this point regardless of how the accuracy
   // pass below goes, so playback becomes available immediately rather than
@@ -171,9 +172,13 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
   // where this take's segments start on the session's global timeline (see
   // `PlaybackState.timelineOffsetSec`'s doc comment) -- the WAV itself is
   // always 0-based, only the segments referring to it are shifted.
-  void useAppStore.getState().loadPlayback(idFromWavPath(path), path, baseSec);
+  void useAppStore.getState().loadPlayback(recordingId, path, baseSec);
 
-  useAppStore.setState({ processing: "refining", refineProgress: 0 });
+  // `processingRecordingId` lets the UI say *which* recording "精度向上パス
+  // 実行中" refers to (see its own doc comment in appStore.ts) -- unlike
+  // `rerunHistoryEntry`, the id here only exists once `capture.finish()`
+  // above has already resolved, so it can't be set any earlier than this.
+  useAppStore.setState({ processing: "refining", refineProgress: 0, processingRecordingId: recordingId });
   try {
     const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
     const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
@@ -188,10 +193,23 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
     }
 
     const targets = nonBlankChunks(result).map((c) => c.timestamp);
-    const rebasedEvents = newEvents.map((e) => ({ ...e, start: e.start + baseSec, end: e.end + baseSec }));
-    useAppStore.setState((s) => ({
-      audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
-    }));
+    // Audio-tagging is a separate call from transcription (detectAudioEvents,
+    // run against `targets` from this same result -- see runAccuracyPipeline)
+    // that can fail or get skipped on its own: disabled in settings, nothing
+    // to tag because `targets` came back empty, or the call itself threw.
+    // `excluded` only comes back defined when it actually completed; when
+    // it's undefined, `newEvents` is just its unset initial value, not "no
+    // events found". Overwriting the live pass's own preview with that would
+    // silently discard real data over a failure that says nothing about
+    // whether the preview was wrong -- so, mirroring the segments fallback
+    // below, keep the live preview instead.
+    const audioEventsUsable = excluded !== undefined;
+    if (audioEventsUsable) {
+      const rebasedEvents = newEvents.map((e) => ({ ...e, start: e.start + baseSec, end: e.end + baseSec }));
+      useAppStore.setState((s) => ({
+        audioEvents: [...s.audioEvents.filter((e) => e.start < baseSec), ...rebasedEvents],
+      }));
+    }
 
     const refined = segmentsFromResult(result, baseSec, peekNextSegmentId(), speakers, excluded, newEvents);
     // One segment per non-blank chunk, always -- an excluded chunk becomes a
@@ -204,7 +222,6 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
       consumeSegmentIds(refined.length);
     }
 
-    const recordingId = idFromWavPath(path);
     // An empty (or all-excluded-placeholder) second pass means something went
     // wrong upstream, not that the meeting was silent -- the live pass
     // already found speech in this audio. Checked by actual text rather than
@@ -243,6 +260,16 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
       id: i + 1,
       startOffsetSec: s.startOffsetSec - baseSec,
     }));
+    // Same idea as `localSegments`, for audio events: whichever pass's
+    // results are now live in the store for this take -- the post-hoc pass's,
+    // if `audioEventsUsable`, otherwise whatever the live preview already had
+    // -- read back out and rebased onto the recording's own 0-based timeline
+    // for persistence, rather than re-reading `newEvents` (which, unlike the
+    // state, doesn't reflect the fallback when the pass wasn't usable).
+    const localAudioEvents = useAppStore
+      .getState()
+      .audioEvents.filter((e) => e.start >= baseSec)
+      .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }));
     try {
       await saveRecordingHistory(recordingId, {
         durationSec: recordingDurationSec,
@@ -254,9 +281,9 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
         // that isn't there.
         usedDiarize: secondPassUsable && diarizeSettings.enabled,
         usedVad: secondPassUsable && vadSettings.enabled,
-        usedAudioEvents: audioEventSettings.enabled,
+        usedAudioEvents: audioEventsUsable,
         segments: localSegments,
-        audioEvents: newEvents,
+        audioEvents: localAudioEvents,
       });
       // Awaited, not fire-and-forget: only once `recordingHistory` actually
       // contains this entry does `markRecordingViewed` below have anything
@@ -292,7 +319,7 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
       refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
   } finally {
-    useAppStore.setState({ processing: null, refineProgress: null });
+    useAppStore.setState({ processing: null, refineProgress: null, processingRecordingId: null });
   }
 }
 

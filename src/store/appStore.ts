@@ -133,6 +133,20 @@ interface AppState {
   refineNotice: string | null;
   /** 0-100 while `processing` is "refining", otherwise null. */
   refineProgress: number | null;
+  /**
+   * The id of whichever recording `processing` is currently running the
+   * accuracy pass against, when known. Set by `rerunHistoryEntry` (the id is
+   * its own parameter) and by `refineRecording` (once `capture.finish()`
+   * resolves and the id is known -- so this stays `null` for the brief
+   * moment `processing` first becomes `"refining"` but the WAV isn't closed
+   * yet). Deliberately independent of `viewedRecordingId`: unlike that
+   * field, this one must stay correct even if the user browses to a
+   * *different* entry while a reanalysis keeps running in the background
+   * (`rerunHistoryEntry`'s `browseHistory`/`loadHistoryEntry` gate is
+   * `recordingPhase` alone, not `processing`, so that's reachable) -- see
+   * `TitleBarStatus`/`HistorySidebar` for where this is shown.
+   */
+  processingRecordingId: string | null;
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
@@ -244,6 +258,10 @@ interface AppState {
  *   handler for the one write site outside it) must check that before
  *   applying an update, since the backend event feeding it isn't guaranteed
  *   to stop arriving the instant the frontend moves on.
+ * - `processingRecordingId` -- only meaningful while `processing !== null`;
+ *   set alongside it in `rerunHistoryEntry` and (once the id is known)
+ *   `refineRecording`, cleared alongside it in every `finally`. Deliberately
+ *   *not* required to equal `viewedRecordingId` -- see its own doc comment.
  */
 
 /**
@@ -373,6 +391,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   errorMessage: null,
   refineNotice: null,
   refineProgress: null,
+  processingRecordingId: null,
   settings: loadSettings(),
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
@@ -505,7 +524,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const durationSec = get().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
     const path = await wavPath(id);
 
-    set({ processing: "refining", refineProgress: 0, refineNotice: null });
+    set({ processing: "refining", refineProgress: 0, refineNotice: null, processingRecordingId: id });
     try {
       const { settings, vadSettings, diarizeSettings, audioEventSettings } = get();
       const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
@@ -562,7 +581,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
     } finally {
-      set({ processing: null, refineProgress: null });
+      set({ processing: null, refineProgress: null, processingRecordingId: null });
     }
   },
 

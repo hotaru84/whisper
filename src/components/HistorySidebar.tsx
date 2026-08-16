@@ -7,6 +7,7 @@ import {
   Download,
   MoreHorizontal,
   FileAudio,
+  Loader2,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -24,16 +25,8 @@ import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
-import { formatTimestamp } from "../lib/format";
+import { formatTimestamp, formatDateTime } from "../lib/format";
 import { cn } from "../lib/utils";
-
-function formatDateTime(date: Date): { day: string; time: string } {
-  const p = (n: number) => String(n).padStart(2, "0");
-  return {
-    day: `${date.getMonth() + 1}/${date.getDate()}`,
-    time: `${p(date.getHours())}:${p(date.getMinutes())}`,
-  };
-}
 
 /** Feature badges are icon-only (no label) to keep each row to one line --
  * each carries its own `aria-label` rather than relying on a label learned
@@ -69,6 +62,7 @@ function useHistoryRowActions(id: string) {
 
 function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
+  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
   const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
@@ -87,6 +81,13 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   // counter, so it is a stopped-only action -- the store enforces this too,
   // but a dead-looking click is worse than a disabled control.
   const browsable = recordingPhase === "stopped";
+  // This row specifically -- not just "some reanalysis is running somewhere"
+  // (that's `!can.reanalyze`, which already greys out every row's own 解析
+  // button) -- is the target of the accuracy pass right now. Shown
+  // unconditionally rather than only on hover (unlike the action buttons
+  // below) since this is the answer to "which one is it doing", not an
+  // action the user reaches for.
+  const isProcessing = processingRecordingId === meta.id;
   const { confirming: confirmingDelete, onClick: onDeleteClick } =
     useConfirmClick(() => {
       void deleteHistoryEntry(meta.id);
@@ -121,9 +122,16 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {day} {time}
           </span>
-          <span className="font-mono text-xs tabular-nums text-muted-foreground">
-            {formatTimestamp(meta.durationSec)}
-          </span>
+          {isProcessing ? (
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
+              解析中…
+            </span>
+          ) : (
+            <span className="font-mono text-xs tabular-nums text-muted-foreground">
+              {formatTimestamp(meta.durationSec)}
+            </span>
+          )}
         </div>
         {meta.transcribed ? (
           meta.preview && (
@@ -212,7 +220,11 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           size="sm"
           className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 data-[confirming=true]:opacity-100"
           data-confirming={confirmingDelete}
-          disabled={!browsable}
+          // Deleting the entry `rerunHistoryEntry` is currently working
+          // against would let its eventual `saveRecordingHistory` call
+          // silently recreate the sidecar JSON out from under the delete --
+          // see `isProcessing`'s own doc comment above.
+          disabled={!browsable || isProcessing}
           onClick={onDeleteClick}
         >
           <Trash2 className="h-3 w-3" />

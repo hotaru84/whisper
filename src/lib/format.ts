@@ -15,3 +15,14 @@ export function formatTimestamp(totalSec: number): string {
   const ss = String(s).padStart(2, "0");
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
+
+/** A recording's `createdAt` as the short `month/day` + `HH:MM` pair the
+ * sidebar row and the titlebar's "which recording" status both need --
+ * shared so the two can never format the same timestamp differently. */
+export function formatDateTime(date: Date): { day: string; time: string } {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return {
+    day: `${date.getMonth() + 1}/${date.getDate()}`,
+    time: `${p(date.getHours())}:${p(date.getMinutes())}`,
+  };
+}

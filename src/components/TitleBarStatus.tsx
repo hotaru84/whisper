@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
 import { useAppStore, type RecordingPhase } from "../store/appStore";
-import { formatTimestamp } from "../lib/format";
+import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
  * How long the current take has actually been capturing, ticking every half
@@ -51,8 +51,18 @@ export function TitleBarStatus() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
   const refineProgress = useAppStore((s) => s.refineProgress);
+  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
+  const recordingHistory = useAppStore((s) => s.recordingHistory);
   const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
   const elapsed = useElapsedRecordingSec(recordingPhase);
+
+  // Only resolves once the recording being refined already has a history
+  // entry (`processingRecordingId` can briefly point at one that doesn't
+  // yet, e.g. a live take between `capture.finish()` and its own save
+  // completing -- see `refineRecording`) -- falls back to a generic label
+  // for that window rather than showing nothing.
+  const processingTarget = recordingHistory.find((r) => r.id === processingRecordingId);
+  const processingTargetTime = processingTarget && formatDateTime(processingTarget.createdAt);
 
   // One slot, four mutually exclusive occupants: the take's own state wins
   // while one exists, then the post-stop pipeline, then the record-only idle
@@ -83,7 +93,17 @@ export function TitleBarStatus() {
       {processing === "saving" && <span className="truncate text-muted-foreground">録音を保存中…</span>}
       {processing === "refining" && (
         <span className="flex items-center gap-1.5 truncate text-muted-foreground">
-          精度向上パス実行中…
+          {processingTargetTime ? (
+            <>
+              履歴（
+              <span className="font-mono tabular-nums">
+                {processingTargetTime.day} {processingTargetTime.time}
+              </span>
+              ）を精度向上パス実行中…
+            </>
+          ) : (
+            "精度向上パス実行中…"
+          )}
           <span className="font-mono tabular-nums">{Math.round(refineProgress ?? 0)}%</span>
         </span>
       )}
