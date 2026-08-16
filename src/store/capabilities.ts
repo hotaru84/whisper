@@ -35,8 +35,14 @@ export type RecordingPhase = "stopped" | "recording" | "paused";
  * the status bar would otherwise claim a transcription is happening when none
  * is -- while still keeping `processing` non-null, which is what stops a new
  * take from starting in the gap (see `stopRecording`).
+ *
+ * `cancelling` exists for the same pair of reasons as `saving`: once the user
+ * has asked to stop the analysis pass, saying "精度向上パス実行中" would be a
+ * lie, but `processing` has to stay non-null until the pass has actually wound
+ * down -- diarization cannot be interrupted mid-call, so that can take a while,
+ * and letting a new take start into it would be the same bug `saving` prevents.
  */
-export type ProcessingPhase = "transcribing" | "refining" | "saving" | null;
+export type ProcessingPhase = "transcribing" | "refining" | "saving" | "cancelling" | null;
 
 /**
  * `idle` means the model has not been loaded and nothing is wrong -- the state
@@ -62,6 +68,10 @@ export interface Capabilities {
   browseHistory: boolean;
   playback: boolean;
   reanalyze: boolean;
+  /** Whether the analysis pass can be asked to stop. Deliberately excludes
+   * `cancelling`, so the button disables itself the instant it is pressed
+   * without any consumer having to track "already asked" separately. */
+  cancelAnalysis: boolean;
   /** Settings that feed the live pass must not change mid-take: the streaming
    * transcriber re-reads `settings` on every window, so switching language
    * while paused would silently decode the rest of the recording differently. */
@@ -93,6 +103,9 @@ export function selectCapabilities(s: CapabilityInputs): Capabilities {
     // *causes* the model to load in record-only mode. `rerunHistoryEntry`
     // awaits `ensureModelReady` itself and reports a notice if it fails.
     reanalyze: idle,
+    // Only the accuracy pass is cancellable. The live flush (`transcribing`)
+    // is a second or two, and `saving` runs no inference at all.
+    cancelAnalysis: s.processing === "refining",
     editSettings: stopped,
   };
 }

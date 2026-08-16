@@ -199,10 +199,14 @@ pub async fn diarize_recording(
     min_duration_on: f32,
     min_duration_off: f32,
 ) -> Result<Vec<Option<i32>>, String> {
+    let cancel = crate::cancel::flag(&app);
+
     tauri::async_runtime::spawn_blocking(move || {
+        crate::cancel::check(&cancel)?;
         let samples = crate::wav::read(std::path::Path::new(&path))?;
         let segmentation_model = resolve_segmentation_model_path(&app)?;
         let embedding_model = resolve_embedding_model_path(&app)?;
+        crate::cancel::check(&cancel)?;
 
         let settings = DiarizeSettings {
             enabled: true,
@@ -217,6 +221,14 @@ pub async fn diarize_recording(
             &segmentation_model.display().to_string(),
             &embedding_model.display().to_string(),
         )?;
+        // The only cancellation point diarization has after it starts.
+        // `diarize` is one opaque `OfflineSpeakerDiarization::process` call --
+        // sherpa-onnx's C API has a progress-callback variant of it, but the
+        // 1.13.5 Rust binding does not expose one, so there is nowhere to poll
+        // from inside. Cancelling therefore lets the pass run to completion
+        // and throws the result away; if a `process_with_callback` binding
+        // ever lands, this is the check that becomes a real interrupt.
+        crate::cancel::check(&cancel)?;
 
         Ok(assign_speakers(&chunks, &speakers))
     })

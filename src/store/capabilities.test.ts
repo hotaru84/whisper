@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { selectCapabilities, type RecordingPhase, type ProcessingPhase, type ModelStatus } from "./capabilities";
 
 const RECORDING_PHASES: RecordingPhase[] = ["stopped", "recording", "paused"];
-const PROCESSING_PHASES: ProcessingPhase[] = ["transcribing", "refining", "saving", null];
+const PROCESSING_PHASES: ProcessingPhase[] = ["transcribing", "refining", "saving", "cancelling", null];
 const MODEL_STATUSES: ModelStatus[] = ["idle", "loading", "ready", "error"];
 
 describe("selectCapabilities", () => {
@@ -70,6 +70,18 @@ describe("selectCapabilities", () => {
     }
   });
 
+  it("stops offering to cancel once a cancellation has already been requested", () => {
+    // The whole reason "cancelling" is its own phase rather than a flag beside
+    // "refining": pressing the button is what makes it stop offering itself.
+    const inputs = { recordingPhase: "stopped", modelStatus: "ready", recordOnly: false } as const;
+    expect(selectCapabilities({ ...inputs, processing: "refining" }).cancelAnalysis).toBe(true);
+    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).cancelAnalysis).toBe(false);
+    // ...and a take must not be able to start into a pass that is still
+    // winding down (diarization cannot be interrupted mid-call).
+    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).startRecording).toBe(false);
+    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).reanalyze).toBe(false);
+  });
+
   it("covers every state combination without throwing and keeps stop/browseHistory/playback/editSettings mutually consistent with recordingPhase", () => {
     for (const recordingPhase of RECORDING_PHASES) {
       for (const processing of PROCESSING_PHASES) {
@@ -83,6 +95,7 @@ describe("selectCapabilities", () => {
             expect(can.editSettings).toBe(stopped);
             expect(can.pause).toBe(recordingPhase === "recording");
             expect(can.resume).toBe(recordingPhase === "paused");
+            expect(can.cancelAnalysis).toBe(processing === "refining");
             // startRecording/reanalyze can only ever be true while idle.
             const idle = stopped && processing === null;
             if (!idle) {

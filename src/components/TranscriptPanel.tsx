@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 import { TranscriptToolbar } from "./TranscriptToolbar";
+import { CancelAnalysisButton } from "./CancelAnalysisButton";
 import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
 import { useAppStore, selectCapabilities } from "../store/appStore";
@@ -130,10 +131,15 @@ export function TranscriptPanel() {
         // The numeric progress and "what's happening" text live in the
         // titlebar's status readout (always visible regardless of scroll
         // position); this is only the one thing it can't say, since it's
-        // specific to what's shown below.
-        <p className="text-xs text-muted-foreground">
-          録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
-        </p>
+        // specific to what's shown below. The cancel button is repeated from
+        // the titlebar because this is where the user is when they decide the
+        // pass is taking too long.
+        <div className="flex items-start gap-2">
+          <p className="text-xs text-muted-foreground">
+            録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
+          </p>
+          <CancelAnalysisButton className="shrink-0" />
+        </div>
       )}
 
       {refineNotice && <p className="text-xs text-amber">{refineNotice}</p>}

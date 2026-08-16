@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
 import { useAppStore, type RecordingPhase } from "../store/appStore";
+import { CancelAnalysisButton } from "./CancelAnalysisButton";
 import { formatTimestamp } from "../lib/format";
 
 /**
@@ -54,11 +55,12 @@ export function TitleBarStatus() {
   const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
   const elapsed = useElapsedRecordingSec(recordingPhase);
 
-  // One slot, four mutually exclusive occupants: the take's own state wins
-  // while one exists, then the post-stop pipeline, then the record-only idle
-  // chip. There used to be a fifth (a CPU/Vulkan device chip) but which
-  // backend loaded the model is an implementation detail with no bearing on
-  // anything the user can act on, so it was dropped rather than moved here.
+  // One slot, five mutually exclusive occupants: the take's own state wins
+  // while one exists, then the post-stop pipeline (including the wind-down
+  // after a cancel), then the record-only idle chip. There used to be a sixth
+  // (a CPU/Vulkan device chip) but which backend loaded the model is an
+  // implementation detail with no bearing on anything the user can act on, so
+  // it was dropped rather than moved here.
   const idleChip = recordingPhase === "stopped" && processing === null;
 
   return (
@@ -85,7 +87,16 @@ export function TitleBarStatus() {
         <span className="flex items-center gap-1.5 truncate text-muted-foreground">
           精度向上パス実行中…
           <span className="font-mono tabular-nums">{Math.round(refineProgress ?? 0)}%</span>
+          {/* The root is `pointer-events-none` so the titlebar stays draggable,
+              which the one clickable thing in here has to opt back out of. */}
+          <CancelAnalysisButton className="pointer-events-auto" />
         </span>
+      )}
+      {processing === "cancelling" && (
+        // No progress and no button: the pass has been told to stop and is
+        // winding down, which is not instant -- diarization cannot be
+        // interrupted mid-call, so this can sit here for a while.
+        <span className="truncate text-muted-foreground">解析をキャンセル中…</span>
       )}
       {idleChip && recordOnly && (
         <span className="flex items-center gap-1 truncate text-muted-foreground">

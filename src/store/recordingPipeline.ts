@@ -20,6 +20,7 @@ import type {
   AudioEventSettings,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
+import { isCancelledError } from "../lib/asr";
 import { nonBlankChunks, segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory } from "../lib/history";
 import { toErrorMessage } from "../lib/errors";
@@ -79,6 +80,12 @@ interface AccuracyPipelineResult {
   notices: string[];
 }
 
+/** `runAccuracyPipeline`'s return: either a completed pass, or the fact that
+ * the user cancelled it. A cancellation carries nothing else -- every partial
+ * result is discarded, because what it is being weighed against is a
+ * transcript the user already has on screen. */
+type AccuracyPipelineOutcome = ({ cancelled: false } & AccuracyPipelineResult) | { cancelled: true };
+
 /**
  * The re-transcribe/diarize/audio-tag sequence shared by `refineRecording`
  * (a just-finished live recording) and `rerunHistoryEntry` (any past one,
@@ -91,6 +98,15 @@ interface AccuracyPipelineResult {
  * thrown: a transcript without speaker labels or event filtering is still
  * the whole point of this pass, so losing the transcript over either would
  * be a much worse trade than just not having that one extra.
+ *
+ * A *cancellation* is not a failure and so is not a notice: it aborts the
+ * remaining stages and returns `{ cancelled: true }`. Without that
+ * distinction, one press of the cancel button would produce a "話者分離に失敗
+ * した" and a "音響イベント検出に失敗しました" on the way out.
+ *
+ * Being the one entry point both callers share also makes this the right
+ * place to clear the backend's cancel flag, so a cancel that arrived too late
+ * to stop the previous pass cannot kill this one on sight.
  */
 export async function runAccuracyPipeline(
   path: string,
@@ -98,9 +114,20 @@ export async function runAccuracyPipeline(
   vadSettings: VadSettings,
   diarizeSettings: DiarizeSettings,
   audioEventSettings: AudioEventSettings,
-): Promise<AccuracyPipelineResult> {
+): Promise<AccuracyPipelineOutcome> {
+  await asrClient.beginAnalysis();
+
   const notices: string[] = [];
-  const result = await asrClient.transcribeRecording(path, settings, vadSettings);
+  let result: TranscribeResult;
+  try {
+    result = await asrClient.transcribeRecording(path, settings, vadSettings);
+  } catch (err) {
+    // Only a cancellation is caught here -- a real failure still propagates,
+    // so the caller keeps its "the second pass broke, hold on to the live
+    // transcript" path exactly as before.
+    if (isCancelledError(err)) return { cancelled: true };
+    throw err;
+  }
   if (result.vadUnavailable) {
     notices.push(
       "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
@@ -117,6 +144,7 @@ export async function runAccuracyPipeline(
     try {
       speakers = await asrClient.diarizeRecording(path, targets, diarizeSettings);
     } catch (err) {
+      if (isCancelledError(err)) return { cancelled: true };
       notices.push(`話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
     }
   }
@@ -129,11 +157,104 @@ export async function runAccuracyPipeline(
       excluded = eventResult.exclude;
       newEvents = eventResult.events;
     } catch (err) {
+      if (isCancelledError(err)) return { cancelled: true };
       notices.push(`音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`);
     }
   }
 
-  return { result, speakers, excluded, newEvents, notices };
+  return { cancelled: false, result, speakers, excluded, newEvents, notices };
+}
+
+/**
+ * Files a take in history: the sidecar, then the list refresh the sidebar
+ * reads, then `markRecordingViewed`. Shared by `refineRecording`'s completed
+ * and cancelled paths, which differ only in what goes into the entry.
+ *
+ * The refresh is awaited rather than fire-and-forget: only once
+ * `recordingHistory` actually contains this entry does `markRecordingViewed`
+ * have anything for `TranscriptPanel`/`HistorySidebar` to find by id. A `void`
+ * here let `viewedRecordingId` become "correct" a beat before the sidebar list
+ * caught up, so the delete button and the "履歴を表示中" banner both failed
+ * their lookup for the length of that IPC round-trip -- the same bug
+ * `finishRecordOnly` already avoids by awaiting the equivalent call.
+ *
+ * Returns whether it worked, and reports failure as a notice rather than
+ * throwing: the transcript on screen (and its place in this session) is
+ * unaffected, only future browsing of this take from the sidebar is lost,
+ * which is a much smaller loss than any other failure path around it.
+ */
+async function persistTake(
+  recordingId: string,
+  entry: Parameters<typeof saveRecordingHistory>[1],
+): Promise<boolean> {
+  try {
+    await saveRecordingHistory(recordingId, entry);
+    await useAppStore.getState().refreshRecordingHistory();
+    markRecordingViewed(recordingId);
+    return true;
+  } catch (err) {
+    useAppStore.setState({
+      refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+    });
+    return false;
+  }
+}
+
+/**
+ * Winds up a take whose accuracy pass the user cancelled: keep what the live
+ * pass already put on screen, and file exactly that in history.
+ *
+ * Nothing partial is kept from the cancelled pass. What it would be weighed
+ * against is a transcript the user is already reading, and half a second pass
+ * spliced onto the front of the live one would be worse than either.
+ *
+ * The history write is *not* optional. Skipping it would leave the WAV on disk
+ * with no sidecar, and `listRecordings` enumerates sidecars -- the take would
+ * become a file the user can neither find nor ask to be transcribed later,
+ * which `finishRecordOnly`'s doc comment calls out as the one thing this
+ * feature must never do.
+ */
+async function finishCancelledTake(
+  path: string,
+  baseSec: number,
+  keptSegments: number,
+  recordingDurationSec: number,
+  language: string,
+): Promise<void> {
+  const state = useAppStore.getState();
+  // This take's live output, on the recording's own 0-based timeline with
+  // freshly sequential ids -- the same convention every other history write
+  // uses, so a cancelled take looks like any other entry.
+  const liveSegments = state.segments.slice(keptSegments);
+  const localSegments = liveSegments.map((s, i) => ({
+    ...s,
+    id: i + 1,
+    startOffsetSec: s.startOffsetSec - baseSec,
+  }));
+  const liveEvents = state.audioEvents
+    .filter((e) => e.start >= baseSec)
+    .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }));
+
+  useAppStore.setState({
+    refineNotice:
+      "解析をキャンセルしました（表示中の文字起こしはそのまま使えます）。あとから履歴の「再解析」でやり直せます。",
+  });
+
+  await persistTake(idFromWavPath(path), {
+    durationSec: recordingDurationSec,
+    language,
+    // A cancelled take with nothing on screen is not transcribed, and saying
+    // so is what puts the 解析 button on its history row -- the same door
+    // record-only takes come through.
+    transcribed: liveSegments.some((s) => s.text.trim() !== ""),
+    // None of the three ran to completion, so none of them describe what was
+    // saved.
+    usedDiarize: false,
+    usedVad: false,
+    usedAudioEvents: false,
+    segments: localSegments,
+    audioEvents: liveEvents,
+  });
 }
 
 /**
@@ -176,13 +297,24 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
   useAppStore.setState({ processing: "refining", refineProgress: 0 });
   try {
     const { settings, vadSettings, diarizeSettings, audioEventSettings } = useAppStore.getState();
-    const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
+    const outcome = await runAccuracyPipeline(
       path,
       settings,
       vadSettings,
       diarizeSettings,
       audioEventSettings,
     );
+
+    // The store is consulted as well as the outcome so that a cancel which
+    // lost a race with the last stage's completion still gets the answer the
+    // user asked for. Pressing cancel and then watching the transcript get
+    // swapped anyway would be the one outcome the button must never produce.
+    if (outcome.cancelled || useAppStore.getState().processing === "cancelling") {
+      await finishCancelledTake(path, baseSec, keptSegments, recordingDurationSec, settings.language);
+      return;
+    }
+
+    const { result, speakers, excluded, newEvents, notices } = outcome;
     if (notices.length > 0) {
       useAppStore.setState({ refineNotice: notices.join(" ") });
     }
@@ -243,48 +375,27 @@ export async function refineRecording(capture: RecordingCapture): Promise<void> 
       id: i + 1,
       startOffsetSec: s.startOffsetSec - baseSec,
     }));
-    try {
-      await saveRecordingHistory(recordingId, {
-        durationSec: recordingDurationSec,
-        language: settings.language,
-        transcribed: true,
-        // Speaker labels and VAD-based exclusion only ever land on the
-        // second pass's own segments -- claiming them here when the live
-        // pass's segments are what actually got saved would describe data
-        // that isn't there.
-        usedDiarize: secondPassUsable && diarizeSettings.enabled,
-        usedVad: secondPassUsable && vadSettings.enabled,
-        usedAudioEvents: audioEventSettings.enabled,
-        segments: localSegments,
-        audioEvents: newEvents,
-      });
-      // Awaited, not fire-and-forget: only once `recordingHistory` actually
-      // contains this entry does `markRecordingViewed` below have anything
-      // for `TranscriptPanel`/`HistorySidebar` to find by id. A `void` here
-      // let `viewedRecordingId` become "correct" a beat before the sidebar
-      // list caught up, so the delete button and the "履歴を表示中" banner
-      // both failed their lookup for the length of that IPC round-trip --
-      // the same bug `finishRecordOnly` (this function's record-only
-      // counterpart) already avoids by awaiting the equivalent call.
-      await useAppStore.getState().refreshRecordingHistory();
-      markRecordingViewed(recordingId);
-      // Only worth surfacing when the live pass actually had something the
-      // second pass then lost -- a genuinely silent recording ending up
-      // with an empty transcript both times is not a failure worth
-      // reporting as one.
-      if (!secondPassUsable && liveHasText) {
-        useAppStore.setState({
-          refineNotice:
-            "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離・VAD は未適用です）。設定を確認のうえ「再解析」をお試しください。",
-        });
-      }
-    } catch (err) {
-      // The transcript on screen (and its place in this session) is
-      // unaffected -- only future browsing of it from the history sidebar
-      // is lost, which is a much smaller loss than any other failure path
-      // in this function.
+    const saved = await persistTake(recordingId, {
+      durationSec: recordingDurationSec,
+      language: settings.language,
+      transcribed: true,
+      // Speaker labels and VAD-based exclusion only ever land on the
+      // second pass's own segments -- claiming them here when the live
+      // pass's segments are what actually got saved would describe data
+      // that isn't there.
+      usedDiarize: secondPassUsable && diarizeSettings.enabled,
+      usedVad: secondPassUsable && vadSettings.enabled,
+      usedAudioEvents: audioEventSettings.enabled,
+      segments: localSegments,
+      audioEvents: newEvents,
+    });
+    // Only worth surfacing when the live pass actually had something the
+    // second pass then lost -- a genuinely silent recording ending up with an
+    // empty transcript both times is not a failure worth reporting as one.
+    if (saved && !secondPassUsable && liveHasText) {
       useAppStore.setState({
-        refineNotice: `録音履歴への保存に失敗しました（今の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+        refineNotice:
+          "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離・VAD は未適用です）。設定を確認のうえ「再解析」をお試しください。",
       });
     }
   } catch (err) {
