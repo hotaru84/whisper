@@ -104,11 +104,16 @@ pub struct AudioEvent {
 /// model and its `class_labels_indices.csv` (see README for where to obtain
 /// them; Apache-2.0, unlike the CED alternative sherpa-onnx also ships, which
 /// is a GPL-3.0 conversion of RicherMans/CED and was rejected for that reason).
+///
+/// `cancelled` is polled once per window, which is this pass's cancellation
+/// granularity: `WINDOW_SEC` of audio, and the tagger is fast enough that one
+/// window is imperceptible.
 pub fn detect_events(
     samples: &[f32],
     settings: &AudioEventSettings,
     model_path: &str,
     labels_path: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<AudioEvent>, String> {
     if samples.is_empty() {
         return Ok(Vec::new());
@@ -119,6 +124,7 @@ pub fn detect_events(
     let window_samples = (WINDOW_SEC * crate::wav::SAMPLE_RATE as f32).round() as usize;
     let mut events = Vec::new();
     for (start, end) in window_bounds(samples.len(), window_samples) {
+        crate::cancel::check(cancelled)?;
         let start_sec = start as f32 / crate::wav::SAMPLE_RATE as f32;
         let end_sec = end as f32 / crate::wav::SAMPLE_RATE as f32;
         events.extend(tag_window(
@@ -295,10 +301,14 @@ pub async fn detect_audio_events(
     threshold: f32,
     top_k: i32,
 ) -> Result<AudioEventResult, String> {
+    let cancel = crate::cancel::flag(&app);
+
     tauri::async_runtime::spawn_blocking(move || {
+        crate::cancel::check(&cancel)?;
         let samples = crate::wav::read(std::path::Path::new(&path))?;
         let model_path = resolve_model_path(&app)?;
         let labels_path = resolve_labels_path(&app)?;
+        crate::cancel::check(&cancel)?;
 
         let settings = AudioEventSettings {
             enabled: true,
@@ -310,6 +320,7 @@ pub async fn detect_audio_events(
             &settings,
             &model_path.display().to_string(),
             &labels_path.display().to_string(),
+            &cancel,
         )?;
         let exclude = classify_chunks(&chunks, &events);
 

@@ -223,6 +223,12 @@ interface AppState {
    * relabeled with it. Reuses `processing: "refining"` and `refineProgress`,
    * so the same progress UI `refineRecording` drives applies here too. */
   rerunHistoryEntry: (id: string) => Promise<void>;
+  /** Asks the running accuracy pass to stop (whichever of `refineRecording`
+   * or `rerunHistoryEntry` started it). Returns as soon as the backend has
+   * been told; the pass itself finishes unwinding on its own, and its own
+   * `finally` is what clears `processing`. Nothing partial is kept -- see
+   * `finishCancelledTake`. */
+  cancelAnalysis: () => Promise<void>;
   /** Loads `path`'s audio for playback, tagged with `recordingId` so the UI
    * can tell it apart from whatever was loaded before. Replaces (and
    * disposes) any previously loaded audio; a no-op if `recordingId` is
@@ -527,13 +533,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ processing: "refining", refineProgress: 0, refineNotice: null, processingRecordingId: id });
     try {
       const { settings, vadSettings, diarizeSettings, audioEventSettings } = get();
-      const { result, speakers, excluded, newEvents, notices } = await runAccuracyPipeline(
+      const outcome = await runAccuracyPipeline(
         path,
         settings,
         vadSettings,
         diarizeSettings,
         audioEventSettings,
       );
+      // Bailing out before `saveRecordingHistory` is the whole cancellation
+      // story here: the existing sidecar and the segments on screen are both
+      // left exactly as they were, so a cancelled re-analysis costs the user
+      // nothing but the time it ran. See `refineRecording` for why the store
+      // is consulted alongside the outcome.
+      if (outcome.cancelled || get().processing === "cancelling") {
+        set({ refineNotice: "解析をキャンセルしました（既存の履歴はそのまま残っています）。" });
+        return;
+      }
+      const { result, speakers, excluded, newEvents, notices } = outcome;
 
       // Always the recording's own 0-based timeline with fresh sequential
       // ids -- this entry has no "session" of its own to rebase onto, and
@@ -582,6 +598,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
     } finally {
       set({ processing: null, refineProgress: null, processingRecordingId: null });
+    }
+  },
+
+  cancelAnalysis: async () => {
+    if (!capabilitiesOf(get()).cancelAnalysis) return;
+
+    // Moves off "refining" (the status readout would otherwise keep claiming
+    // the pass is running) but deliberately not to `null`: that is the running
+    // pipeline's own `finally`, and clearing it here as well would re-enable
+    // the record button for however long the pass takes to notice -- which,
+    // while diarization is mid-`process()`, is not short.
+    set({ processing: "cancelling", refineProgress: null });
+    try {
+      await asrClient.cancelAnalysis();
+    } catch (err) {
+      // The pass just runs to completion, and its own `finally` still clears
+      // `processing`, so this costs the user time rather than data.
+      set({
+        refineNotice: `キャンセルを要求できませんでした（解析はそのまま続行します）: ${toErrorMessage(err)}`,
+      });
     }
   },
 

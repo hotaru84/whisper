@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
 import { useAppStore, type RecordingPhase } from "../store/appStore";
+import { CancelAnalysisButton } from "./CancelAnalysisButton";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
@@ -29,7 +30,10 @@ function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
 
     const spanStart = Date.now();
     const base = activeSecRef.current;
-    const id = setInterval(() => setElapsed(Math.floor(base + (Date.now() - spanStart) / 1000)), 500);
+    const id = setInterval(
+      () => setElapsed(Math.floor(base + (Date.now() - spanStart) / 1000)),
+      500,
+    );
     return () => {
       activeSecRef.current = base + (Date.now() - spanStart) / 1000;
       clearInterval(id);
@@ -61,23 +65,32 @@ export function TitleBarStatus() {
   // yet, e.g. a live take between `capture.finish()` and its own save
   // completing -- see `refineRecording`) -- falls back to a generic label
   // for that window rather than showing nothing.
-  const processingTarget = recordingHistory.find((r) => r.id === processingRecordingId);
-  const processingTargetTime = processingTarget && formatDateTime(processingTarget.createdAt);
+  const processingTarget = recordingHistory.find(
+    (r) => r.id === processingRecordingId,
+  );
+  const processingTargetTime =
+    processingTarget && formatDateTime(processingTarget.createdAt);
 
-  // One slot, four mutually exclusive occupants: the take's own state wins
-  // while one exists, then the post-stop pipeline, then the record-only idle
-  // chip. There used to be a fifth (a CPU/Vulkan device chip) but which
-  // backend loaded the model is an implementation detail with no bearing on
-  // anything the user can act on, so it was dropped rather than moved here.
+  // One slot, five mutually exclusive occupants: the take's own state wins
+  // while one exists, then the post-stop pipeline (including the wind-down
+  // after a cancel), then the record-only idle chip. There used to be a sixth
+  // (a CPU/Vulkan device chip) but which backend loaded the model is an
+  // implementation detail with no bearing on anything the user can act on, so
+  // it was dropped rather than moved here.
   const idleChip = recordingPhase === "stopped" && processing === null;
 
   return (
     <div className="pointer-events-none flex min-w-0 items-center justify-center gap-3 text-xs">
       {recordingPhase === "recording" && (
         <span className="flex items-center gap-1.5 font-medium text-signal">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-signal motion-reduce:animate-none" aria-hidden="true" />
+          <span
+            className="h-2 w-2 animate-pulse rounded-full bg-signal motion-reduce:animate-none"
+            aria-hidden="true"
+          />
           録音中
-          <span className="font-mono tabular-nums">{formatTimestamp(elapsed)}</span>
+          <span className="font-mono tabular-nums">
+            {formatTimestamp(elapsed)}
+          </span>
         </span>
       )}
       {recordingPhase === "paused" && (
@@ -86,11 +99,19 @@ export function TitleBarStatus() {
         <span className="flex items-center gap-1.5 font-medium text-signal">
           <span className="h-2 w-2 rounded-full bg-signal" aria-hidden="true" />
           一時停止中
-          <span className="font-mono tabular-nums">{formatTimestamp(elapsed)}</span>
+          <span className="font-mono tabular-nums">
+            {formatTimestamp(elapsed)}
+          </span>
         </span>
       )}
-      {processing === "transcribing" && <span className="truncate text-muted-foreground">文字起こし処理中…</span>}
-      {processing === "saving" && <span className="truncate text-muted-foreground">録音を保存中…</span>}
+      {processing === "transcribing" && (
+        <span className="truncate text-muted-foreground">
+          文字起こし処理中…
+        </span>
+      )}
+      {processing === "saving" && (
+        <span className="truncate text-muted-foreground">録音を保存中…</span>
+      )}
       {processing === "refining" && (
         <span className="flex items-center gap-1.5 truncate text-muted-foreground">
           {processingTargetTime ? (
@@ -104,7 +125,20 @@ export function TitleBarStatus() {
           ) : (
             "精度向上パス実行中…"
           )}
-          <span className="font-mono tabular-nums">{Math.round(refineProgress ?? 0)}%</span>
+          <span className="font-mono tabular-nums">
+            {Math.round(refineProgress ?? 0)}%
+          </span>
+          {/* The root is `pointer-events-none` so the titlebar stays draggable,
+              which the one clickable thing in here has to opt back out of. */}
+          <CancelAnalysisButton className="pointer-events-auto" />
+        </span>
+      )}
+      {processing === "cancelling" && (
+        // No progress and no button: the pass has been told to stop and is
+        // winding down, which is not instant -- diarization cannot be
+        // interrupted mid-call, so this can sit here for a while.
+        <span className="truncate text-muted-foreground">
+          解析をキャンセル中…
         </span>
       )}
       {idleChip && recordOnly && (

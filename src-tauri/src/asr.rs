@@ -531,12 +531,17 @@ pub async fn transcribe_recording(
     let translate = task.as_deref() == Some("translate");
     let prompt = prompt.filter(|p| !p.trim().is_empty());
     let app_for_progress = app.clone();
+    let cancel = crate::cancel::flag(&app);
 
     tauri::async_runtime::spawn_blocking(move || {
+        crate::cancel::check(&cancel)?;
         let samples = crate::wav::read(std::path::Path::new(&path))?;
         if samples.is_empty() {
             return Err(format!("{path} contains no audio"));
         }
+        // Reading an hour of WAV is not instant, and the lock below is not
+        // taken yet, so this is the cheapest possible place to give up.
+        crate::cancel::check(&cancel)?;
 
         let state = app.state::<AsrState>();
         let guard = state.0.lock().unwrap();
@@ -583,9 +588,30 @@ pub async fn transcribe_recording(
             }
         });
 
-        whisper_state
-            .full(params, &samples)
-            .map_err(|e| e.to_string())?;
+        // whisper.cpp evaluates this after every encode and every decode step
+        // (whisper.cpp:7020/7146/7458), so a cancel lands in well under a
+        // second even on a long recording.
+        //
+        // The `Box<dyn FnMut() -> bool>` annotation is load-bearing, not
+        // stylistic: whisper-rs 0.16.0's `set_abort_callback_safe` stores a
+        // `*mut Box<dyn FnMut() -> bool>` as the user data but instantiates
+        // its trampoline as `trampoline::<F>` (whisper_params.rs:637-647).
+        // Handing it a bare closure would have the trampoline reinterpret the
+        // box's data/vtable words as that closure's captures. Type-erasing
+        // here makes `F` *be* the box type, so the two line up -- which is
+        // what the (correctly written) progress path above hardcodes.
+        let abort_flag = std::sync::Arc::clone(&cancel);
+        let abort: Box<dyn FnMut() -> bool> =
+            Box::new(move || abort_flag.load(std::sync::atomic::Ordering::Relaxed));
+        params.set_abort_callback_safe(abort);
+
+        if let Err(e) = whisper_state.full(params, &samples) {
+            // An abort surfaces as an ordinary decode failure (-6 from the
+            // encoder, -8 from the decoder), so without this the user's own
+            // cancel would be reported back to them as a crash.
+            crate::cancel::check(&cancel)?;
+            return Err(e.to_string());
+        }
 
         let mut result = drop_silent_segments(collect_segments(&whisper_state)?, &samples);
         result.vad_unavailable = vad_unavailable;

@@ -14,6 +14,7 @@ export type {
   AudioEvent,
   AudioEventResult,
 } from "./client";
+export { ANALYSIS_CANCELLED, isCancelledError } from "./cancel";
 export { RecordingCapture } from "./capture";
 export type { CaptureInfo } from "./capture";
 export { StreamingTranscriber } from "./streaming";
