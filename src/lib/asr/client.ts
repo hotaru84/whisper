@@ -5,6 +5,12 @@ import { logPcmStats, logResultHealth } from "./diagnostics";
 import { ANALYSIS_CANCELLED } from "./cancel";
 import { useMockBackend } from "../env";
 import { WHISPER_SAMPLE_RATE } from "../audio/resample";
+import {
+  mockAudioEvents,
+  mockDurationSec,
+  mockIdFromPath,
+  mockRefinedResult,
+} from "../mock/fixtures";
 
 export interface AsrClientHandlers {
   onDeviceInfo?: (device: AsrDevice) => void;
@@ -151,8 +157,6 @@ function mockTranscribeWindow(audio: Float32Array): TranscribeResult {
   return { text, chunks: [{ text, timestamp: [0, durationSec] }] };
 }
 
-const MOCK_REFINED_TEXT =
-  "（モック）精度向上パス完了後の文字起こし結果です。バックエンドに接続されていないため、実際の音声内容は反映されていません。";
 
 /**
  * Talks to the native whisper.cpp backend (see src-tauri/src/asr.rs) via Tauri
@@ -255,7 +259,10 @@ export class AsrClient {
         if (this.mockCancelled) throw new Error(ANALYSIS_CANCELLED);
         this.handlers.onRefineProgress?.(percent);
       }
-      return { text: MOCK_REFINED_TEXT, chunks: [{ text: MOCK_REFINED_TEXT, timestamp: [0, 3] }] };
+      // Spread over the recording's real length, so the resulting segments
+      // land at plausible timestamps and clicking one actually seeks
+      // somewhere -- see `mockRefinedResult`.
+      return mockRefinedResult(mockDurationSec(mockIdFromPath(path)));
     }
 
     const result = await invoke<TranscribeResult>("transcribe_recording", {
@@ -355,7 +362,14 @@ export class AsrClient {
   ): Promise<AudioEventResult> {
     if (useMockBackend) {
       await wait(200);
-      return { events: [], exclude: chunks.map(() => false) };
+      // Every chunk is kept (`exclude` all false): dropping transcript lines
+      // in the preview would look like a bug rather than a feature. The
+      // events themselves are populated so the timeline's event track has
+      // something to render.
+      return {
+        events: mockAudioEvents(mockDurationSec(mockIdFromPath(path))),
+        exclude: chunks.map(() => false),
+      };
     }
     return await invoke<AudioEventResult>("detect_audio_events", {
       path,
@@ -376,7 +390,9 @@ export class AsrClient {
    * timeline (the caller's bookkeeping, same as `transcribe`'s windows).
    */
   async detectEventsWindow(audio: Float32Array, startSec: number, settings: AudioEventSettings): Promise<AudioEvent[]> {
-    if (useMockBackend) return [];
+    if (useMockBackend) {
+      return mockAudioEvents(audio.length / WHISPER_SAMPLE_RATE, startSec);
+    }
     const bytes = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
     const headers: Record<string, string> = {
       "X-Threshold": String(settings.threshold),

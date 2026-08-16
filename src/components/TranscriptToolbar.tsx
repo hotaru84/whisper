@@ -15,6 +15,8 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { useConfirmClick } from "./useConfirmClick";
+import { useMockBackend } from "../lib/env";
+import { MOCK_EXPORT_UNAVAILABLE as EXPORT_UNAVAILABLE } from "../lib/mock/fixtures";
 
 /**
  * Deleting a recording is the same operation the history sidebar's row button
@@ -103,11 +105,22 @@ export function TranscriptToolbar({
             <Copy className="h-4 w-4" />
             コピー
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => onExport("txt")}>
+          {/* Saving needs a native file dialog, which a plain browser tab
+              does not have -- disabled rather than silently doing nothing in
+              the browser preview. See lib/env.ts. */}
+          <DropdownMenuItem
+            onSelect={() => onExport("txt")}
+            disabled={useMockBackend}
+            title={useMockBackend ? EXPORT_UNAVAILABLE : undefined}
+          >
             <Download className="h-4 w-4" />
             .txt として保存
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => onExport("srt")}>
+          <DropdownMenuItem
+            onSelect={() => onExport("srt")}
+            disabled={useMockBackend}
+            title={useMockBackend ? EXPORT_UNAVAILABLE : undefined}
+          >
             <Download className="h-4 w-4" />
             .srt として保存
           </DropdownMenuItem>

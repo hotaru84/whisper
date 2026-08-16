@@ -1,5 +1,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useMockBackend } from "../env";
+import { MOCK_AUDIO_APPS } from "../mock/fixtures";
 
 export interface AudioAppInfo {
   processId: number;
@@ -26,6 +28,10 @@ export class AppAudioClient {
 
   /** Apps currently capable of being captured (have an active audio session). */
   async listApps(): Promise<AudioAppInfo[]> {
+    // WASAPI is Windows- and Tauri-only, so in a plain browser this used to
+    // reject and leave the target picker permanently empty (the rejection was
+    // swallowed by `refreshAppAudioApps`, so nothing said why). See ../env.ts.
+    if (useMockBackend) return MOCK_AUDIO_APPS;
     return await invoke<AudioAppInfo[]>("list_audio_apps");
   }
 
@@ -44,6 +50,11 @@ export class AppAudioClient {
   ): Promise<void> {
     await this.stopCapture();
 
+    // Nothing to capture and nothing to report: `AudioMixer` is paced by the
+    // microphone, so a target that never delivers a frame simply mixes in as
+    // silence and the rest of the recording path is unchanged.
+    if (useMockBackend) return;
+
     this.unlistenError = await listen<AppAudioErrorPayload>("asr:app-audio-error", (event) => {
       onError(event.payload.message);
     });
@@ -59,6 +70,7 @@ export class AppAudioClient {
   async stopCapture(): Promise<void> {
     this.unlistenError?.();
     this.unlistenError = null;
+    if (useMockBackend) return;
     try {
       await invoke("stop_app_audio_capture");
     } catch {
