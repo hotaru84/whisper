@@ -1,0 +1,23 @@
+{
+  "feature_name": "screen-state-redesign",
+  "project_description": "モンキーテストで、状態遷移時に一瞬ゴミ画面が見える不具合と、録音ボタンを押してもすぐに録音画面へ遷移しない不具合が見つかった。原因は画面表示（React コンポーネント）と内部状態（Zustand ストア、および timeline.ts/playback.ts/appStore.ts のモジュールスコープ変数といった非リアクティブな可変状態）の不一致だと推測される。対症療法の前に、まず現状の画面仕様（どの内部状態でどの画面が出て、何が押せて、何がそれを決めているか）を current-state.md として文書化した。次のフェーズで、この現状分析を踏まえた要件定義・設計（状態管理の再設計）を行う。",
+  "created_at": "2026-08-16T11:17:01Z",
+  "updated_at": "2026-08-16T12:42:51Z",
+  "language": "japanese",
+  "phase": "implemented",
+  "approvals": {
+    "requirements": {
+      "generated": false,
+      "approved": false
+    },
+    "design": {
+      "generated": true,
+      "approved": false
+    },
+    "tasks": {
+      "generated": true,
+      "approved": false
+    }
+  },
+  "ready_for_implementation": false
+}

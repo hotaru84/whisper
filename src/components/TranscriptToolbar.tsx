@@ -5,6 +5,7 @@ import {
   Check,
   Trash2,
   RotateCw,
+  XCircle,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -52,6 +53,12 @@ function DeleteHistoryButton({
  * caller (`TranscriptPanel`) exactly when that recording doesn't exist yet --
  * a plain presentational split, so this component never has to know why a
  * button might not apply.
+ *
+ * `reanalyze.mode` doubles this one button as the accuracy pass's cancel
+ * control: while the recording currently on screen is the one being
+ * refined, `TranscriptPanel` switches it to `"cancel"` instead of rendering
+ * a separate cancel button next to it -- there is only ever one thing to do
+ * with this button at a time, so there is no need for two.
  */
 export function TranscriptToolbar({
   hasTranscript,
@@ -65,7 +72,11 @@ export function TranscriptToolbar({
   copied: boolean;
   onCopy: () => void;
   onExport: (format: "txt" | "srt") => void;
-  reanalyze?: { onClick: () => void; disabled: boolean };
+  reanalyze?: {
+    mode: "reanalyze" | "cancel";
+    onClick: () => void;
+    disabled: boolean;
+  };
   deleteHistory?: { id: string; onClick: () => void; disabled: boolean };
 }) {
   return (
@@ -102,19 +113,32 @@ export function TranscriptToolbar({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      {reanalyze && (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={reanalyze.onClick}
-          disabled={reanalyze.disabled}
-          title="現在の設定（話者分離・VAD・音響イベント）でこの録音を詳しく解析し直し、履歴を上書きします"
-        >
-          <RotateCw className="h-4 w-4" />
-          再解析
-        </Button>
-      )}
+      {reanalyze &&
+        (reanalyze.mode === "cancel" ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={reanalyze.onClick}
+            disabled={reanalyze.disabled}
+            title="解析を中止します。すでに表示されている文字起こしと録音ファイルはそのまま残ります"
+          >
+            <XCircle className="h-4 w-4" />
+            解析中止
+          </Button>
+        ) : (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={reanalyze.onClick}
+            disabled={reanalyze.disabled}
+            title="現在の設定（話者分離・VAD・音響イベント）でこの録音を詳しく解析し直し、履歴を上書きします"
+          >
+            <RotateCw className="h-4 w-4" />
+            再解析
+          </Button>
+        ))}
       {deleteHistory && (
         <DeleteHistoryButton
           key={deleteHistory.id}

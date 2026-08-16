@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
 import { useAppStore, type RecordingPhase } from "../store/appStore";
-import { CancelAnalysisButton } from "./CancelAnalysisButton";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
@@ -128,9 +127,6 @@ export function TitleBarStatus() {
           <span className="font-mono tabular-nums">
             {Math.round(refineProgress ?? 0)}%
           </span>
-          {/* The root is `pointer-events-none` so the titlebar stays draggable,
-              which the one clickable thing in here has to opt back out of. */}
-          <CancelAnalysisButton className="pointer-events-auto" />
         </span>
       )}
       {processing === "cancelling" && (

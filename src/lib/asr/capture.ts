@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { WHISPER_SAMPLE_RATE } from "../audio/resample";
+import { useMockBackend } from "../env";
 
 /**
  * How much audio to accumulate before handing it to the backend.
@@ -42,14 +43,26 @@ export class RecordingCapture {
   private tail: Promise<void> = Promise.resolve();
   private failure: Error | null = null;
   private closed = false;
+  // Mock-only bookkeeping (see ../env.ts) -- there is no real file, so
+  // `finish()` fakes a duration from wall-clock time instead.
+  private mockName = "";
+  private mockStartedAt = 0;
 
   async start(name = defaultName()): Promise<string> {
+    if (useMockBackend) {
+      this.mockName = name;
+      this.mockStartedAt = Date.now();
+      return `mock-recordings/${name}.wav`;
+    }
     return await invoke<string>("start_capture", { name });
   }
 
   /** Buffers one captured PCM frame, flushing once FLUSH_SEC has accumulated. */
   push(frame: Float32Array): void {
     if (this.closed || this.failure) return;
+    // No file to append to -- the streaming transcript (which doesn't go
+    // through this class) is what the mock backend drives instead.
+    if (useMockBackend) return;
     this.pending.push(frame);
     this.pendingSamples += frame.length;
     if (this.pendingSamples >= FLUSH_SAMPLES) this.flush();
@@ -85,6 +98,12 @@ export class RecordingCapture {
    */
   async finish(): Promise<CaptureInfo> {
     this.closed = true;
+    if (useMockBackend) {
+      return {
+        path: `mock-recordings/${this.mockName}.wav`,
+        durationSec: Math.max(1, (Date.now() - this.mockStartedAt) / 1000),
+      };
+    }
     this.flush();
     await this.tail;
     const info = await invoke<CaptureInfo>("finish_capture");

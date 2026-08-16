@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AsrDevice, TranscriptChunk, TranscriptionTask } from "./types";
 import { logPcmStats, logResultHealth } from "./diagnostics";
+import { ANALYSIS_CANCELLED } from "./cancel";
+import { useMockBackend } from "../env";
+import { WHISPER_SAMPLE_RATE } from "../audio/resample";
 
 export interface AsrClientHandlers {
   onDeviceInfo?: (device: AsrDevice) => void;
@@ -124,6 +127,33 @@ interface RefineProgressPayload {
   percent: number;
 }
 
+// --- Mock backend (see ../env.ts) --------------------------------------
+// Everything below this line only ever runs when `useMockBackend` is true --
+// `npm run dev` opened in a plain browser, with no Tauri/Rust backend behind
+// it. It exists purely so the app's screen transitions (record -> starting ->
+// recording -> stop -> home, the history 解析/解析中止 toggle) can still be
+// clicked through for UI review; the fake text below is never meant to look
+// like a real transcript.
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+let mockWindowCount = 0;
+const MOCK_LIVE_PHRASES = [
+  "（モック）これはバックエンドなしのプレビュー用の文字起こしです。",
+  "（モック）実際の音声認識は行われていません。",
+  "（モック）画面遷移の確認用のダミーテキストです。",
+];
+
+function mockTranscribeWindow(audio: Float32Array): TranscribeResult {
+  const text = MOCK_LIVE_PHRASES[mockWindowCount % MOCK_LIVE_PHRASES.length];
+  mockWindowCount += 1;
+  const durationSec = Math.max(1, audio.length / WHISPER_SAMPLE_RATE);
+  return { text, chunks: [{ text, timestamp: [0, durationSec] }] };
+}
+
+const MOCK_REFINED_TEXT =
+  "（モック）精度向上パス完了後の文字起こし結果です。バックエンドに接続されていないため、実際の音声内容は反映されていません。";
+
 /**
  * Talks to the native whisper.cpp backend (see src-tauri/src/asr.rs) via Tauri
  * commands and events. Model inference runs entirely in Rust; this class only
@@ -133,6 +163,10 @@ export class AsrClient {
   private handlers: AsrClientHandlers;
   private initialized = false;
   private unlisten: UnlistenFn[] = [];
+  // Mock-only (see ../env.ts): mirrors the backend's own begin/cancel flag
+  // (cancel.rs) closely enough that the 解析中止 UI has something real to
+  // exercise even without a backend.
+  private mockCancelled = false;
 
   constructor(handlers: AsrClientHandlers = {}) {
     this.handlers = handlers;
@@ -145,6 +179,14 @@ export class AsrClient {
   async init(): Promise<void> {
     if (this.initialized) return;
     this.initialized = true;
+
+    if (useMockBackend) {
+      // Long enough that `ModelLoadingOverlay` is visibly exercised too,
+      // short enough not to be annoying on every reload.
+      await wait(500);
+      this.handlers.onModelReady?.();
+      return;
+    }
 
     this.unlisten.push(
       await listen<ModelReadyPayload>("asr:model-ready", (event) => {
@@ -169,6 +211,11 @@ export class AsrClient {
   }
 
   async transcribe(audio: Float32Array, options: TranscribeOptions = {}): Promise<TranscribeResult> {
+    if (useMockBackend) {
+      await wait(150);
+      return mockTranscribeWindow(audio);
+    }
+
     logPcmStats(audio, options.language, options.task);
 
     // Send the PCM window as a raw binary IPC body (not a JSON number array) to
@@ -199,6 +246,18 @@ export class AsrClient {
     options: TranscribeOptions = {},
     vad: VadSettings = DEFAULT_VAD_SETTINGS,
   ): Promise<TranscribeResult> {
+    if (useMockBackend) {
+      // A few ticks with a delay between each, so `refineProgress` (and the
+      // history row's progress bar / titlebar readout it drives) has
+      // something to visibly animate rather than jumping straight to 100.
+      for (const percent of [15, 35, 60, 85, 100]) {
+        await wait(350);
+        if (this.mockCancelled) throw new Error(ANALYSIS_CANCELLED);
+        this.handlers.onRefineProgress?.(percent);
+      }
+      return { text: MOCK_REFINED_TEXT, chunks: [{ text: MOCK_REFINED_TEXT, timestamp: [0, 3] }] };
+    }
+
     const result = await invoke<TranscribeResult>("transcribe_recording", {
       path,
       language: options.language ?? null,
@@ -220,6 +279,10 @@ export class AsrClient {
    * on sight.
    */
   async beginAnalysis(): Promise<void> {
+    if (useMockBackend) {
+      this.mockCancelled = false;
+      return;
+    }
     await invoke("begin_analysis");
   }
 
@@ -230,6 +293,10 @@ export class AsrClient {
    * what eventually rejects with `ANALYSIS_CANCELLED`.
    */
   async cancelAnalysis(): Promise<void> {
+    if (useMockBackend) {
+      this.mockCancelled = true;
+      return;
+    }
     await invoke("cancel_analysis");
   }
 
@@ -252,6 +319,12 @@ export class AsrClient {
     chunks: Array<[number, number]>,
     settings: DiarizeSettings,
   ): Promise<Array<number | null>> {
+    if (useMockBackend) {
+      await wait(200);
+      // Alternates two fake speakers, just enough to exercise speaker labels
+      // in the transcript UI.
+      return chunks.map((_, i) => i % 2);
+    }
     return await invoke<Array<number | null>>("diarize_recording", {
       path,
       chunks,
@@ -280,6 +353,10 @@ export class AsrClient {
     chunks: Array<[number, number]>,
     settings: AudioEventSettings,
   ): Promise<AudioEventResult> {
+    if (useMockBackend) {
+      await wait(200);
+      return { events: [], exclude: chunks.map(() => false) };
+    }
     return await invoke<AudioEventResult>("detect_audio_events", {
       path,
       chunks,
@@ -299,6 +376,7 @@ export class AsrClient {
    * timeline (the caller's bookkeeping, same as `transcribe`'s windows).
    */
   async detectEventsWindow(audio: Float32Array, startSec: number, settings: AudioEventSettings): Promise<AudioEvent[]> {
+    if (useMockBackend) return [];
     const bytes = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
     const headers: Record<string, string> = {
       "X-Threshold": String(settings.threshold),

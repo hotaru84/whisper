@@ -1,8 +1,8 @@
 import { useState } from "react";
+import { X } from "lucide-react";
 import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 import { TranscriptToolbar } from "./TranscriptToolbar";
-import { CancelAnalysisButton } from "./CancelAnalysisButton";
 import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
 import { useAppStore, selectCapabilities } from "../store/appStore";
@@ -18,8 +18,11 @@ export function TranscriptPanel() {
   const refineNotice = useAppStore((s) => s.refineNotice);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
+  const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
+  const cancelAnalysis = useAppStore((s) => s.cancelAnalysis);
+  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
   const playback = useAppStore((s) => s.playback);
   const seekTo = useAppStore((s) => s.seekTo);
   const [copied, setCopied] = useState(false);
@@ -43,6 +46,12 @@ export function TranscriptPanel() {
   const hasTranscript = segments.length > 0;
   const text = combinedText(segments);
   const isRefining = processing === "refining";
+  // Whether the recording on screen is specifically the one the accuracy
+  // pass is running against -- `can.cancelAnalysis` alone doesn't say
+  // *which* recording, and offering to cancel a pass running against a
+  // different history entry than the one being viewed would cancel the
+  // wrong thing.
+  const isCancelable = can.cancelAnalysis && currentRecordingId === processingRecordingId;
   // "More text is still on its way": a take is open (recording or paused, since
   // pausing flushes but does not end it), or the final flush is running.
   const isLive = recordingPhase !== "stopped" || processing === "transcribing";
@@ -100,7 +109,13 @@ export function TranscriptPanel() {
         onExport={(format) => void handleExport(format)}
         reanalyze={
           currentRecordingId
-            ? { onClick: () => void rerunHistoryEntry(currentRecordingId), disabled: !can.reanalyze }
+            ? isCancelable
+              ? { mode: "cancel", onClick: () => void cancelAnalysis(), disabled: false }
+              : {
+                  mode: "reanalyze",
+                  onClick: () => void rerunHistoryEntry(currentRecordingId),
+                  disabled: !can.reanalyze,
+                }
             : undefined
         }
         deleteHistory={
@@ -114,32 +129,58 @@ export function TranscriptPanel() {
         }
       />
 
-      {viewedRecording && (
-        <p className="text-xs text-muted-foreground">
-          履歴を表示中 —{" "}
-          <span className="font-mono">
-            {viewedRecording.createdAt.getFullYear()}-
-            {String(viewedRecording.createdAt.getMonth() + 1).padStart(2, "0")}-
-            {String(viewedRecording.createdAt.getDate()).padStart(2, "0")}{" "}
-            {String(viewedRecording.createdAt.getHours()).padStart(2, "0")}:
-            {String(viewedRecording.createdAt.getMinutes()).padStart(2, "0")}
-          </span>
-        </p>
+      {/* Gated on `recordingPhase` rather than `viewedRecording` resolving:
+          this panel is only ever mounted stopped-and-showing-something (Home's
+          "something selected" state -- App.tsx's `showRecordStart` already
+          excludes the alternative), so the close button belongs here the
+          instant that's true, not only once `recordingHistory` has caught up
+          enough for the `.find()` below to resolve (a just-stopped take can
+          briefly go through that gap -- see `refineRecording`'s early
+          `persistTake` call, which now keeps this gap essentially instant). */}
+      {recordingPhase === "stopped" && (
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs text-muted-foreground">
+            {viewedRecording ? (
+              <>
+                履歴を表示中 —{" "}
+                <span className="font-mono">
+                  {viewedRecording.createdAt.getFullYear()}-
+                  {String(viewedRecording.createdAt.getMonth() + 1).padStart(2, "0")}-
+                  {String(viewedRecording.createdAt.getDate()).padStart(2, "0")}{" "}
+                  {String(viewedRecording.createdAt.getHours()).padStart(2, "0")}:
+                  {String(viewedRecording.createdAt.getMinutes()).padStart(2, "0")}
+                </span>
+              </>
+            ) : (
+              "録音を処理中…"
+            )}
+          </p>
+          {/* Explicit dismiss back to the Home screen's record-start CTA, in
+              addition to (not instead of) clicking the already-selected row
+              again in the sidebar -- see design.md's close-button rationale. */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0"
+            aria-label="閉じてホームに戻る"
+            title="閉じてホームに戻る"
+            onClick={deselectHistoryEntry}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       )}
 
       {isRefining && (
-        // The numeric progress and "what's happening" text live in the
-        // titlebar's status readout (always visible regardless of scroll
-        // position); this is only the one thing it can't say, since it's
-        // specific to what's shown below. The cancel button is repeated from
-        // the titlebar because this is where the user is when they decide the
-        // pass is taking too long.
-        <div className="flex items-start gap-2">
-          <p className="text-xs text-muted-foreground">
-            録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
-          </p>
-          <CancelAnalysisButton className="shrink-0" />
-        </div>
+        // The numeric progress lives in the titlebar's status readout
+        // (always visible regardless of scroll position); this is only the
+        // one thing it can't say, since it's specific to what's shown below.
+        // Cancelling happens via the toolbar's 解析中止 button above rather
+        // than a second button here -- see `isCancelable`.
+        <p className="text-xs text-muted-foreground">
+          録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
+        </p>
       )}
 
       {refineNotice && <p className="text-xs text-amber">{refineNotice}</p>}

@@ -88,6 +88,17 @@ export { type PlaybackState } from "./playback";
 interface AppState {
   /** What the recorder is doing. The primary state everything else keys off. */
   recordingPhase: RecordingPhase;
+  /**
+   * True for the async setup window inside `startRecording` -- between the
+   * press and `recordingPhase` actually becoming `"recording"` (device
+   * negotiation, `capture.start()`, optional app-audio capture). Lets the
+   * Active screen render the instant the button is pressed, rather than
+   * waiting on however long that setup takes with nothing on screen to show
+   * for it. Also closes the guard gap that let a rapid second press start a
+   * second, unguarded recording into the same window -- see `startRecording`'s
+   * own comments and `capabilities.ts`'s `startRecording` derivation.
+   */
+  startingRecording: boolean;
   /** The post-stop pipeline, orthogonal to `recordingPhase`. */
   processing: ProcessingPhase;
   modelStatus: ModelStatus;
@@ -277,12 +288,15 @@ interface AppState {
  * they subscribe to each field separately (a selector returning a fresh
  * object would re-render on every store change).
  */
-function capabilitiesOf(s: Pick<AppState, "recordingPhase" | "processing" | "modelStatus" | "recordingMode">) {
+function capabilitiesOf(
+  s: Pick<AppState, "recordingPhase" | "processing" | "modelStatus" | "recordingMode" | "startingRecording">,
+) {
   return selectCapabilities({
     recordingPhase: s.recordingPhase,
     processing: s.processing,
     modelStatus: s.modelStatus,
     recordOnly: s.recordingMode.recordOnly,
+    startingRecording: s.startingRecording,
   });
 }
 
@@ -385,6 +399,7 @@ let recordingRecordOnly = false;
 
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
+  startingRecording: false,
   processing: null,
   // Not "loading": nothing is loading until something asks for it. Record-only
   // mode never does, and starting in "loading" would put the blocking overlay
@@ -637,6 +652,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // one -- its frames would keep arriving forever, and `capture.start()`
     // would drop the old WAV writer out from under it.
     if (!capabilitiesOf(get()).startRecording) return;
+    // Set synchronously, before anything else -- this is what lets the Active
+    // screen render on the very next tick instead of waiting on the async
+    // setup below, and (via `capabilities.ts`'s `startRecording` derivation)
+    // is what makes a second press landing anywhere in that setup window see
+    // `can.startRecording === false` instead of racing this call.
+    set({ startingRecording: true });
     // Leaving whatever was being viewed -- a past entry, or a just-finished
     // take -- happens atomically, in this one synchronous tick, before any
     // of the async device/capture setup below even starts: `playback`,
@@ -775,6 +796,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // what makes sure a take actually starting always wins that race.
       set({
         recordingPhase: "recording",
+        startingRecording: false,
         errorMessage: null,
         refineNotice: notices.length > 0 ? notices.join(" ") : null,
         levelMeter,
@@ -791,7 +813,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         appAudioActive = false;
         void appAudioClient.stopCapture();
       }
-      set({ recordingPhase: "stopped", errorMessage: toErrorMessage(err) });
+      set({ recordingPhase: "stopped", startingRecording: false, errorMessage: toErrorMessage(err) });
     }
   },
 

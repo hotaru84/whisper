@@ -8,6 +8,7 @@ import {
   MoreHorizontal,
   FileAudio,
   Loader2,
+  XCircle,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -67,6 +68,8 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
+  const cancelAnalysis = useAppStore((s) => s.cancelAnalysis);
+  const refineProgress = useAppStore((s) => s.refineProgress);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
@@ -88,6 +91,12 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   // below) since this is the answer to "which one is it doing", not an
   // action the user reaches for.
   const isProcessing = processingRecordingId === meta.id;
+  // Distinguishes "actively running, with progress to show and a pass that
+  // can still be cancelled" from "cancel was already pressed and this is
+  // winding down" -- `can.cancelAnalysis` excludes `cancelling` for exactly
+  // this reason (see its own doc comment), so it doubles as the row's own
+  // refining/cancelling split once paired with `isProcessing`.
+  const isRefiningThis = isProcessing && can.cancelAnalysis;
   const { confirming: confirmingDelete, onClick: onDeleteClick } =
     useConfirmClick(() => {
       void deleteHistoryEntry(meta.id);
@@ -125,7 +134,9 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           {isProcessing ? (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
-              解析中…
+              {isRefiningThis
+                ? `解析中… ${Math.round(refineProgress ?? 0)}%`
+                : "中止中…"}
             </span>
           ) : (
             <span className="font-mono text-xs tabular-nums text-muted-foreground">
@@ -133,6 +144,14 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             </span>
           )}
         </div>
+        {isRefiningThis && (
+          <div className="h-1 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-foreground transition-[width]"
+              style={{ width: `${Math.min(100, Math.max(0, refineProgress ?? 0))}%` }}
+            />
+          </div>
+        )}
         {meta.transcribed ? (
           meta.preview && (
             <p className="line-clamp-2 text-xs text-foreground">
@@ -148,31 +167,53 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
         <FeatureIcons meta={meta} />
       </button>
       <div className="flex items-center justify-end gap-1">
-        {!meta.transcribed && (
+        {isRefiningThis ? (
+          // Same button, swapped to the opposite action -- see `isRefiningThis`'s
+          // doc comment. Shown unconditionally rather than only on hover
+          // (unlike every other action here) since this row is busy right
+          // now, not something the user has to reach for.
           <Button
             type="button"
             variant="outline"
             size="sm"
-            className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100"
-            disabled={!can.reanalyze}
-            title="この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+            className="h-6 px-2 text-xs"
+            title="解析を中止します。すでに表示されている文字起こしと録音ファイルはそのまま残ります"
             onClick={(e) => {
               e.stopPropagation();
-              // Opens the entry first so the transcript panel switches to it
-              // right away (showing the "未解析" placeholder), then runs the
-              // analysis against that same now-selected recording -- without
-              // this, `rerunHistoryEntry` still transcribes correctly but has
-              // nothing to display its result into until the user separately
-              // clicks the row.
-              void (async () => {
-                await loadHistoryEntry(meta.id);
-                await rerunHistoryEntry(meta.id);
-              })();
+              void cancelAnalysis();
             }}
           >
-            <Wand2 className="h-3 w-3" />
-            解析
+            <XCircle className="h-3 w-3" />
+            解析中止
           </Button>
+        ) : (
+          !meta.transcribed &&
+          !isProcessing && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100"
+              disabled={!can.reanalyze}
+              title="この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+              onClick={(e) => {
+                e.stopPropagation();
+                // Opens the entry first so the transcript panel switches to it
+                // right away (showing the "未解析" placeholder), then runs the
+                // analysis against that same now-selected recording -- without
+                // this, `rerunHistoryEntry` still transcribes correctly but has
+                // nothing to display its result into until the user separately
+                // clicks the row.
+                void (async () => {
+                  await loadHistoryEntry(meta.id);
+                  await rerunHistoryEntry(meta.id);
+                })();
+              }}
+            >
+              <Wand2 className="h-3 w-3" />
+              解析
+            </Button>
+          )
         )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

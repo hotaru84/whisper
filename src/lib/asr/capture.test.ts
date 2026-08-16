@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const invoke = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+// `isTauri: () => true` so `../env.ts`'s `useMockBackend` is false and
+// `capture.ts` takes its real (invoke-calling) path rather than its own
+// no-backend mock branch -- this suite is testing that real path.
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invoke(...args),
+  isTauri: () => true,
+}));
 
 const { RecordingCapture } = await import("./capture");
 const { WHISPER_SAMPLE_RATE } = await import("../audio/resample");

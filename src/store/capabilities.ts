@@ -84,6 +84,12 @@ export interface CapabilityInputs {
   modelStatus: ModelStatus;
   /** `recordingMode.recordOnly` -- see `RecordingModeSettings` in the store. */
   recordOnly: boolean;
+  /** `AppState.startingRecording` -- true for the async setup window between
+   * a record press and `recordingPhase` actually becoming `"recording"`.
+   * Optional (defaults to falsy) so the read-only call sites that only care
+   * about the other four axes don't have to plumb it through; only the
+   * `startRecording` action's own guard actually needs it. */
+  startingRecording?: boolean;
 }
 
 export function selectCapabilities(s: CapabilityInputs): Capabilities {
@@ -93,7 +99,10 @@ export function selectCapabilities(s: CapabilityInputs): Capabilities {
     // Record-only mode is the whole point of not loading the model, so it
     // cannot be gated on the model being ready. Its recordings are
     // transcribed later via `reanalyze`, which loads the model on demand.
-    startRecording: idle && (s.recordOnly || s.modelStatus === "ready"),
+    // `!startingRecording` closes the window where a second record press,
+    // landing after the first's `set({startingRecording: true})` but before
+    // `recordingPhase` itself flips, would otherwise still read as `idle`.
+    startRecording: idle && !s.startingRecording && (s.recordOnly || s.modelStatus === "ready"),
     pause: s.recordingPhase === "recording",
     resume: s.recordingPhase === "paused",
     stop: !stopped,

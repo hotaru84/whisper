@@ -221,6 +221,33 @@ async function persistTake(
 }
 
 /**
+ * This take's live output so far, rebased onto the recording's own 0-based
+ * timeline with freshly sequential ids -- the same convention every history
+ * write uses. Shared by every place that has to file *something* in history
+ * before (or instead of) the accuracy pass has a result of its own: the
+ * pass being cancelled, the pass never getting a chance to run at all, and
+ * (below) the provisional entry `refineRecording` writes immediately on
+ * stop so the take is not invisible to the sidebar for however long the
+ * pass takes.
+ */
+function liveTakeSnapshot(
+  baseSec: number,
+  keptSegments: number,
+): { segments: TranscriptSegment[]; audioEvents: AudioEvent[]; hasText: boolean } {
+  const state = useAppStore.getState();
+  const liveSegments = state.segments.slice(keptSegments);
+  const segments = liveSegments.map((s, i) => ({
+    ...s,
+    id: i + 1,
+    startOffsetSec: s.startOffsetSec - baseSec,
+  }));
+  const audioEvents = state.audioEvents
+    .filter((e) => e.start >= baseSec)
+    .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }));
+  return { segments, audioEvents, hasText: liveSegments.some((s) => s.text.trim() !== "") };
+}
+
+/**
  * Winds up a take whose accuracy pass the user cancelled: keep what the live
  * pass already put on screen, and file exactly that in history.
  *
@@ -241,19 +268,7 @@ async function finishCancelledTake(
   recordingDurationSec: number,
   language: string,
 ): Promise<void> {
-  const state = useAppStore.getState();
-  // This take's live output, on the recording's own 0-based timeline with
-  // freshly sequential ids -- the same convention every other history write
-  // uses, so a cancelled take looks like any other entry.
-  const liveSegments = state.segments.slice(keptSegments);
-  const localSegments = liveSegments.map((s, i) => ({
-    ...s,
-    id: i + 1,
-    startOffsetSec: s.startOffsetSec - baseSec,
-  }));
-  const liveEvents = state.audioEvents
-    .filter((e) => e.start >= baseSec)
-    .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }));
+  const snapshot = liveTakeSnapshot(baseSec, keptSegments);
 
   useAppStore.setState({
     refineNotice:
@@ -266,14 +281,14 @@ async function finishCancelledTake(
     // A cancelled take with nothing on screen is not transcribed, and saying
     // so is what puts the 解析 button on its history row -- the same door
     // record-only takes come through.
-    transcribed: liveSegments.some((s) => s.text.trim() !== ""),
+    transcribed: snapshot.hasText,
     // None of the three ran to completion, so none of them describe what was
     // saved.
     usedDiarize: false,
     usedVad: false,
     usedAudioEvents: false,
-    segments: localSegments,
-    audioEvents: liveEvents,
+    segments: snapshot.segments,
+    audioEvents: snapshot.audioEvents,
   });
 }
 
@@ -327,6 +342,25 @@ export async function refineRecording(
     processingRecordingId: recordingId,
   });
   try {
+    // File the take in history right away, using whatever the live pass
+    // already produced -- otherwise the sidebar has nothing to show for this
+    // recording (and `viewedRecordingId` has nothing to resolve to, hiding
+    // the transcript panel's own "close" button) for however long the
+    // accuracy pass below takes, even though the transcript panel is already
+    // showing its content. `persistTake` below overwrites this with the
+    // refined result once the pass actually finishes.
+    const liveSnapshot = liveTakeSnapshot(baseSec, keptSegments);
+    await persistTake(recordingId, {
+      durationSec: recordingDurationSec,
+      language: useAppStore.getState().settings.language,
+      transcribed: liveSnapshot.hasText,
+      usedDiarize: false,
+      usedVad: false,
+      usedAudioEvents: false,
+      segments: liveSnapshot.segments,
+      audioEvents: liveSnapshot.audioEvents,
+    });
+
     const { settings, vadSettings, diarizeSettings, audioEventSettings } =
       useAppStore.getState();
     const outcome = await runAccuracyPipeline(

@@ -3,8 +3,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
 import { TitleBarControls } from "./TitleBarControls";
 import { TitleBarStatus } from "./TitleBarStatus";
+import { runningInTauri } from "../lib/env";
 
-const appWindow = getCurrentWindow();
+// `null` outside Tauri: `getCurrentWindow()` itself reads Tauri-injected
+// globals at call time, which don't exist in a plain browser tab -- without
+// this guard, `npm run dev` opened outside the Tauri webview crashed on this
+// module's very first evaluation (a module-scope call, not deferred into the
+// component), taking the whole app down before anything could render.
+const appWindow = runningInTauri ? getCurrentWindow() : null;
 
 /**
  * Replaces the OS titlebar (`decorations: false` in `tauri.conf.json`) so it
@@ -28,6 +34,7 @@ export function TitleBar() {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
+    if (!appWindow) return;
     let unlisten: (() => void) | undefined;
     void appWindow.isMaximized().then(setIsMaximized);
     void appWindow.onResized(() => {
@@ -59,7 +66,7 @@ export function TitleBar() {
         <button
           type="button"
           aria-label="最小化"
-          onClick={() => void appWindow.minimize()}
+          onClick={() => void appWindow?.minimize()}
           className="flex w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           <Minus className="h-3.5 w-3.5" />
@@ -67,7 +74,7 @@ export function TitleBar() {
         <button
           type="button"
           aria-label={isMaximized ? "元のサイズに戻す" : "最大化"}
-          onClick={() => void appWindow.toggleMaximize()}
+          onClick={() => void appWindow?.toggleMaximize()}
           className="flex w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           {isMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3 w-3" />}
@@ -75,7 +82,7 @@ export function TitleBar() {
         <button
           type="button"
           aria-label="閉じる"
-          onClick={() => void appWindow.close()}
+          onClick={() => void appWindow?.close()}
           className="flex w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-signal hover:text-white"
         >
           <X className="h-4 w-4" />

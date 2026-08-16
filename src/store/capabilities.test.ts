@@ -70,6 +70,20 @@ describe("selectCapabilities", () => {
     }
   });
 
+  it("does not let a second record press start while the first is still in its async setup window", () => {
+    // Otherwise idle -- this is exactly the state a rapid double-click on
+    // record would land the second call in, since recordingPhase itself
+    // doesn't flip to "recording" until the first call's setup finishes.
+    const can = selectCapabilities({
+      recordingPhase: "stopped",
+      processing: null,
+      modelStatus: "ready",
+      recordOnly: false,
+      startingRecording: true,
+    });
+    expect(can.startRecording).toBe(false);
+  });
+
   it("stops offering to cancel once a cancellation has already been requested", () => {
     // The whole reason "cancelling" is its own phase rather than a flag beside
     // "refining": pressing the button is what makes it stop offering itself.

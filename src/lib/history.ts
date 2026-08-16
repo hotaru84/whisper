@@ -2,6 +2,7 @@ import { readDir, readTextFile, writeTextFile, remove, exists } from "@tauri-app
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import type { TranscriptSegment } from "./transcript";
 import type { AudioEvent } from "./asr";
+import { useMockBackend } from "./env";
 
 /**
  * Persists finished recordings so the history sidebar can browse them across
@@ -65,6 +66,12 @@ interface StoredRecording {
   audioEvents: AudioEvent[];
 }
 
+// Mock backend only (see ./env.ts) -- an in-memory stand-in for the sidecar
+// JSON files on disk, so history can be filed/browsed/deleted while
+// exercising screen transitions in a plain browser. Resets on reload, same
+// as every other piece of mock state in this app.
+const mockStore = new Map<string, StoredRecording>();
+
 async function recordingsDir(): Promise<string> {
   return join(await appCacheDir(), "recordings");
 }
@@ -79,6 +86,7 @@ async function jsonPath(id: string): Promise<string> {
  * take a path string, so the frontend can point them at any past
  * recording's WAV, not only the one just finished. */
 export async function wavPath(id: string): Promise<string> {
+  if (useMockBackend) return `mock-recordings/${id}.wav`;
   return join(await recordingsDir(), `${id}.wav`);
 }
 
@@ -102,16 +110,35 @@ function previewFrom(segments: TranscriptSegment[]): string {
   return text.length > 80 ? `${text.slice(0, 80)}…` : text;
 }
 
+function metaFromStored(id: string, createdAt: Date, stored: StoredRecording): RecordingHistoryMeta {
+  return {
+    id,
+    createdAt,
+    durationSec: stored.durationSec,
+    language: stored.language,
+    transcribed: stored.transcribed ?? true,
+    usedDiarize: stored.usedDiarize,
+    usedVad: stored.usedVad,
+    usedAudioEvents: stored.usedAudioEvents,
+    preview: previewFrom(stored.segments),
+  };
+}
+
 /**
  * Writes the sidecar JSON for a just-finished recording. `id` must be the
  * same stem `capture.start()` used for the WAV -- see `wavPath`/`jsonPath`.
+ * A full overwrite each time, so it's safe to call more than once for the
+ * same `id` as better data becomes available.
  *
- * Called from `appStore.ts`'s `refineRecording` once the second pass (and
- * any diarization/audio-event passes) finish. A failure here is reported the
- * same way every other post-processing failure in that function is: a
- * `refineNotice`, not an error that discards the transcript already on
- * screen -- the recording not being *browsable later* is a smaller loss than
- * losing it *right now*.
+ * `recordingPipeline.ts`'s `refineRecording` calls this twice: once right
+ * after the recording stops (with whatever the live pass already produced,
+ * so the take is immediately visible/selectable in the sidebar), and again
+ * once the second pass (and any diarization/audio-event passes) finish, to
+ * overwrite the provisional entry with the refined result. A failure here is
+ * reported the same way every other post-processing failure in that
+ * function is: a `refineNotice`, not an error that discards the transcript
+ * already on screen -- the recording not being *browsable later* is a
+ * smaller loss than losing it *right now*.
  */
 export async function saveRecordingHistory(
   id: string,
@@ -127,6 +154,10 @@ export async function saveRecordingHistory(
     segments: entry.segments,
     audioEvents: entry.audioEvents,
   };
+  if (useMockBackend) {
+    mockStore.set(id, stored);
+    return;
+  }
   await writeTextFile(await jsonPath(id), JSON.stringify(stored));
 }
 
@@ -142,6 +173,15 @@ export async function saveRecordingHistory(
  * whole list -- one bad file must not hide every other recording.
  */
 export async function listRecordings(): Promise<RecordingHistoryMeta[]> {
+  if (useMockBackend) {
+    const metas: RecordingHistoryMeta[] = [];
+    for (const [id, stored] of mockStore) {
+      const createdAt = parseCreatedAt(id);
+      if (createdAt) metas.push(metaFromStored(id, createdAt, stored));
+    }
+    return metas.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
   const dir = await recordingsDir();
   if (!(await exists(dir))) return [];
 
@@ -155,17 +195,7 @@ export async function listRecordings(): Promise<RecordingHistoryMeta[]> {
     try {
       const raw = await readTextFile(await join(dir, entry.name));
       const stored = JSON.parse(raw) as StoredRecording;
-      metas.push({
-        id,
-        createdAt,
-        durationSec: stored.durationSec,
-        language: stored.language,
-        transcribed: stored.transcribed ?? true,
-        usedDiarize: stored.usedDiarize,
-        usedVad: stored.usedVad,
-        usedAudioEvents: stored.usedAudioEvents,
-        preview: previewFrom(stored.segments),
-      });
+      metas.push(metaFromStored(id, createdAt, stored));
     } catch (err) {
       console.warn(`[history] skipping unreadable recording ${id}:`, err);
     }
@@ -178,21 +208,16 @@ export async function listRecordings(): Promise<RecordingHistoryMeta[]> {
 export async function loadRecording(id: string): Promise<RecordingHistoryEntry> {
   const createdAt = parseCreatedAt(id);
   if (!createdAt) throw new Error(`${id}: not a recognized recording id`);
+
+  if (useMockBackend) {
+    const stored = mockStore.get(id);
+    if (!stored) throw new Error(`${id}: not found in the mock history store`);
+    return { ...metaFromStored(id, createdAt, stored), segments: stored.segments, audioEvents: stored.audioEvents };
+  }
+
   const raw = await readTextFile(await jsonPath(id));
   const stored = JSON.parse(raw) as StoredRecording;
-  return {
-    id,
-    createdAt,
-    durationSec: stored.durationSec,
-    language: stored.language,
-    transcribed: stored.transcribed ?? true,
-    usedDiarize: stored.usedDiarize,
-    usedVad: stored.usedVad,
-    usedAudioEvents: stored.usedAudioEvents,
-    preview: previewFrom(stored.segments),
-    segments: stored.segments,
-    audioEvents: stored.audioEvents,
-  };
+  return { ...metaFromStored(id, createdAt, stored), segments: stored.segments, audioEvents: stored.audioEvents };
 }
 
 /** Deletes both the sidecar JSON and the WAV. Each file is checked for
@@ -203,6 +228,10 @@ export async function loadRecording(id: string): Promise<RecordingHistoryEntry> 
  * "not found" error from `remove`) avoids depending on the exact wording of
  * an OS error message, which differs by platform. */
 export async function deleteRecording(id: string): Promise<void> {
+  if (useMockBackend) {
+    mockStore.delete(id);
+    return;
+  }
   const [json, wav] = await Promise.all([jsonPath(id), wavPath(id)]);
   await Promise.all(
     [json, wav].map(async (path) => {
