@@ -104,5 +104,18 @@ echo [win-build-env] VS         : %VSINSTALL%
 echo [win-build-env] VULKAN_SDK : %VULKAN_SDK%
 echo [win-build-env] LIBCLANG   : %LIBCLANG_PATH%
 
+REM --- sherpa-onnx-sys's own lib dir override, optional ----------------------
+REM Unlike VULKAN_SDK this is never required: sherpa-onnx-sys's build.rs
+REM downloads a prebuilt (CPU-only) DLL set from GitHub by default, and that's
+REM enough for a normal build. SHERPA_ONNX_LIB_DIR only matters when it's
+REM already set by whoever ran a one-off native sherpa-onnx build with
+REM -DSHERPA_ONNX_ENABLE_DIRECTML=ON (see README for that build) and wants this
+REM build to link against it instead of the GitHub download -- so this script
+REM just passes it through and echoes it for visibility, it never sets or
+REM validates it itself.
+if defined SHERPA_ONNX_LIB_DIR (
+    echo [win-build-env] SHERPA_ONNX_LIB_DIR: %SHERPA_ONNX_LIB_DIR% ^(DirectML build^)
+)
+
 call %*
 exit /b %errorlevel%

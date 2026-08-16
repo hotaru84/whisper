@@ -120,6 +120,10 @@ pub async fn init_model(app: AppHandle) -> Result<(), String> {
         // boundaries can land hundreds of ms from the actual speech. This preset
         // is model-specific (its attention heads were selected for
         // large-v3-turbo) and only applies to the model we ship.
+        // `collect_segments` reads the resulting per-token `t_dtw` values to
+        // tighten segment boundaries, which matters because diarization
+        // assigns speakers by overlapping these timestamps against diarizer
+        // segments.
         //
         // Safe to enable unconditionally: flash_attn (the one thing DTW
         // conflicts with) and new_segment_callback (whose calls DTW makes
@@ -334,8 +338,45 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
     params
 }
 
+/// Segment bounds derived from per-token DTW alignment, in centiseconds.
+///
+/// whisper.cpp only assigns `t_dtw` to text tokens (timestamp tokens are
+/// skipped and keep the uncomputed sentinel), so the min/max across a
+/// segment's tokens is the DTW-aligned span of the words actually spoken --
+/// tighter than the single timestamp token whisper's default reader reads
+/// off the segment boundary. Returns `None` when no token in the segment has
+/// a computed `t_dtw` (DTW disabled, or nothing but non-text tokens), so the
+/// caller can fall back to the segment-level timestamp.
+fn dtw_segment_bounds(segment: &whisper_rs::WhisperSegment) -> Option<(i64, i64)> {
+    let mut bounds: Option<(i64, i64)> = None;
+    for i in 0..segment.n_tokens() {
+        let Some(token) = segment.get_token(i) else {
+            continue;
+        };
+        let t_dtw = token.token_data().t_dtw;
+        // -1 is whisper.cpp's uncomputed sentinel (whisper_sample_token's
+        // default init), not a valid timestamp -- see whisper.h's warning not
+        // to use t_dtw "if you haven't computed token-level timestamps with dtw".
+        if t_dtw < 0 {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (t_dtw, t_dtw),
+            Some((min, max)) => (min.min(t_dtw), max.max(t_dtw)),
+        });
+    }
+    bounds
+}
+
 /// Collects whisper's segments into the shape the frontend consumes.
 /// Timestamps are converted from whisper's centiseconds to seconds.
+///
+/// When DTW token-level timestamps were computed (see `init_model`), segment
+/// bounds are taken from the DTW-aligned token span rather than the single
+/// timestamp token whisper's default segmentation happens to emit -- DTW
+/// tracks attention alignment through the decoder and lands much closer to
+/// the actual speech boundaries, which matters because diarization assigns
+/// speakers by overlapping these timestamps against diarizer segments.
 pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeResult, String> {
     let n_segments = state.full_n_segments();
     let mut chunks = Vec::with_capacity(n_segments.max(0) as usize);
@@ -348,8 +389,10 @@ pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeRe
         // tokens, and segment boundaries can land mid-UTF-8, which the strict
         // accessor rejects outright.
         let seg_text = segment.to_str_lossy().map_err(|e| e.to_string())?.into_owned();
-        let t0 = segment.start_timestamp() as f32 / 100.0;
-        let t1 = segment.end_timestamp() as f32 / 100.0;
+        let (t0_cs, t1_cs) = dtw_segment_bounds(&segment)
+            .unwrap_or((segment.start_timestamp(), segment.end_timestamp()));
+        let t0 = t0_cs as f32 / 100.0;
+        let t1 = t1_cs as f32 / 100.0;
         text.push_str(&seg_text);
         chunks.push(TranscribeChunk {
             text: seg_text,
