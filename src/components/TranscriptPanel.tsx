@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { X } from "lucide-react";
 import { Button } from "./ui/button";
 import { ScrollArea } from "./ui/scroll-area";
 import { TranscriptToolbar } from "./TranscriptToolbar";
@@ -18,7 +17,6 @@ export function TranscriptPanel() {
   const refineNotice = useAppStore((s) => s.refineNotice);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
-  const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const cancelAnalysis = useAppStore((s) => s.cancelAnalysis);
@@ -132,44 +130,30 @@ export function TranscriptPanel() {
       {/* Gated on `recordingPhase` rather than `viewedRecording` resolving:
           this panel is only ever mounted stopped-and-showing-something (Home's
           "something selected" state -- App.tsx's `showRecordStart` already
-          excludes the alternative), so the close button belongs here the
-          instant that's true, not only once `recordingHistory` has caught up
-          enough for the `.find()` below to resolve (a just-stopped take can
-          briefly go through that gap -- see `refineRecording`'s early
-          `persistTake` call, which now keeps this gap essentially instant). */}
+          excludes the alternative), so this belongs here the instant that's
+          true, not only once `recordingHistory` has caught up enough for the
+          `.find()` below to resolve (a just-stopped take can briefly go
+          through that gap -- see `refineRecording`'s early `persistTake`
+          call, which now keeps this gap essentially instant). Returning to
+          Home from here is the titlebar's own "戻る" button
+          (`TitleBarControls.tsx`), not a control local to this panel. */}
       {recordingPhase === "stopped" && (
-        <div className="flex items-center justify-between gap-2">
-          <p className="text-xs text-muted-foreground">
-            {viewedRecording ? (
-              <>
-                履歴を表示中 —{" "}
-                <span className="font-mono">
-                  {viewedRecording.createdAt.getFullYear()}-
-                  {String(viewedRecording.createdAt.getMonth() + 1).padStart(2, "0")}-
-                  {String(viewedRecording.createdAt.getDate()).padStart(2, "0")}{" "}
-                  {String(viewedRecording.createdAt.getHours()).padStart(2, "0")}:
-                  {String(viewedRecording.createdAt.getMinutes()).padStart(2, "0")}
-                </span>
-              </>
-            ) : (
-              "録音を処理中…"
-            )}
-          </p>
-          {/* Explicit dismiss back to the Home screen's record-start CTA, in
-              addition to (not instead of) clicking the already-selected row
-              again in the sidebar -- see design.md's close-button rationale. */}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            className="shrink-0"
-            aria-label="閉じてホームに戻る"
-            title="閉じてホームに戻る"
-            onClick={deselectHistoryEntry}
-          >
-            <X className="h-3.5 w-3.5" />
-          </Button>
-        </div>
+        <p className="text-xs text-muted-foreground">
+          {viewedRecording ? (
+            <>
+              履歴を表示中 —{" "}
+              <span className="font-mono">
+                {viewedRecording.createdAt.getFullYear()}-
+                {String(viewedRecording.createdAt.getMonth() + 1).padStart(2, "0")}-
+                {String(viewedRecording.createdAt.getDate()).padStart(2, "0")}{" "}
+                {String(viewedRecording.createdAt.getHours()).padStart(2, "0")}:
+                {String(viewedRecording.createdAt.getMinutes()).padStart(2, "0")}
+              </span>
+            </>
+          ) : (
+            "録音を処理中…"
+          )}
+        </p>
       )}
 
       {isRefining && (

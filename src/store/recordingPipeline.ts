@@ -32,7 +32,6 @@ import {
   consumeSegmentIds,
   getTimelineBaseSec,
   getRecordingBaseSec,
-  getSegmentsBeforeRecording,
 } from "./timeline";
 import { useAppStore, markRecordingViewed } from "./appStore";
 
@@ -292,20 +291,41 @@ async function finishCancelledTake(
   });
 }
 
-/**
- * Re-transcribes the finished recording as one continuous piece and swaps the
- * result in for the segments the live pass produced.
- *
- * Every failure path here keeps the live transcript. The second pass is an
- * improvement on something the user already has; losing it costs accuracy, while
- * discarding the live result would cost them the meeting.
- */
-export async function refineRecording(
-  capture: RecordingCapture,
-): Promise<void> {
-  const keptSegments = getSegmentsBeforeRecording();
-  const baseSec = getRecordingBaseSec();
+/** What `fileTakeProvisionally` hands off to `refineRecording` once the WAV
+ * is closed and a provisional history entry is already filed. */
+export interface TakeFiling {
+  recordingId: string;
+  path: string;
+  recordingDurationSec: number;
+}
 
+/**
+ * Closes the WAV and files a provisional history entry from whatever the
+ * live pass already produced -- *before* the accuracy pass has run, and
+ * (per its caller, `stopRecording`) even before the live pass's own trailing
+ * window has finished flushing. `refineRecording` below overwrites this with
+ * the refined result once the accuracy pass actually finishes.
+ *
+ * Split out of what used to be `refineRecording`'s own opening so
+ * `stopRecording` can run this *before*, rather than after,
+ * `streamer.finish()`/`eventStreamer.finish()` -- those are real
+ * transcription calls and can take several seconds on their own, and closing
+ * the WAV / writing the sidecar don't depend on them at all. Making the
+ * sidebar wait for that flush too was exactly the "recording exists but
+ * isn't browsable yet" gap this function exists to close. One consequence:
+ * the live snapshot below can be one trailing window short of what
+ * `streamer.finish()` would otherwise have flushed -- acceptable, since this
+ * entry is provisional by construction and gets overwritten by the real
+ * refined transcript within moments regardless.
+ *
+ * `null` return means `capture.finish()` itself failed; the caller skips the
+ * accuracy pass entirely in that case, same as before this was split out.
+ */
+export async function fileTakeProvisionally(
+  capture: RecordingCapture,
+  baseSec: number,
+  keptSegments: number,
+): Promise<TakeFiling | null> {
   let path: string;
   let recordingDurationSec: number;
   try {
@@ -320,7 +340,7 @@ export async function refineRecording(
       processing: null,
       refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
-    return;
+    return null;
   }
   const recordingId = idFromWavPath(path);
 
@@ -341,26 +361,39 @@ export async function refineRecording(
     refineProgress: 0,
     processingRecordingId: recordingId,
   });
-  try {
-    // File the take in history right away, using whatever the live pass
-    // already produced -- otherwise the sidebar has nothing to show for this
-    // recording (and `viewedRecordingId` has nothing to resolve to, hiding
-    // the transcript panel's own "close" button) for however long the
-    // accuracy pass below takes, even though the transcript panel is already
-    // showing its content. `persistTake` below overwrites this with the
-    // refined result once the pass actually finishes.
-    const liveSnapshot = liveTakeSnapshot(baseSec, keptSegments);
-    await persistTake(recordingId, {
-      durationSec: recordingDurationSec,
-      language: useAppStore.getState().settings.language,
-      transcribed: liveSnapshot.hasText,
-      usedDiarize: false,
-      usedVad: false,
-      usedAudioEvents: false,
-      segments: liveSnapshot.segments,
-      audioEvents: liveSnapshot.audioEvents,
-    });
 
+  const liveSnapshot = liveTakeSnapshot(baseSec, keptSegments);
+  await persistTake(recordingId, {
+    durationSec: recordingDurationSec,
+    language: useAppStore.getState().settings.language,
+    transcribed: liveSnapshot.hasText,
+    usedDiarize: false,
+    usedVad: false,
+    usedAudioEvents: false,
+    segments: liveSnapshot.segments,
+    audioEvents: liveSnapshot.audioEvents,
+  });
+
+  return { recordingId, path, recordingDurationSec };
+}
+
+/**
+ * Re-transcribes the finished recording as one continuous piece and swaps the
+ * result in for the segments the live pass produced. Takes over from
+ * `fileTakeProvisionally`, which `stopRecording` has already run (and which
+ * already filed the take in history) by the time this is called.
+ *
+ * Every failure path here keeps the live transcript. The second pass is an
+ * improvement on something the user already has; losing it costs accuracy, while
+ * discarding the live result would cost them the meeting.
+ */
+export async function refineRecording(
+  filing: TakeFiling,
+  baseSec: number,
+  keptSegments: number,
+): Promise<void> {
+  const { recordingId, path, recordingDurationSec } = filing;
+  try {
     const { settings, vadSettings, diarizeSettings, audioEventSettings } =
       useAppStore.getState();
     const outcome = await runAccuracyPipeline(

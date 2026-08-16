@@ -23,9 +23,15 @@
   - `src/lib/asr/capture.test.ts`: 新規 `isTauri` インポートに対応するモックを追加（既存テストは実バックエンド経路のままにするため `isTauri: () => true` を返す）
 - [x] `npm run build`／`npm run lint`／`npx vitest run` 再確認（全通過）
 
+## 追加修正2（実機テストのフィードバックによる）
+
+- [x] 録音停止後、履歴リストへの登録がまだ遅い問題を修正。原因は `stopRecording` が `streamer.finish()`/`eventStreamer.finish()`（実際に文字起こしモデルを呼ぶ、数秒かかりうる処理）の完了を待ってから `capture.finish()`＋暫定 `persistTake` を実行していたこと。`refineRecording` を `fileTakeProvisionally`（WAV クローズ＋暫定履歴登録）と `refineRecording`（精度向上パス本体）に分割し、`stopRecording` から `fileTakeProvisionally` をライブ文字起こしのフラッシュより**前**に呼ぶよう順序を入れ替えた（`src/store/recordingPipeline.ts`, `src/store/appStore.ts`）。暫定エントリがライブ文字起こしの最後の1ウィンドウ分を含まない可能性があるが、精度向上パス完了後にどのみち上書きされるため許容
+- [x] 閉じるボタンの位置を変更: サイドバー表示切替ボタン（`toggleSidebar`）を廃止し、サイドバーは Home 画面で常時表示に変更。そのボタンがあった位置（タイトルバー左）に「戻る」ボタンを新設し、`TranscriptPanel.tsx` 内にあった小さな×ボタンを置き換えた（`src/components/TitleBarControls.tsx` 全面書き換え、`src/App.tsx`、`src/store/appStore.ts`／`src/store/persistedSettings.ts` から `sidebar.visible`/`toggleSidebar` を削除）
+- [x] `npm run build`／`npm run lint`／`npx vitest run` 再確認（全通過、100テスト）
+
 ## 未検証
 
-- 上記モックレイヤーは実際のブラウザでの目視確認ができていない（このセッションのブラウザプレビューツールが `localhost:1420`（ユーザー自身の `npm run dev` プロセス）にネットワーク到達できず、コンソール確認・スクリーンショットとも失敗した）。ユーザー自身のブラウザで `npm run dev` → `http://localhost:1420` を開いての確認が必要
+- 上記モックレイヤー・今回の追加修正は実際のブラウザでの目視確認ができていない（このセッションのブラウザプレビューツールが `localhost:1420`（ユーザー自身の `npm run dev` プロセス）にネットワーク到達できず、コンソール確認・スクリーンショットとも失敗した）。ユーザー自身のブラウザで `npm run dev` → `http://localhost:1420` を開いての確認が必要
 - Tauri ネイティブウィンドウでの実際の目視確認（`npm run tauri dev`）
 - モンキーテストで報告された2つの不具合（ゴミ画面フラッシュ、録音開始の遷移遅延）が実機で解消されているかの再現確認
 - 保存（.txt/.srt エクスポート）ボタンはモック未対応（`saveTranscript.ts` は非対象 -- クリックすると失敗するが画面遷移には影響しない）

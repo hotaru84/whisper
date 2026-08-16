@@ -56,17 +56,20 @@ import {
   setTimelineBaseSec,
   getRecordingBaseSec,
   setRecordingBaseSec,
+  getSegmentsBeforeRecording,
   setSegmentsBeforeRecording,
   resetTimeline,
 } from "./timeline";
 import {
   runAccuracyPipeline,
+  fileTakeProvisionally,
   refineRecording,
   finishRecordOnly,
   ensureModelReady,
   appendStreamingSegment,
   appendLiveAudioEvents,
 } from "./recordingPipeline";
+import type { TakeFiling } from "./recordingPipeline";
 
 // Re-exported because this is where every consumer already imports them from.
 export {
@@ -163,9 +166,9 @@ interface AppState {
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
-  /** History sidebar width/visibility. Layout, not behaviour, but it lives
-   * here because the toggle (TitleBarControls) and the panel itself (App)
-   * are siblings with no common owner below the root. */
+  /** History sidebar width (resizable, persisted). Always shown on the Home
+   * screen and never on Active -- see `App.tsx` -- so this is just layout,
+   * not a visibility toggle. */
   sidebar: SidebarSettings;
   levelMeter: AudioLevelMeter | null;
   /** Available microphones, for the settings dropdown. Labels are placeholders
@@ -216,7 +219,6 @@ interface AppState {
    * on release via `persistSidebarSettings`. */
   setSidebarWidth: (width: number) => void;
   persistSidebarSettings: () => void;
-  toggleSidebar: () => void;
   setAppAudioTarget: (processId: number | null) => void;
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
@@ -878,8 +880,33 @@ export const useAppStore = create<AppState>((set, get) => ({
       levelMeter: null,
     });
 
+    let filing: TakeFiling | null = null;
+    let baseSec = 0;
+    let keptSegments = 0;
+
     try {
       const totalSamples = await controller.stop();
+
+      // Read synchronously, before any of the async work below -- these are
+      // `timeline.ts`'s module state, which a concurrent action elsewhere
+      // (e.g. browsing to a different history entry) could otherwise rewrite
+      // out from under this take before `fileTakeProvisionally`/`refineRecording`
+      // get around to using them.
+      keptSegments = getSegmentsBeforeRecording();
+      baseSec = getRecordingBaseSec();
+
+      // Close the WAV and file a provisional history entry *before* flushing
+      // the live pass's own trailing window below: that flush is a real
+      // transcription call and can take several seconds on its own, and
+      // there is no reason the sidebar (and `viewedRecordingId`, which the
+      // transcript panel's close button depends on) should have to wait for
+      // it too when it has nothing to do with closing the file. Skipped for
+      // record-only takes, whose `finishRecordOnly` below is already just as
+      // fast (no accuracy pass to file ahead of).
+      if (capture && !recordOnly) {
+        filing = await fileTakeProvisionally(capture, baseSec, keptSegments);
+      }
+
       // Flush any audio not yet committed by the streaming pass.
       await streamer?.finish();
       // Best-effort: a live preview window failing to flush must never hold
@@ -906,9 +933,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // windows produced. Runs after the live result is already on screen, so the
     // user has a transcript throughout. A record-only take has nothing to
     // replace and no model loaded to do it with, so it only gets filed away.
+    // `filing` is only null if `fileTakeProvisionally` itself failed (already
+    // reported as a `refineNotice` there) or was skipped for a record-only
+    // take, in which case `finishRecordOnly` below does its own filing.
     if (capture) {
       if (recordOnly) await finishRecordOnly(capture);
-      else await refineRecording(capture);
+      else if (filing) await refineRecording(filing, baseSec, keptSegments);
     }
   },
 
@@ -956,13 +986,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ sidebar: { ...s.sidebar, width: clampSidebarWidth(width) } })),
 
   persistSidebarSettings: () => saveSidebarSettings(get().sidebar),
-
-  toggleSidebar: () =>
-    set((s) => {
-      const sidebar = { ...s.sidebar, visible: !s.sidebar.visible };
-      saveSidebarSettings(sidebar);
-      return { sidebar };
-    }),
 
 }));
 

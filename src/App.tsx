@@ -114,26 +114,25 @@ function App() {
             <ActiveRecordingScreen starting={startingRecording && recordingPhase === "stopped"} />
           ) : (
             <>
-              {sidebar.visible && (
-                <>
-                  <HistorySidebar width={sidebar.width} />
-                  {/* The divider and the thing you grab to move it are the same
-                      element: -mx-2 takes the handle out of the layout entirely
-                      (zero width contributed), so its 16px hit area straddles the
-                      line it draws instead of sitting beside it. A 1px-wide click
-                      target is unusable with a real cursor, hence the hit area
-                      being much wider than what's drawn. */}
-                  <div
-                    onPointerDown={onDragHandleDown}
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label="履歴パネルの幅を調整"
-                    className="group relative z-20 -mx-2 flex w-4 shrink-0 cursor-col-resize touch-none items-stretch justify-center"
-                  >
-                    <div className="w-px bg-sidebar-border transition-[width,background-color] group-hover:w-0.5 group-hover:bg-ring group-active:bg-ring" />
-                  </div>
-                </>
-              )}
+              {/* Always shown on Home -- no manual visibility toggle any more
+                  (see TitleBarControls.tsx's doc comment); the automatic
+                  Home/Active split already covers what that toggle was for. */}
+              <HistorySidebar width={sidebar.width} />
+              {/* The divider and the thing you grab to move it are the same
+                  element: -mx-2 takes the handle out of the layout entirely
+                  (zero width contributed), so its 16px hit area straddles the
+                  line it draws instead of sitting beside it. A 1px-wide click
+                  target is unusable with a real cursor, hence the hit area
+                  being much wider than what's drawn. */}
+              <div
+                onPointerDown={onDragHandleDown}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="履歴パネルの幅を調整"
+                className="group relative z-20 -mx-2 flex w-4 shrink-0 cursor-col-resize touch-none items-stretch justify-center"
+              >
+                <div className="w-px bg-sidebar-border transition-[width,background-color] group-hover:w-0.5 group-hover:bg-ring group-active:bg-ring" />
+              </div>
               {/* overflow-hidden + min-h-0 (rather than overflow-y-auto) so this
                   column itself never scrolls -- only TranscriptPanel's own
                   transcript list does. Everything else here (the error banner,

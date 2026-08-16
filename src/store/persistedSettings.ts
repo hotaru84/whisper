@@ -47,14 +47,12 @@ export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false
 export interface SidebarSettings {
   /** Width of the history sidebar in CSS pixels, always within [MIN, MAX]. */
   width: number;
-  /** Whether the history sidebar is shown at all. */
-  visible: boolean;
 }
 
 export const MIN_SIDEBAR_WIDTH = 180;
 export const MAX_SIDEBAR_WIDTH = 420;
 
-export const DEFAULT_SIDEBAR_SETTINGS: SidebarSettings = { width: 224, visible: true };
+export const DEFAULT_SIDEBAR_SETTINGS: SidebarSettings = { width: 224 };
 
 export function clampSidebarWidth(width: number): number {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width));
@@ -164,8 +162,8 @@ export const saveRecordingMode = recordingMode.save;
 
 /**
  * Layout rather than behaviour, but persisted for the same reason as the rest:
- * a pane the user deliberately narrowed (or closed) reopening at its default
- * on every launch is a setting that undoes itself.
+ * a pane the user deliberately narrowed reopening at its default width on
+ * every launch is a setting that undoes itself.
  *
  * Width is clamped on the way *in* as well as on the way out, so a hand-edited
  * or stale value can't produce a sidebar that is unusably narrow or eats the
@@ -177,7 +175,6 @@ const sidebarSettings = definePersistedSettings<SidebarSettings>(
   (parsed, d) => ({
     width:
       typeof parsed.width === "number" && Number.isFinite(parsed.width) ? clampSidebarWidth(parsed.width) : d.width,
-    visible: typeof parsed.visible === "boolean" ? parsed.visible : d.visible,
   }),
 );
 export const loadSidebarSettings = sidebarSettings.load;
