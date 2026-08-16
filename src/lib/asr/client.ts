@@ -212,6 +212,28 @@ export class AsrClient {
   }
 
   /**
+   * Clears any leftover cancellation, at the head of an analysis pass.
+   *
+   * Called by `runAccuracyPipeline` -- the single entry point both the
+   * post-stop second pass and history re-analysis go through -- so a cancel
+   * that arrived too late to stop the previous pass cannot kill the next one
+   * on sight.
+   */
+  async beginAnalysis(): Promise<void> {
+    await invoke("begin_analysis");
+  }
+
+  /**
+   * Asks the running analysis pass to stop. Resolves as soon as the backend
+   * flag is set, *not* when the pass has actually wound down: the in-flight
+   * `transcribeRecording`/`diarizeRecording`/`detectAudioEvents` promise is
+   * what eventually rejects with `ANALYSIS_CANCELLED`.
+   */
+  async cancelAnalysis(): Promise<void> {
+    await invoke("cancel_analysis");
+  }
+
+  /**
    * Diarizes a finished recording and returns one speaker (or `null`) per
    * entry of `chunks`, in the same order.
    *

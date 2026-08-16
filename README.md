@@ -291,6 +291,42 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   - **第2パスの間もユーザーは逐次パスの結果を読める。** 第2パスが失敗しても逐次パスの結果は保持し、
     `refineNotice` として理由だけを添える（`src/store/appStore.ts`）。既に手元にある文字起こしを、
     改善のために失うことがあってはならない。
+- **停止後の解析パスは途中でキャンセルできる。中断の合図は共有の `Arc<AtomicBool>` 1本。**
+  1時間の会議なら第2パスだけで約4分、その後ろに話者分離と音響イベント検出が積まれ、しかも後者2つは進捗を
+  一切出さないため、whisper が 100% に達したあと readout は固まったまま数分待たされる。設定を間違えたことに
+  気づいても、次の録音を急いで始めたくても、終わるまで録音ボタンは無効のままだった。フラグは
+  `src-tauri/src/cancel.rs` の `CancelState` に置き、`begin_analysis`/`cancel_analysis` の2コマンドで
+  操作する（`appaudio.rs` の `CaptureHandle.stop` と同じ協調停止パターン。ただし join すべきスレッドは無く、
+  実体は `spawn_blocking` 上にある）。
+  - **キャンセルコマンドは `AsrState` に触ってはいけない。** そのミューテックスは `full()` の実行中ずっと
+    保持されている（`asr.rs`）ので、ロックを取りに行くと**止めようとしている処理そのものの後ろでブロックする**。
+    フラグを別の managed state に分けている理由はこれが全て。
+  - **フラグが1本で足りる根拠は `selectCapabilities` にある。** `reanalyze` も `startRecording` も
+    `processing === null` を要求するため、解析パスは同時に高々1つしか走らない。取り残しの持ち越しは
+    `runAccuracyPipeline`（第2パスと履歴の「再解析」が共有する唯一の入口）の先頭が `begin_analysis` で
+    毎回クリアすることで防ぐ。
+  - **中断できる粒度はパスごとに違う。** whisper は `abort_callback` を encode 後と decode ステップごとに
+    評価するので1秒未満で止まる。音響イベント検出は自前の10秒ウィンドウのループなので1ウィンドウぶん。
+    **話者分離だけは中断できない** — sherpa-onnx の C API には
+    `SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback` があるが 1.13.5 の Rust 束縛が公開しておらず、
+    `process()` は単発の不透明呼び出しになる。したがって話者分離中のキャンセルは「最後まで走らせて結果を捨てる」
+    になり、UI はその間 `ProcessingPhase` の `"cancelling"` を表示して待つ。
+  - **whisper-rs 0.16.0 の `set_abort_callback_safe` には型消去した `Box<dyn FnMut() -> bool>` を渡すこと。**
+    この関数は user_data に `*mut Box<dyn FnMut() -> bool>` を格納しながらトランポリンを `trampoline::<F>` で
+    実体化している（`whisper_params.rs:637-647`）。素のクロージャを渡すと、トランポリンが Box の
+    データ/vtable ワードをクロージャのキャプチャとして読む型混同になる。先に `Box<dyn ...>` へ束ねて `F` 自体を
+    その型にすれば辻褄が合う（正しく書けている progress 側は `trampoline::<Box<dyn FnMut(i32)>>` を
+    ハードコードしている）。`asr.rs` のコメントに同じ説明を残してある。
+  - **abort は失敗として返ってくるので、失敗と区別する必要がある。** whisper.cpp は中断時 `-6`（encode）/
+    `-8`（decode）を返すだけなので、フラグを見て `cancel::CANCELLED` センチネル文字列に振り替えている。
+    ここを省くとユーザー自身のキャンセルが「話者分離に失敗した」等の失敗通知として表示される。
+  - **途中結果は捨て、ライブパスの文字起こしを残す。** 半分だけ精緻化されたセグメントをライブ結果の頭に
+    継ぎ足すのは、境界の重複と「話者ラベルが途中まで」の混在を招くだけで、既に読めている文字起こしより
+    良くならない。ただし**履歴への保存は必ず行う**（`finishCancelledTake`）。サイドカー JSON を書かずに
+    抜けると `listRecordings` がその録音を見つけられなくなり、再生も後日の文字起こしもできない take が
+    残ってしまう。ライブ結果が空のままキャンセルした場合は `transcribed: false` で保存し、履歴の行に
+    「解析」ボタンが出るようにしてある。履歴からの「再解析」をキャンセルした場合は保存自体を行わないので、
+    既存のサイドカーはそのまま残る。
 - **「録音のみ」モードは2パスの手前に0パス目を足す形で実装している。** バッテリー駆動時に、録音中ずっと
   15秒ウィンドウの逐次パスが GPU（Vulkan）を回し続けるのが消費電力の支配項になる。これを避けるため、
   `src/store/appStore.ts` の `recordingMode.recordOnly` が立っていると `startRecording` は

@@ -4,6 +4,8 @@ pub mod appaudio;
 // Public so the accuracy harness (`examples/cer.rs`) can decode with exactly the
 // same settings the app uses.
 pub mod asr;
+// Cooperative cancellation shared by the three post-stop analysis commands.
+pub mod cancel;
 // Retains the whole recording so a second pass (and diarization) can see
 // more than one streaming window at a time.
 pub mod capture;
@@ -29,6 +31,7 @@ pub fn run() {
         .manage(capture::CaptureState::default())
         .manage(appaudio::AppAudioState::default())
         .manage(events::AudioTaggingState::default())
+        .manage(cancel::CancelState::default())
         .invoke_handler(tauri::generate_handler![
             asr::init_model,
             asr::transcribe_window,
@@ -42,6 +45,8 @@ pub fn run() {
             appaudio::list_audio_apps,
             appaudio::start_app_audio_capture,
             appaudio::stop_app_audio_capture,
+            cancel::begin_analysis,
+            cancel::cancel_analysis,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
