@@ -7,7 +7,7 @@ import { ActiveRecordingScreen } from "./components/ActiveRecordingScreen";
 import { RecordingTimeline } from "./components/RecordingTimeline";
 import { TranscriptPanel } from "./components/TranscriptPanel";
 import { TooltipProvider } from "./components/ui/tooltip";
-import { useAppStore, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
+import { useAppStore, effectiveRecordOnly, debugTranscribeUrl, debugStreamTranscribeUrl } from "./store/appStore";
 
 /** Drag-to-resize for the history sidebar. The sidebar is the flex row's
  * first child starting at the window's left edge, so the pointer's own
@@ -78,12 +78,16 @@ function App() {
   const showRecordStart = !isActive && processing === null && segmentCount === 0 && playbackRecordingId == null;
 
   useEffect(() => {
-    // Skipped entirely in record-only mode -- loading the model is the cost
-    // that mode exists to avoid, and nothing in a record-only session needs
-    // it. `rerunHistoryEntry` loads it on demand if the user asks for an
+    // Skipped entirely in (effective) record-only mode -- loading the model is
+    // the cost that mode exists to avoid, and nothing in a record-only session
+    // needs it. `rerunHistoryEntry` loads it on demand if the user asks for an
     // analysis later, and leaving the mode loads it right away
-    // (`updateRecordingMode`).
-    if (!useAppStore.getState().recordingMode.recordOnly) void initModel();
+    // (`updateRecordingMode`/`setPowerSource`). In auto mode this reads
+    // whatever `powerSource` happens to be at this exact tick -- "unknown"
+    // (before the first battery reading lands) resolves to the analyzed take,
+    // same safe default as everywhere else `effectiveRecordOnly` is read.
+    const { recordingMode, powerSource } = useAppStore.getState();
+    if (!effectiveRecordOnly(recordingMode, powerSource)) void initModel();
     // Listable (with placeholder labels) even before microphone permission is
     // granted, so the settings dropdown isn't empty on a first visit.
     void refreshAudioInputDevices();

@@ -391,6 +391,32 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
     依存を持たない `src/store/capabilities.ts` に切り出してある。これは「状態を1つ足すと `===` 連鎖から
     静かに漏れる」ことを防ぐための関数で、そのぶんテストの価値が高いので、mock 不要な純粋関数として
     単体テスト可能にする目的が大きい（`capabilities.test.ts`）。
+  - **「自動」モードは `recordOnly` の手動値を電源状態から都度導出する値で置き換えるだけで、0パス目の
+    実装には一切触れない。** `recordingMode`（`RecordingModeSettings`）に `auto: boolean` を追加し、
+    `capabilities.ts` の `effectiveRecordOnly(recordingMode, powerSource)` が「`auto` が立っていれば
+    `powerSource === "battery"`、そうでなければ手動の `recordOnly` をそのまま使う」を1箇所で解決する。
+    `startRecording`/`capabilitiesOf`/`App.tsx` の起動時 `initModel()` 判定/`TitleBarStatus` の
+    アイドルチップ/`RecordButton`・`TranscriptPanel`・`HistorySidebar` の `selectCapabilities` 呼び出しは
+    すべてこの関数を通すだけで、`recordingMode.recordOnly` を直接読んでいた箇所を置き換えた。
+    `recordingRecordOnly`（`startRecording` 時点で凍結される実効値）の意味もそのまま「その take が実際に
+    どちらのモードで走ったか」で変わらない——自動モードでも録音開始の瞬間に一度だけ解決し、take の途中で
+    電源を抜き差ししても最後まで同じモードで走る。
+  - **電源状態の取得は Rust コマンドではなく、フロントエンドで Battery Status API
+    (`navigator.getBattery()`) を直接使う**（`src/lib/power.ts`）。この API は fingerprinting 懸念で
+    仕様自体は撤回され Firefox/Safari は実装を外したが、Chromium は `getBattery()` を残しており、
+    このアプリが積む WebView2 もその Chromium エンジンなので使える。マイク入力
+    (`getUserMedia`/`AudioContext`) やデバイス変更検知 (`devicechange`) と同じく「フロントエンドがブラウザ
+    API を直接叩く」既存の役割分担に沿っており、WASAPI ループバックのように Web に存在しない機能を
+    Rust 側で足す必要があるケースとは事情が違う。`getBattery` が無い環境／呼び出しが失敗した環境は
+    `"unknown"` として扱い、`effectiveRecordOnly` はこれを常に「解析する」側に倒す
+    （バッテリー状態が分からないことを理由に文字起こしが黙って行われなくなるのは避けたい失敗モードで、
+    自動モードが GPU 時間を節約し損ねるだけの方が安全）。
+  - `powerSource` はストアの非永続フィールドで、`clients.ts` の `watchPowerSource` 購読が起動時から
+    アプリの生存期間ずっと更新し続ける（`onAudioDeviceChange`/`startSleepWatch` と同じ「外部から店へ書き込む
+    グローバル配線」の並び）。電源を挿し直すたびに `setPowerSource` アクションが走り、自動モード中に
+    実効値が「録音のみ→解析」へ変わったときは `updateRecordingMode` が手動トグル OFF 時にしているのと
+    同じモデルの先読みロードを行う——アイドル中に電源を挿した瞬間からロードが始まり、録音ボタンを押した
+    ときには待たされない。
 - **録音中の音声は WAV としてディスクに追記する。** 16kHz f32 は1時間で約230MB あり、全体をメモリに置けない。
   `src/lib/asr/capture.ts` が5秒ぶんずつバッファして Rust 側 (`src-tauri/src/capture.rs`) へ生バイナリ IPC で送り、
   `wav::Writer` が16bit PCM で追記する。書き込みに失敗しても録音と逐次文字起こしは続行する（失うのは第2パスだけ）。

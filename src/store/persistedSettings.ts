@@ -40,9 +40,17 @@ export interface RecordingModeSettings {
    * is that transcription will not run.
    */
   recordOnly: boolean;
+  /**
+   * Ignore `recordOnly` above and decide it fresh at the start of every take
+   * instead, from the machine's current power source: record-only on
+   * battery, the normal analyzed take on mains power. See
+   * `capabilities.ts`'s `effectiveRecordOnly`, the one function that actually
+   * resolves this.
+   */
+  auto: boolean;
 }
 
-export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false };
+export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false, auto: false };
 
 export interface SidebarSettings {
   /** Width of the history sidebar in CSS pixels, always within [MIN, MAX]. */
@@ -155,6 +163,7 @@ const recordingMode = definePersistedSettings<RecordingModeSettings>(
   DEFAULT_RECORDING_MODE,
   (parsed, d) => ({
     recordOnly: typeof parsed.recordOnly === "boolean" ? parsed.recordOnly : d.recordOnly,
+    auto: typeof parsed.auto === "boolean" ? parsed.auto : d.auto,
   }),
 );
 export const loadRecordingMode = recordingMode.load;

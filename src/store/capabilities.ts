@@ -5,11 +5,14 @@
  * Split out of `appStore.ts` (which re-exports all of it, so consumers are
  * unaffected) purely so `selectCapabilities` can be unit-tested: `appStore.ts`
  * pulls in the Tauri IPC client and the whole audio stack at import time,
- * while everything here is plain data with no imports at all. This is the one
- * function in the app whose entire reason for existing is that adding a state
- * must not silently fall through an `===` chain -- so it is also the one most
- * worth an exhaustive test.
+ * while everything here is plain data with a type-only import (`PowerSource`)
+ * and otherwise no imports at all. This is the one function in the app whose
+ * entire reason for existing is that adding a state must not silently fall
+ * through an `===` chain -- so it is also the one most worth an exhaustive
+ * test.
  */
+import type { PowerSource } from "../lib/power";
+import type { RecordingModeSettings } from "./persistedSettings";
 
 /**
  * What the recorder itself is doing -- the app's primary, user-visible state.
@@ -76,6 +79,28 @@ export interface Capabilities {
    * transcriber re-reads `settings` on every window, so switching language
    * while paused would silently decode the rest of the recording differently. */
   editSettings: boolean;
+}
+
+/**
+ * Whether a take started right now would run in record-only mode -- the one
+ * place `RecordingModeSettings.recordOnly` and `.auto` actually get resolved
+ * into the boolean every other capability/action reads.
+ *
+ * Manual mode (`auto: false`) is exactly the stored `recordOnly` flag, same as
+ * before "自動" existed. Auto mode ignores that stored flag and derives it
+ * fresh from the live `powerSource` instead: `"battery"` means record-only,
+ * anything else means the normal analyzed take.
+ *
+ * `"unknown"` (no Battery Status API, or the query failed -- see `lib/power.ts`)
+ * resolves to the analyzed take, not record-only. Battery-driven auto mode
+ * exists to save GPU time the user would not have minded spending anyway
+ * (it's not correctness-critical), whereas silently downgrading a take to
+ * record-only because the browser couldn't answer a question is a transcript
+ * the user never gets back -- so uncertainty here always resolves toward the
+ * safer, more expensive default.
+ */
+export function effectiveRecordOnly(recordingMode: RecordingModeSettings, powerSource: PowerSource): boolean {
+  return recordingMode.auto ? powerSource === "battery" : recordingMode.recordOnly;
 }
 
 export interface CapabilityInputs {

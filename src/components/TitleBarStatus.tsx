@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
-import { useAppStore, activeRecordedSec, type RecordingPhase } from "../store/appStore";
+import { useAppStore, activeRecordedSec, effectiveRecordOnly, type RecordingPhase } from "../store/appStore";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
@@ -64,7 +64,7 @@ export function TitleBarStatus() {
   const refineProgress = useAppStore((s) => s.refineProgress);
   const processingRecordingId = useAppStore((s) => s.processingRecordingId);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
-  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const elapsed = useElapsedRecordingSec(recordingPhase);
 
   // Only resolves once the recording being refined already has a history

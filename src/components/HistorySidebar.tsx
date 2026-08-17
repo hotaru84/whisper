@@ -21,7 +21,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { useConfirmClick } from "./useConfirmClick";
 import { ThemeToggle } from "./ThemeToggle";
 import { SettingsDialog } from "./SettingsDialog";
-import { useAppStore, selectCapabilities } from "../store/appStore";
+import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
 import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
@@ -75,7 +75,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
-  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const can = selectCapabilities({
     recordingPhase,
     processing,
