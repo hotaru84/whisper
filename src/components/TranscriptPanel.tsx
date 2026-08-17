@@ -4,7 +4,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { TranscriptToolbar } from "./TranscriptToolbar";
 import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
-import { useAppStore, selectCapabilities } from "../store/appStore";
+import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
 import { combinedText, type TranscriptSegment } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
 import { cn } from "../lib/utils";
@@ -24,7 +24,7 @@ export function TranscriptPanel() {
   const playback = useAppStore((s) => s.playback);
   const seekTo = useAppStore((s) => s.seekTo);
   const [copied, setCopied] = useState(false);
-  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const can = selectCapabilities({
     recordingPhase,
     processing,

@@ -1,10 +1,10 @@
 /**
  * The two Tauri IPC client singletons the store drives, plus the pieces of
- * global wiring (`onAudioDeviceChange`, `startSleepWatch`) that reach into the
- * store on their own rather than through a store action. Kept apart from
- * `appStore.ts` so "which external client does this" has one obvious home; the
- * recording lifecycle (`appStore.ts`) and the accuracy pipeline
- * (`recordingPipeline.ts`) both import from here.
+ * global wiring (`onAudioDeviceChange`, `startSleepWatch`, `watchPowerSource`)
+ * that reach into the store on their own rather than through a store action.
+ * Kept apart from `appStore.ts` so "which external client does this" has one
+ * obvious home; the recording lifecycle (`appStore.ts`) and the accuracy
+ * pipeline (`recordingPipeline.ts`) both import from here.
  *
  * `useAppStore` is imported for the callbacks below to call, not at module
  * top level -- each callback only runs after the whole module graph
@@ -15,6 +15,7 @@
 import { AsrClient } from "../lib/asr";
 import { AppAudioClient, onAudioDeviceChange } from "../lib/audio";
 import { startSleepWatch } from "../lib/sleepWatch";
+import { watchPowerSource } from "../lib/power";
 import { useAppStore } from "./appStore";
 
 // One instance shared by the app-list refresh and the actual capture start/stop:
@@ -61,4 +62,14 @@ startSleepWatch((gapSec) => {
   useAppStore.setState({
     refineNotice: `PC がスリープしていた約 ${minutes} 分間の音声は録音されていません（前後の音声はつながって記録されます）。`,
   });
+});
+
+// Feeds `powerSource`, which "自動" recording mode reads to decide record-only
+// vs. the normal analyzed take (`capabilities.ts`'s `effectiveRecordOnly`).
+// Routed through the `setPowerSource` action rather than a bare `setState`
+// (unlike the two wirings above) because auto mode has a side effect the
+// store itself owns: warming the model when a live take would no longer need
+// to be record-only -- see that action's own doc comment.
+watchPowerSource((source) => {
+  useAppStore.getState().setPowerSource(source);
 });

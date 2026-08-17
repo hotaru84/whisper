@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { selectCapabilities, type RecordingPhase, type ProcessingPhase, type ModelStatus } from "./capabilities";
+import {
+  selectCapabilities,
+  effectiveRecordOnly,
+  type RecordingPhase,
+  type ProcessingPhase,
+  type ModelStatus,
+} from "./capabilities";
 
 const RECORDING_PHASES: RecordingPhase[] = ["stopped", "recording", "paused"];
 const PROCESSING_PHASES: ProcessingPhase[] = ["transcribing", "refining", "saving", "cancelling", null];
@@ -120,5 +126,23 @@ describe("selectCapabilities", () => {
         }
       }
     }
+  });
+});
+
+describe("effectiveRecordOnly", () => {
+  it("is exactly the chosen mode, regardless of power source", () => {
+    expect(effectiveRecordOnly({ mode: "recordOnly" }, "battery")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "recordOnly" }, "ac")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "analyze" }, "battery")).toBe(false);
+    expect(effectiveRecordOnly({ mode: "analyze" }, "ac")).toBe(false);
+  });
+
+  it("follows the power source in auto mode", () => {
+    expect(effectiveRecordOnly({ mode: "auto" }, "battery")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "auto" }, "ac")).toBe(false);
+  });
+
+  it("resolves an unknown power source to the analyzed take, never record-only", () => {
+    expect(effectiveRecordOnly({ mode: "auto" }, "unknown")).toBe(false);
   });
 });

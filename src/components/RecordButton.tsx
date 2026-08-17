@@ -1,6 +1,6 @@
 import { Mic, Square, Pause, Loader2 } from "lucide-react";
 import { Button } from "./ui/button";
-import { useAppStore, selectCapabilities } from "../store/appStore";
+import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
 import { cn } from "../lib/utils";
 
 /** Both buttons are the same circle, so the pair reads as one control rather
@@ -38,7 +38,7 @@ export function RecordButton({ placement = "hero" }: { placement?: keyof typeof 
   const stopRecording = useAppStore((s) => s.stopRecording);
   const pauseRecording = useAppStore((s) => s.pauseRecording);
   const resumeRecording = useAppStore((s) => s.resumeRecording);
-  const recordOnly = useAppStore((s) => s.recordingMode.recordOnly);
+  const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
 
   if (recordingPhase === "stopped") {

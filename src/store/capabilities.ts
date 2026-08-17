@@ -5,11 +5,14 @@
  * Split out of `appStore.ts` (which re-exports all of it, so consumers are
  * unaffected) purely so `selectCapabilities` can be unit-tested: `appStore.ts`
  * pulls in the Tauri IPC client and the whole audio stack at import time,
- * while everything here is plain data with no imports at all. This is the one
- * function in the app whose entire reason for existing is that adding a state
- * must not silently fall through an `===` chain -- so it is also the one most
- * worth an exhaustive test.
+ * while everything here is plain data with a type-only import (`PowerSource`)
+ * and otherwise no imports at all. This is the one function in the app whose
+ * entire reason for existing is that adding a state must not silently fall
+ * through an `===` chain -- so it is also the one most worth an exhaustive
+ * test.
  */
+import type { PowerSource } from "../lib/power";
+import type { RecordingModeSettings } from "./persistedSettings";
 
 /**
  * What the recorder itself is doing -- the app's primary, user-visible state.
@@ -78,11 +81,41 @@ export interface Capabilities {
   editSettings: boolean;
 }
 
+/**
+ * Whether a take started right now would run in record-only mode -- the one
+ * place `RecordingModeSettings.mode` actually gets resolved into the boolean
+ * every other capability/action reads.
+ *
+ * `"recordOnly"`/`"analyze"` are exactly themselves. `"auto"` ignores the
+ * stored choice and derives it fresh from the live `powerSource` instead:
+ * `"battery"` means record-only, anything else means the normal analyzed
+ * take.
+ *
+ * `"unknown"` (no Battery Status API, or the query failed -- see `lib/power.ts`)
+ * resolves to the analyzed take, not record-only. Battery-driven auto mode
+ * exists to save GPU time the user would not have minded spending anyway
+ * (it's not correctness-critical), whereas silently downgrading a take to
+ * record-only because the browser couldn't answer a question is a transcript
+ * the user never gets back -- so uncertainty here always resolves toward the
+ * safer, more expensive default.
+ */
+export function effectiveRecordOnly(recordingMode: RecordingModeSettings, powerSource: PowerSource): boolean {
+  switch (recordingMode.mode) {
+    case "recordOnly":
+      return true;
+    case "analyze":
+      return false;
+    case "auto":
+      return powerSource === "battery";
+  }
+}
+
 export interface CapabilityInputs {
   recordingPhase: RecordingPhase;
   processing: ProcessingPhase;
   modelStatus: ModelStatus;
-  /** `recordingMode.recordOnly` -- see `RecordingModeSettings` in the store. */
+  /** Already resolved by `effectiveRecordOnly` -- see `RecordingModeSettings`
+   * in the store. */
   recordOnly: boolean;
   /** `AppState.startingRecording` -- true for the async setup window between
    * a record press and `recordingPhase` actually becoming `"recording"`.

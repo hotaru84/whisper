@@ -38,8 +38,9 @@ import type { PlaybackState } from "./playback";
 // The state axes and `selectCapabilities` live in their own import-free module
 // so they can be unit-tested without dragging in the Tauri client and the
 // audio stack -- see capabilities.ts.
-import { selectCapabilities } from "./capabilities";
+import { selectCapabilities, effectiveRecordOnly } from "./capabilities";
 import type { RecordingPhase, ProcessingPhase, ModelStatus } from "./capabilities";
+import type { PowerSource } from "../lib/power";
 import { toErrorMessage } from "../lib/errors";
 import {
   loadSettings,
@@ -56,7 +57,7 @@ import {
   saveSidebarSettings,
   clampSidebarWidth,
 } from "./persistedSettings";
-import type { AsrSettings, RecordingModeSettings, SidebarSettings } from "./persistedSettings";
+import type { AsrSettings, RecordingModeSettings, RecordingModeChoice, SidebarSettings } from "./persistedSettings";
 import {
   setNextSegmentId,
   getTimelineBaseSec,
@@ -81,15 +82,18 @@ import type { TakeFiling } from "./recordingPipeline";
 // Re-exported because this is where every consumer already imports them from.
 export {
   selectCapabilities,
+  effectiveRecordOnly,
   type RecordingPhase,
   type ProcessingPhase,
   type ModelStatus,
   type Capabilities,
   type CapabilityInputs,
 } from "./capabilities";
+export type { PowerSource } from "../lib/power";
 export {
   type AsrSettings,
   type RecordingModeSettings,
+  type RecordingModeChoice,
   type SidebarSettings,
   DEFAULT_RECORDING_MODE,
 } from "./persistedSettings";
@@ -173,6 +177,12 @@ interface AppState {
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
+  /** The machine's current power source, kept live by `clients.ts`'s
+   * `watchPowerSource` wiring for as long as the app runs. Not persisted --
+   * it describes hardware state right now, not a preference. Only meaningful
+   * while `recordingMode.mode === "auto"`; see `effectiveRecordOnly`, which
+   * reads both together. */
+  powerSource: PowerSource;
   /** History sidebar width (resizable, persisted). Always shown on the Home
    * screen and never on Active -- see `App.tsx` -- so this is just layout,
    * not a visibility toggle. */
@@ -216,11 +226,17 @@ interface AppState {
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
-  /** Turning record-only *off* starts loading the model right away rather
-   * than waiting for the next record press: `startRecording` is gated on the
-   * model being ready outside this mode, so without it the button would sit
+  /** Switching to a mode that would need the model (`"analyze"`, or `"auto"`
+   * while currently on mains power) starts loading it right away rather than
+   * waiting for the next record press: `startRecording` is gated on the model
+   * being ready outside record-only mode, so without it the button would sit
    * disabled with nothing on screen explaining why. */
-  updateRecordingMode: (partial: Partial<RecordingModeSettings>) => void;
+  setRecordingMode: (mode: RecordingModeChoice) => void;
+  /** Called only by `clients.ts`'s `watchPowerSource` wiring, whenever the
+   * machine's AC/battery state changes. Not a user action, and not meant to
+   * be called from UI code -- there's nothing for a component to decide
+   * here, only hardware state to record. */
+  setPowerSource: (source: PowerSource) => void;
   /** Live width during a resize drag. Deliberately does *not* persist: this
    * fires on every pointermove, and the drag's final width is committed once
    * on release via `persistSidebarSettings`. */
@@ -303,13 +319,16 @@ interface AppState {
  * object would re-render on every store change).
  */
 function capabilitiesOf(
-  s: Pick<AppState, "recordingPhase" | "processing" | "modelStatus" | "recordingMode" | "startingRecording">,
+  s: Pick<
+    AppState,
+    "recordingPhase" | "processing" | "modelStatus" | "recordingMode" | "startingRecording" | "powerSource"
+  >,
 ) {
   return selectCapabilities({
     recordingPhase: s.recordingPhase,
     processing: s.processing,
     modelStatus: s.modelStatus,
-    recordOnly: s.recordingMode.recordOnly,
+    recordOnly: effectiveRecordOnly(s.recordingMode, s.powerSource),
     startingRecording: s.startingRecording,
   });
 }
@@ -404,11 +423,12 @@ let appAudioActive = false;
 // itself (it also has to stop counting samples -- see `setPaused`); this is
 // the app-audio half of the same gate.
 let recordingPaused = false;
-// `recordingMode.recordOnly` as it was when the current take started. The
-// setting is locked for the duration of a take anyway, but `stopRecording`
-// has to branch on the mode the take actually *ran* in -- reading the store
-// there would let a mode change land between start and stop and send a
-// record-only take down the refine path (or worse, the reverse).
+// The *effective* record-only decision (`effectiveRecordOnly`) as it was when
+// the current take started. Locked for the duration of a take either way --
+// manual or auto -- but `stopRecording` has to branch on the mode the take
+// actually *ran* in -- reading the store (or re-deriving from a `powerSource`
+// that may have since changed) there would let it land between start and stop
+// and send a record-only take down the refine path (or worse, the reverse).
 let recordingRecordOnly = false;
 // Whether `recoverInterruptedRecordings` has already run for this app session.
 // Module state rather than a store field because nothing renders it, and
@@ -485,6 +505,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   vadSettings: loadVadSettings(),
   audioEventSettings: loadAudioEventSettings(),
   recordingMode: loadRecordingMode(),
+  // Real reading arrives shortly after startup via `clients.ts`'s
+  // `watchPowerSource` wiring; "unknown" until then resolves to the analyzed
+  // take everywhere it's read (see `effectiveRecordOnly`), never record-only.
+  powerSource: "unknown",
   sidebar: loadSidebarSettings(),
   levelMeter: null,
   audioInputDevices: [],
@@ -766,8 +790,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // (`viewedRecordingId === null`, nothing being "viewed") must append to
     // `segments`, not wipe them -- see "Existing segments are kept" below.
     if (get().viewedRecordingId !== null) resetToBlankSession(set, get);
-    // Frozen for the whole take -- see `recordingRecordOnly`.
-    const recordOnly = get().recordingMode.recordOnly;
+    // Frozen for the whole take -- see `recordingRecordOnly`. In auto mode
+    // this reads the power source at this exact moment, so a take started
+    // while unplugging the charger runs record-only start to finish even if
+    // the user plugs back in a minute later -- same "decided once, at press
+    // time" contract the manual toggle already had.
+    const recordOnly = effectiveRecordOnly(get().recordingMode, get().powerSource);
     recordingRecordOnly = recordOnly;
     try {
       // Transcribe on the fly: the recorder streams PCM frames into the streaming
@@ -1075,16 +1103,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { audioEventSettings };
     }),
 
-  updateRecordingMode: (partial) => {
-    const recordingMode = { ...get().recordingMode, ...partial };
+  setRecordingMode: (mode) => {
+    const recordingMode: RecordingModeSettings = { mode };
     saveRecordingMode(recordingMode);
     set({ recordingMode });
-    // Leaving record-only mode means the next take needs the model, and
+    // Leaving record-only mode -- picking "解析する" directly, or "自動" while
+    // already on mains power -- means the next take needs the model, and
     // `startRecording` will not enable itself until it is there. Kick the load
     // off now so the wait happens while the user is still setting up rather
     // than when they press record. Failures surface through `modelStatus`
     // exactly as the startup load's do.
-    if (!recordingMode.recordOnly) void ensureModelReady();
+    if (!effectiveRecordOnly(recordingMode, get().powerSource)) void ensureModelReady();
+  },
+
+  setPowerSource: (source) => {
+    set({ powerSource: source });
+    // Mirrors `setRecordingMode`'s own model warm-up: in auto mode the
+    // machine getting plugged in while idle has the same effect on the next
+    // take as the user picking "解析する" by hand, so it gets the same
+    // treatment -- load the model now, not at the next record press.
+    if (get().recordingMode.mode === "auto" && !effectiveRecordOnly(get().recordingMode, source)) {
+      void ensureModelReady();
+    }
   },
 
   setSidebarWidth: (width) =>
