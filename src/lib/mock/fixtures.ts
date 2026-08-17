@@ -104,10 +104,11 @@ export const MOCK_AUDIO_APPS: AudioAppInfo[] = [
 
 // --- User-facing copy ---------------------------------------------------
 
-/** Why the 保存 menu's two export items are disabled in the browser preview
- * (both need a native save dialog). Shown as their `title`. */
-export const MOCK_EXPORT_UNAVAILABLE =
-  "ブラウザプレビューでは保存できません（ネイティブの保存ダイアログが必要です）";
+/** Why anything needing a native dialog, file manager, or filesystem access
+ * outside the app's own sandbox (the auto-save folder picker, "open folder"
+ * links) is disabled in the browser preview. Shown as their `title`. */
+export const MOCK_NATIVE_FEATURE_UNAVAILABLE =
+  "ブラウザプレビューでは利用できません（ネイティブ機能が必要です）";
 
 /** The mock badge's tooltip, in the titlebar. */
 export const MOCK_BADGE_TITLE =

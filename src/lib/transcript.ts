@@ -190,8 +190,8 @@ export function normalizeForCollapse(text: string): string {
  * `lib/export/srt.ts`, which does the same thing for SRT export -- this is
  * the equivalent for everywhere else a transcript is shown or copied
  * (`TranscriptPanel`, which both the live view and history view render
- * through, `HistorySidebar`'s row-level copy, and `saveTranscript`'s .txt
- * export).
+ * through, `HistorySidebar`'s row-level copy, and `autoSave.ts`'s .txt
+ * auto-save).
  *
  * Purely a rendering transform: never mutates its input and is never fed
  * back into the store's own `segments`. History persistence, the segment

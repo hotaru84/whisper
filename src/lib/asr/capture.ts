@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WHISPER_SAMPLE_RATE } from "../audio/resample";
 import { useMockBackend } from "../env";
 import { rememberMockDuration } from "../mock/fixtures";
+import { getRecordingDirectory } from "../recordingLocation";
 
 /**
  * How much audio to accumulate before handing it to the backend.
@@ -55,7 +56,7 @@ export class RecordingCapture {
       this.mockStartedAt = Date.now();
       return `mock-recordings/${name}.wav`;
     }
-    return await invoke<string>("start_capture", { name });
+    return await invoke<string>("start_capture", { name, directory: getRecordingDirectory() || null });
   }
 
   /** Buffers one captured PCM frame, flushing once FLUSH_SEC has accumulated. */

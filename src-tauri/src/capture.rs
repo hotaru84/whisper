@@ -51,12 +51,20 @@ fn sanitize_stem(name: &str) -> String {
     }
 }
 
-fn recording_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| format!("cannot resolve the cache directory: {e}"))?;
-    Ok(dir.join("recordings").join(format!("{}.wav", sanitize_stem(name))))
+/// `directory`, when non-empty, is a user-configured folder (see
+/// `AutoSaveSettings` on the frontend) that the recording is written to
+/// directly, in place of the app's own cache directory -- so no
+/// `"recordings"` subfolder is appended in that case, unlike the default.
+fn recording_path(app: &AppHandle, name: &str, directory: Option<&str>) -> Result<PathBuf, String> {
+    let dir = match directory {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| format!("cannot resolve the cache directory: {e}"))?
+            .join("recordings"),
+    };
+    Ok(dir.join(format!("{}.wav", sanitize_stem(name))))
 }
 
 /// Opens a WAV file for the recording that is about to start, returning its path.
@@ -64,9 +72,9 @@ fn recording_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
 /// Any file already open is dropped, which closes it. Its data stays on disk:
 /// discarding a previous recording is the user's call, not ours.
 #[tauri::command]
-pub async fn start_capture(app: AppHandle, name: String) -> Result<String, String> {
+pub async fn start_capture(app: AppHandle, name: String, directory: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let path = recording_path(&app, &name)?;
+        let path = recording_path(&app, &name, directory.as_deref())?;
         let writer = wav::Writer::create(&path)?;
         let display = writer.path().display().to_string();
         *app.state::<CaptureState>().0.lock().unwrap() = Some(writer);
@@ -121,9 +129,9 @@ pub async fn append_capture(app: AppHandle, request: Request<'_>) -> Result<(), 
 /// `recording_path` the writer uses, so this cannot be pointed at an arbitrary
 /// file on disk.
 #[tauri::command]
-pub async fn recording_duration_sec(app: AppHandle, name: String) -> Result<f32, String> {
+pub async fn recording_duration_sec(app: AppHandle, name: String, directory: Option<String>) -> Result<f32, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let path = recording_path(&app, &name)?;
+        let path = recording_path(&app, &name, directory.as_deref())?;
         wav::duration_sec(&path)
     })
     .await

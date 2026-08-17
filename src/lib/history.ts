@@ -1,10 +1,12 @@
 import { readDir, readTextFile, writeTextFile, remove, exists } from "@tauri-apps/plugin-fs";
 import { appCacheDir, join } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { TranscriptSegment } from "./transcript";
 import type { AudioEvent } from "./asr";
 import { useMockBackend } from "./env";
 import { rememberMockDuration, seedMockRecordings } from "./mock/fixtures";
+import { getRecordingDirectory } from "./recordingLocation";
 
 /**
  * Persists finished recordings so the history sidebar can browse them across
@@ -81,7 +83,14 @@ export interface StoredRecording {
 // microphone recording -- see `seedMockRecordings`' doc comment.
 const mockStore = new Map<string, StoredRecording>(useMockBackend ? seedMockRecordings() : []);
 
+/** Follows the user's configured auto-save folder (`AutoSaveSettings.directory`
+ * via `recordingLocation.ts`) when one is set, falling back to the app's own
+ * cache directory otherwise -- the same choice `capture.rs`'s `recording_path`
+ * makes on the Rust side, kept in sync so the frontend looks in the same
+ * place the WAV actually landed. */
 async function recordingsDir(): Promise<string> {
+  const configured = getRecordingDirectory();
+  if (configured) return configured;
   return join(await appCacheDir(), "recordings");
 }
 
@@ -97,6 +106,20 @@ async function jsonPath(id: string): Promise<string> {
 export async function wavPath(id: string): Promise<string> {
   if (useMockBackend) return `mock-recordings/${id}.wav`;
   return join(await recordingsDir(), `${id}.wav`);
+}
+
+/** Opens the OS file manager on this recording's WAV, so the user can find
+ * the folder it (and its sidecar JSON / auto-saved transcript, if any) live
+ * in -- whichever folder that currently is, internal cache or a configured
+ * auto-save directory (see `recordingsDir`). A plain browser tab has no file
+ * manager to hand off to, so this is a no-op there, same as every other
+ * native-only action in this module. */
+export async function openRecordingFolder(id: string): Promise<void> {
+  if (useMockBackend) {
+    console.info("[mock] revealing a recording's folder is unavailable in the browser preview");
+    return;
+  }
+  await revealItemInDir(await wavPath(id));
 }
 
 /** Inverse of `capture.ts`'s `defaultName`. Returns `null` for a filename
@@ -274,7 +297,10 @@ export async function recoverInterruptedRecordings(language: string): Promise<st
     try {
       // Reads the WAV's header, not its samples -- these files run to
       // hundreds of megabytes (see `recording_duration_sec` in capture.rs).
-      const durationSec = await invoke<number>("recording_duration_sec", { name: id });
+      const durationSec = await invoke<number>("recording_duration_sec", {
+        name: id,
+        directory: getRecordingDirectory() || null,
+      });
       if (durationSec < MIN_RECOVERABLE_SEC) continue;
       await saveRecordingHistory(id, {
         durationSec,

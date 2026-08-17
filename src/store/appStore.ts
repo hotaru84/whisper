@@ -56,8 +56,17 @@ import {
   loadSidebarSettings,
   saveSidebarSettings,
   clampSidebarWidth,
+  loadAutoSaveSettings,
+  saveAutoSaveSettings,
 } from "./persistedSettings";
-import type { AsrSettings, RecordingModeSettings, RecordingModeChoice, SidebarSettings } from "./persistedSettings";
+import type {
+  AsrSettings,
+  RecordingModeSettings,
+  RecordingModeChoice,
+  SidebarSettings,
+  AutoSaveSettings,
+} from "./persistedSettings";
+import { setRecordingDirectory } from "../lib/recordingLocation";
 import {
   setNextSegmentId,
   getTimelineBaseSec,
@@ -95,6 +104,7 @@ export {
   type RecordingModeSettings,
   type RecordingModeChoice,
   type SidebarSettings,
+  type AutoSaveSettings,
   DEFAULT_RECORDING_MODE,
 } from "./persistedSettings";
 export { type PlaybackState } from "./playback";
@@ -177,6 +187,9 @@ interface AppState {
   vadSettings: VadSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
+  /** Where recordings/transcripts get auto-saved -- see its own doc comment
+   * in persistedSettings.ts. */
+  autoSaveSettings: AutoSaveSettings;
   /** The machine's current power source, kept live by `clients.ts`'s
    * `watchPowerSource` wiring for as long as the app runs. Not persisted --
    * it describes hardware state right now, not a preference. Only meaningful
@@ -226,6 +239,7 @@ interface AppState {
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
+  updateAutoSaveSettings: (partial: Partial<AutoSaveSettings>) => void;
   /** Switching to a mode that would need the model (`"analyze"`, or `"auto"`
    * while currently on mains power) starts loading it right away rather than
    * waiting for the next record press: `startRecording` is gated on the model
@@ -484,6 +498,14 @@ export function activeRecordedSec(): number | null {
   return activeRecorder ? activeRecorder.capturedSamples() / WHISPER_SAMPLE_RATE : null;
 }
 
+// Read once at module load and pushed into `recordingLocation.ts` immediately
+// (rather than left for the first `set()`), so `capture.ts`'s very first
+// `start()` call already sees a configured auto-save folder if one exists --
+// otherwise a take started before any state update would land would silently
+// still go to the internal cache dir.
+const initialAutoSaveSettings = loadAutoSaveSettings();
+setRecordingDirectory(initialAutoSaveSettings.enabled ? initialAutoSaveSettings.directory : "");
+
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
   startingRecording: false,
@@ -505,6 +527,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vadSettings: loadVadSettings(),
   audioEventSettings: loadAudioEventSettings(),
   recordingMode: loadRecordingMode(),
+  autoSaveSettings: initialAutoSaveSettings,
   // Real reading arrives shortly after startup via `clients.ts`'s
   // `watchPowerSource` wiring; "unknown" until then resolves to the analyzed
   // take everywhere it's read (see `effectiveRecordOnly`), never record-only.
@@ -1104,6 +1127,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       const audioEventSettings = { ...s.audioEventSettings, ...partial };
       saveAudioEventSettings(audioEventSettings);
       return { audioEventSettings };
+    }),
+
+  updateAutoSaveSettings: (partial) =>
+    set((s) => {
+      const autoSaveSettings = { ...s.autoSaveSettings, ...partial };
+      saveAutoSaveSettings(autoSaveSettings);
+      setRecordingDirectory(autoSaveSettings.enabled ? autoSaveSettings.directory : "");
+      return { autoSaveSettings };
     }),
 
   setRecordingMode: (mode) => {
