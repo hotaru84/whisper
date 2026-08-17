@@ -391,16 +391,27 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
     依存を持たない `src/store/capabilities.ts` に切り出してある。これは「状態を1つ足すと `===` 連鎖から
     静かに漏れる」ことを防ぐための関数で、そのぶんテストの価値が高いので、mock 不要な純粋関数として
     単体テスト可能にする目的が大きい（`capabilities.test.ts`）。
-  - **「自動」モードは `recordOnly` の手動値を電源状態から都度導出する値で置き換えるだけで、0パス目の
-    実装には一切触れない。** `recordingMode`（`RecordingModeSettings`）に `auto: boolean` を追加し、
-    `capabilities.ts` の `effectiveRecordOnly(recordingMode, powerSource)` が「`auto` が立っていれば
-    `powerSource === "battery"`、そうでなければ手動の `recordOnly` をそのまま使う」を1箇所で解決する。
-    `startRecording`/`capabilitiesOf`/`App.tsx` の起動時 `initModel()` 判定/`TitleBarStatus` の
-    アイドルチップ/`RecordButton`・`TranscriptPanel`・`HistorySidebar` の `selectCapabilities` 呼び出しは
-    すべてこの関数を通すだけで、`recordingMode.recordOnly` を直接読んでいた箇所を置き換えた。
-    `recordingRecordOnly`（`startRecording` 時点で凍結される実効値）の意味もそのまま「その take が実際に
-    どちらのモードで走ったか」で変わらない——自動モードでも録音開始の瞬間に一度だけ解決し、take の途中で
-    電源を抜き差ししても最後まで同じモードで走る。
+  - **録音モードは「自動」「録音のみ」「録音と解析」の3択1つの `RecordStartPanel` のドロップダウン
+    （`RecordingModePicker`）で、この3つは互いに排他な選択肢であって独立した2つの設定ではない。**
+    実装当初は「録音のみ」トグルと「自動」トグルという独立した2つのボタンだったが、それだと
+    「自動が立っているときは録音のみボタンを無効化して実効値だけ表示する」という余分な状態管理が要る
+    うえ、UI上も2つ並んだボタンが実質1つの選択を表しているという不整合があったため、ボタン2つを
+    ドロップダウン1つに統合した。ストア側もそれに合わせて `recordingMode`（`RecordingModeSettings`）を
+    独立した2つの boolean（`recordOnly`/`auto`）から単一のタグ `mode: "recordOnly" | "analyze" | "auto"`
+    に変更している——UIが1択なら状態も1つであるべきで、2booleanのままドロップダウンだけ被せると
+    「両方false」のような存在しないはずの組み合わせが型上は表現できてしまう。0パス目（`finishRecordOnly`
+    などの録音のみ固有の実装）自体には一切触れていない。
+    `capabilities.ts` の `effectiveRecordOnly(recordingMode, powerSource)` が
+    「`mode === "auto"` なら `powerSource === "battery"`、`"recordOnly"`/`"analyze"` ならそれ自身」を
+    1箇所で解決する。`startRecording`/`capabilitiesOf`/`App.tsx` の起動時 `initModel()` 判定/
+    `TitleBarStatus` のアイドルチップ/`RecordButton`・`TranscriptPanel`・`HistorySidebar` の
+    `selectCapabilities` 呼び出しはすべてこの関数を通すだけで、`recordingMode.recordOnly` を直接
+    読んでいた箇所を置き換えた。`recordingRecordOnly`（`startRecording` 時点で凍結される実効値）の
+    意味もそのまま「その take が実際にどちらのモードで走ったか」で変わらない——自動モードでも
+    録音開始の瞬間に一度だけ解決し、take の途中で電源を抜き差ししても最後まで同じモードで走る。
+    永続化（`persistedSettings.ts`）は旧形式（`recordOnly`/`auto` の2 boolean）を読めた場合は
+    `mode` へ変換して引き継ぐ移行処理を入れており、アップグレードで既存の設定が黙ってリセットされる
+    ことはない。
   - **電源状態の取得は Rust コマンドではなく、フロントエンドで Battery Status API
     (`navigator.getBattery()`) を直接使う**（`src/lib/power.ts`）。この API は fingerprinting 懸念で
     仕様自体は撤回され Firefox/Safari は実装を外したが、Chromium は `getBattery()` を残しており、
@@ -414,7 +425,7 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
   - `powerSource` はストアの非永続フィールドで、`clients.ts` の `watchPowerSource` 購読が起動時から
     アプリの生存期間ずっと更新し続ける（`onAudioDeviceChange`/`startSleepWatch` と同じ「外部から店へ書き込む
     グローバル配線」の並び）。電源を挿し直すたびに `setPowerSource` アクションが走り、自動モード中に
-    実効値が「録音のみ→解析」へ変わったときは `updateRecordingMode` が手動トグル OFF 時にしているのと
+    実効値が「録音のみ→解析」へ変わったときは `setRecordingMode` が「録音と解析」を直接選んだときと
     同じモデルの先読みロードを行う——アイドル中に電源を挿した瞬間からロードが始まり、録音ボタンを押した
     ときには待たされない。
 - **録音中の音声は WAV としてディスクに追記する。** 16kHz f32 は1時間で約230MB あり、全体をメモリに置けない。

@@ -81,11 +81,11 @@ function App() {
     // Skipped entirely in (effective) record-only mode -- loading the model is
     // the cost that mode exists to avoid, and nothing in a record-only session
     // needs it. `rerunHistoryEntry` loads it on demand if the user asks for an
-    // analysis later, and leaving the mode loads it right away
-    // (`updateRecordingMode`/`setPowerSource`). In auto mode this reads
-    // whatever `powerSource` happens to be at this exact tick -- "unknown"
-    // (before the first battery reading lands) resolves to the analyzed take,
-    // same safe default as everywhere else `effectiveRecordOnly` is read.
+    // analysis later, and switching away from this mode loads it right away
+    // (`setRecordingMode`/`setPowerSource`). In auto mode this reads whatever
+    // `powerSource` happens to be at this exact tick -- "unknown" (before the
+    // first battery reading lands) resolves to the analyzed take, same safe
+    // default as everywhere else `effectiveRecordOnly` is read.
     const { recordingMode, powerSource } = useAppStore.getState();
     if (!effectiveRecordOnly(recordingMode, powerSource)) void initModel();
     // Listable (with placeholder labels) even before microphone permission is

@@ -83,13 +83,13 @@ export interface Capabilities {
 
 /**
  * Whether a take started right now would run in record-only mode -- the one
- * place `RecordingModeSettings.recordOnly` and `.auto` actually get resolved
- * into the boolean every other capability/action reads.
+ * place `RecordingModeSettings.mode` actually gets resolved into the boolean
+ * every other capability/action reads.
  *
- * Manual mode (`auto: false`) is exactly the stored `recordOnly` flag, same as
- * before "自動" existed. Auto mode ignores that stored flag and derives it
- * fresh from the live `powerSource` instead: `"battery"` means record-only,
- * anything else means the normal analyzed take.
+ * `"recordOnly"`/`"analyze"` are exactly themselves. `"auto"` ignores the
+ * stored choice and derives it fresh from the live `powerSource` instead:
+ * `"battery"` means record-only, anything else means the normal analyzed
+ * take.
  *
  * `"unknown"` (no Battery Status API, or the query failed -- see `lib/power.ts`)
  * resolves to the analyzed take, not record-only. Battery-driven auto mode
@@ -100,14 +100,22 @@ export interface Capabilities {
  * safer, more expensive default.
  */
 export function effectiveRecordOnly(recordingMode: RecordingModeSettings, powerSource: PowerSource): boolean {
-  return recordingMode.auto ? powerSource === "battery" : recordingMode.recordOnly;
+  switch (recordingMode.mode) {
+    case "recordOnly":
+      return true;
+    case "analyze":
+      return false;
+    case "auto":
+      return powerSource === "battery";
+  }
 }
 
 export interface CapabilityInputs {
   recordingPhase: RecordingPhase;
   processing: ProcessingPhase;
   modelStatus: ModelStatus;
-  /** `recordingMode.recordOnly` -- see `RecordingModeSettings` in the store. */
+  /** Already resolved by `effectiveRecordOnly` -- see `RecordingModeSettings`
+   * in the store. */
   recordOnly: boolean;
   /** `AppState.startingRecording` -- true for the async setup window between
    * a record press and `recordingPhase` actually becoming `"recording"`.

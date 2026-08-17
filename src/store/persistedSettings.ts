@@ -28,29 +28,32 @@ export interface AsrSettings {
   inputDeviceId: string;
 }
 
-export interface RecordingModeSettings {
-  /**
-   * Record the audio and nothing else: no model load, no live transcription,
+/**
+ * What the *next* take does, picked from one dropdown in `RecordStartPanel`
+ * (`RecordingModePicker`) -- the three choices are mutually exclusive, so this
+ * is a single tag rather than the two independent booleans (`recordOnly`,
+ * `auto`) it used to be.
+ */
+export type RecordingModeChoice =
+  /** Record the audio and nothing else: no model load, no live transcription,
    * no audio tagging. The WAV still lands on disk exactly as it always does,
    * and the take shows up in history as an unanalyzed entry the user can
-   * transcribe later (`rerunHistoryEntry`, which loads the model on demand).
-   *
-   * Named for what it *does* rather than for its effect: "power saving"
-   * describes the outcome, but what the user needs to know before flipping it
-   * is that transcription will not run.
-   */
-  recordOnly: boolean;
-  /**
-   * Ignore `recordOnly` above and decide it fresh at the start of every take
-   * instead, from the machine's current power source: record-only on
-   * battery, the normal analyzed take on mains power. See
-   * `capabilities.ts`'s `effectiveRecordOnly`, the one function that actually
-   * resolves this.
-   */
-  auto: boolean;
+   * transcribe later (`rerunHistoryEntry`, which loads the model on demand). */
+  | "recordOnly"
+  /** The normal take: live transcription while recording, then the full
+   * refine/diarize/audio-tag pass once it stops. */
+  | "analyze"
+  /** Decide between the two above fresh at the start of every take, from the
+   * machine's current power source: `recordOnly` on battery, `analyze` on
+   * mains power. See `capabilities.ts`'s `effectiveRecordOnly`, the one
+   * function that actually resolves this. */
+  | "auto";
+
+export interface RecordingModeSettings {
+  mode: RecordingModeChoice;
 }
 
-export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { recordOnly: false, auto: false };
+export const DEFAULT_RECORDING_MODE: RecordingModeSettings = { mode: "analyze" };
 
 export interface SidebarSettings {
   /** Width of the history sidebar in CSS pixels, always within [MIN, MAX]. */
@@ -161,10 +164,22 @@ export const saveAudioEventSettings = audioEventSettings.save;
 const recordingMode = definePersistedSettings<RecordingModeSettings>(
   "recording-mode-settings",
   DEFAULT_RECORDING_MODE,
-  (parsed, d) => ({
-    recordOnly: typeof parsed.recordOnly === "boolean" ? parsed.recordOnly : d.recordOnly,
-    auto: typeof parsed.auto === "boolean" ? parsed.auto : d.auto,
-  }),
+  (parsed, d) => {
+    if (parsed.mode === "recordOnly" || parsed.mode === "analyze" || parsed.mode === "auto") {
+      return { mode: parsed.mode };
+    }
+    // Migrates the shape this setting had before the three choices became one
+    // dropdown (independent `recordOnly`/`auto` booleans), so upgrading the
+    // app does not silently reset a preference someone already set. `parsed`
+    // is only *typed* as `Partial<RecordingModeSettings>` -- the object
+    // JSON.parse actually produced from an older version's localStorage entry
+    // still has the old fields at runtime, just not in the new type, hence
+    // the cast to read them.
+    const legacy = parsed as unknown as { recordOnly?: unknown; auto?: unknown };
+    if (legacy.auto === true) return { mode: "auto" };
+    if (typeof legacy.recordOnly === "boolean") return { mode: legacy.recordOnly ? "recordOnly" : "analyze" };
+    return d;
+  },
 );
 export const loadRecordingMode = recordingMode.load;
 export const saveRecordingMode = recordingMode.save;

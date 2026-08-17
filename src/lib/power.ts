@@ -1,8 +1,9 @@
 /**
- * Reports whether the machine is running on battery or mains power, for
- * "自動" recording mode (`RecordingModeSettings.auto`): record-only while on
- * battery, the normal analyzed take otherwise -- see `capabilities.ts`'s
- * `effectiveRecordOnly`, the one place that decision is actually made.
+ * Reports whether the machine is running on battery or mains power, for the
+ * "自動" recording mode choice (`RecordingModeSettings.mode === "auto"`):
+ * record-only while on battery, the normal analyzed take otherwise -- see
+ * `capabilities.ts`'s `effectiveRecordOnly`, the one place that decision is
+ * actually made.
  *
  * Uses the (non-standard) Battery Status API rather than a Tauri/Rust command.
  * The spec was withdrawn over fingerprinting concerns and Firefox/Safari

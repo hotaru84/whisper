@@ -57,7 +57,7 @@ import {
   saveSidebarSettings,
   clampSidebarWidth,
 } from "./persistedSettings";
-import type { AsrSettings, RecordingModeSettings, SidebarSettings } from "./persistedSettings";
+import type { AsrSettings, RecordingModeSettings, RecordingModeChoice, SidebarSettings } from "./persistedSettings";
 import {
   setNextSegmentId,
   getTimelineBaseSec,
@@ -93,6 +93,7 @@ export type { PowerSource } from "../lib/power";
 export {
   type AsrSettings,
   type RecordingModeSettings,
+  type RecordingModeChoice,
   type SidebarSettings,
   DEFAULT_RECORDING_MODE,
 } from "./persistedSettings";
@@ -179,8 +180,8 @@ interface AppState {
   /** The machine's current power source, kept live by `clients.ts`'s
    * `watchPowerSource` wiring for as long as the app runs. Not persisted --
    * it describes hardware state right now, not a preference. Only meaningful
-   * while `recordingMode.auto` is on; see `effectiveRecordOnly`, which reads
-   * both together. */
+   * while `recordingMode.mode === "auto"`; see `effectiveRecordOnly`, which
+   * reads both together. */
   powerSource: PowerSource;
   /** History sidebar width (resizable, persisted). Always shown on the Home
    * screen and never on Active -- see `App.tsx` -- so this is just layout,
@@ -225,11 +226,12 @@ interface AppState {
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
-  /** Turning record-only *off* starts loading the model right away rather
-   * than waiting for the next record press: `startRecording` is gated on the
-   * model being ready outside this mode, so without it the button would sit
+  /** Switching to a mode that would need the model (`"analyze"`, or `"auto"`
+   * while currently on mains power) starts loading it right away rather than
+   * waiting for the next record press: `startRecording` is gated on the model
+   * being ready outside record-only mode, so without it the button would sit
    * disabled with nothing on screen explaining why. */
-  updateRecordingMode: (partial: Partial<RecordingModeSettings>) => void;
+  setRecordingMode: (mode: RecordingModeChoice) => void;
   /** Called only by `clients.ts`'s `watchPowerSource` wiring, whenever the
    * machine's AC/battery state changes. Not a user action, and not meant to
    * be called from UI code -- there's nothing for a component to decide
@@ -1101,11 +1103,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { audioEventSettings };
     }),
 
-  updateRecordingMode: (partial) => {
-    const recordingMode = { ...get().recordingMode, ...partial };
+  setRecordingMode: (mode) => {
+    const recordingMode: RecordingModeSettings = { mode };
     saveRecordingMode(recordingMode);
     set({ recordingMode });
-    // Leaving record-only mode -- manually, or by flipping "自動" on while
+    // Leaving record-only mode -- picking "解析する" directly, or "自動" while
     // already on mains power -- means the next take needs the model, and
     // `startRecording` will not enable itself until it is there. Kick the load
     // off now so the wait happens while the user is still setting up rather
@@ -1116,11 +1118,11 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setPowerSource: (source) => {
     set({ powerSource: source });
-    // Mirrors `updateRecordingMode`'s own model warm-up: in auto mode the
+    // Mirrors `setRecordingMode`'s own model warm-up: in auto mode the
     // machine getting plugged in while idle has the same effect on the next
-    // take as the user flipping "録音のみ" off by hand, so it gets the same
+    // take as the user picking "解析する" by hand, so it gets the same
     // treatment -- load the model now, not at the next record press.
-    if (get().recordingMode.auto && !effectiveRecordOnly(get().recordingMode, source)) {
+    if (get().recordingMode.mode === "auto" && !effectiveRecordOnly(get().recordingMode, source)) {
       void ensureModelReady();
     }
   },

@@ -130,19 +130,19 @@ describe("selectCapabilities", () => {
 });
 
 describe("effectiveRecordOnly", () => {
-  it("is exactly the stored flag when auto mode is off", () => {
-    expect(effectiveRecordOnly({ recordOnly: true, auto: false }, "battery")).toBe(true);
-    expect(effectiveRecordOnly({ recordOnly: true, auto: false }, "ac")).toBe(true);
-    expect(effectiveRecordOnly({ recordOnly: false, auto: false }, "battery")).toBe(false);
-    expect(effectiveRecordOnly({ recordOnly: false, auto: false }, "ac")).toBe(false);
+  it("is exactly the chosen mode, regardless of power source", () => {
+    expect(effectiveRecordOnly({ mode: "recordOnly" }, "battery")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "recordOnly" }, "ac")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "analyze" }, "battery")).toBe(false);
+    expect(effectiveRecordOnly({ mode: "analyze" }, "ac")).toBe(false);
   });
 
-  it("ignores the stored flag and follows the power source when auto mode is on", () => {
-    expect(effectiveRecordOnly({ recordOnly: false, auto: true }, "battery")).toBe(true);
-    expect(effectiveRecordOnly({ recordOnly: true, auto: true }, "ac")).toBe(false);
+  it("follows the power source in auto mode", () => {
+    expect(effectiveRecordOnly({ mode: "auto" }, "battery")).toBe(true);
+    expect(effectiveRecordOnly({ mode: "auto" }, "ac")).toBe(false);
   });
 
   it("resolves an unknown power source to the analyzed take, never record-only", () => {
-    expect(effectiveRecordOnly({ recordOnly: true, auto: true }, "unknown")).toBe(false);
+    expect(effectiveRecordOnly({ mode: "auto" }, "unknown")).toBe(false);
   });
 });
