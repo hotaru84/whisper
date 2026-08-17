@@ -1,22 +1,15 @@
 import {
-  ChevronDown,
   Copy,
-  Download,
   Check,
+  FolderOpen,
   Trash2,
   RotateCw,
   XCircle,
 } from "lucide-react";
 import { Button } from "./ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "./ui/dropdown-menu";
 import { useConfirmClick } from "./useConfirmClick";
 import { useMockBackend } from "../lib/env";
-import { MOCK_EXPORT_UNAVAILABLE as EXPORT_UNAVAILABLE } from "../lib/mock/fixtures";
+import { MOCK_NATIVE_FEATURE_UNAVAILABLE } from "../lib/mock/fixtures";
 
 /**
  * Deleting a recording is the same operation the history sidebar's row button
@@ -49,12 +42,15 @@ function DeleteHistoryButton({
 }
 
 /**
- * The transcript's action row: copy/export, and the two history-only actions
- * (reanalyze, delete) that only make sense once there is a recording behind
- * what's on screen. `reanalyze`/`deleteHistory` are left `undefined` by the
+ * The transcript's action row: copy (always available once there's text),
+ * and three history-only actions (open folder, reanalyze, delete) that only
+ * make sense once there is a recording behind what's on screen.
+ * `openFolder`/`reanalyze`/`deleteHistory` are left `undefined` by the
  * caller (`TranscriptPanel`) exactly when that recording doesn't exist yet --
  * a plain presentational split, so this component never has to know why a
- * button might not apply.
+ * button might not apply. WAV/transcript files themselves are written
+ * automatically (see `AutoSaveSettings`), so there is no manual save/export
+ * button here any more.
  *
  * `reanalyze.mode` doubles this one button as the accuracy pass's cancel
  * control: while the recording currently on screen is the one being
@@ -66,14 +62,17 @@ export function TranscriptToolbar({
   hasTranscript,
   copied,
   onCopy,
-  onExport,
+  openFolder,
   reanalyze,
   deleteHistory,
 }: {
   hasTranscript: boolean;
   copied: boolean;
   onCopy: () => void;
-  onExport: (format: "txt" | "srt") => void;
+  /** Undefined exactly when there is no recording behind what's on screen
+   * yet to open a folder for -- same condition `reanalyze`/`deleteHistory`
+   * use, see this component's own doc comment. */
+  openFolder?: { onClick: () => void; disabled: boolean };
   reanalyze?: {
     mode: "reanalyze" | "cancel";
     onClick: () => void;
@@ -83,49 +82,32 @@ export function TranscriptToolbar({
 }) {
   return (
     <div className="flex justify-end gap-2">
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={!hasTranscript}
-          >
-            {copied ? (
-              <Check className="h-4 w-4" />
-            ) : (
-              <Download className="h-4 w-4" />
-            )}
-            保存
-            <ChevronDown className="h-3.5 w-3.5" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          <DropdownMenuItem onSelect={onCopy}>
-            <Copy className="h-4 w-4" />
-            コピー
-          </DropdownMenuItem>
-          {/* Saving needs a native file dialog, which a plain browser tab
-              does not have -- disabled rather than silently doing nothing in
-              the browser preview. See lib/env.ts. */}
-          <DropdownMenuItem
-            onSelect={() => onExport("txt")}
-            disabled={useMockBackend}
-            title={useMockBackend ? EXPORT_UNAVAILABLE : undefined}
-          >
-            <Download className="h-4 w-4" />
-            .txt として保存
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => onExport("srt")}
-            disabled={useMockBackend}
-            title={useMockBackend ? EXPORT_UNAVAILABLE : undefined}
-          >
-            <Download className="h-4 w-4" />
-            .srt として保存
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={onCopy}
+        disabled={!hasTranscript}
+      >
+        {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+        コピー
+      </Button>
+      {openFolder && (
+        // Needs a native file manager, which a plain browser tab does not
+        // have -- disabled rather than silently doing nothing in the browser
+        // preview. See lib/env.ts.
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={openFolder.onClick}
+          disabled={openFolder.disabled || useMockBackend}
+          title={useMockBackend ? MOCK_NATIVE_FEATURE_UNAVAILABLE : "この録音が保存されているフォルダを開きます"}
+        >
+          <FolderOpen className="h-4 w-4" />
+          フォルダを開く
+        </Button>
+      )}
       {reanalyze &&
         (reanalyze.mode === "cancel" ? (
           <Button

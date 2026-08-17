@@ -24,6 +24,7 @@ import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE } from "../lib/asr";
 import { SILENCE_RMS } from "../lib/asr/diagnostics";
 import { nonBlankChunks, projectOntoNonBlankChunks, segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory } from "../lib/history";
+import { autoSaveTranscript } from "../lib/export/autoSave";
 import { toErrorMessage } from "../lib/errors";
 import type { AsrSettings } from "./persistedSettings";
 import { asrClient } from "./clients";
@@ -250,6 +251,24 @@ async function persistTake(
     await saveRecordingHistory(recordingId, entry);
     await useAppStore.getState().refreshRecordingHistory();
     markRecordingViewed(recordingId);
+    // Best-effort, same as the history write above: a failure here loses
+    // only this take's auto-saved copy, not anything already on screen or
+    // already filed in history.
+    if (entry.transcribed && entry.segments.length > 0) {
+      const { autoSaveSettings } = useAppStore.getState();
+      if (autoSaveSettings.enabled && autoSaveSettings.directory) {
+        try {
+          await autoSaveTranscript(
+            entry.segments,
+            recordingId,
+            autoSaveSettings.directory,
+            autoSaveSettings.transcriptFormat,
+          );
+        } catch (err) {
+          console.warn(`[autosave] failed to write transcript for ${recordingId}:`, err);
+        }
+      }
+    }
     return true;
   } catch (err) {
     useAppStore.setState({

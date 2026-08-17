@@ -6,7 +6,7 @@ import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
 import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
 import { combinedText, collapseDegenerateSegments, type TranscriptSegment } from "../lib/transcript";
-import { saveTranscript } from "../lib/export/saveTranscript";
+import { openRecordingFolder } from "../lib/history";
 import { cn } from "../lib/utils";
 
 export function TranscriptPanel() {
@@ -99,18 +99,17 @@ export function TranscriptPanel() {
     setTimeout(() => setCopied(false), 1500);
   };
 
-  const handleExport = async (format: "txt" | "srt") => {
-    if (!hasTranscript) return;
-    await saveTranscript(segments, format);
-  };
-
   return (
     <div className="flex w-full min-h-0 flex-1 flex-col gap-3 rounded-lg border border-border p-4">
       <TranscriptToolbar
         hasTranscript={hasTranscript}
         copied={copied}
         onCopy={() => void handleCopy()}
-        onExport={(format) => void handleExport(format)}
+        openFolder={
+          currentRecordingId
+            ? { onClick: () => void openRecordingFolder(currentRecordingId), disabled: false }
+            : undefined
+        }
         reanalyze={
           currentRecordingId
             ? isCancelable

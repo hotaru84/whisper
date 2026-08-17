@@ -4,7 +4,7 @@ import {
   Wand2,
   AudioLines,
   Copy,
-  Download,
+  FolderOpen,
   MoreHorizontal,
   FileAudio,
   Loader2,
@@ -22,12 +22,11 @@ import { useConfirmClick } from "./useConfirmClick";
 import { ThemeToggle } from "./ThemeToggle";
 import { SettingsDialog } from "./SettingsDialog";
 import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
-import { loadRecording } from "../lib/history";
+import { loadRecording, openRecordingFolder } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText, collapseDegenerateSegments } from "../lib/transcript";
-import { saveTranscript } from "../lib/export/saveTranscript";
 import { useMockBackend } from "../lib/env";
-import { MOCK_EXPORT_UNAVAILABLE } from "../lib/mock/fixtures";
+import { MOCK_NATIVE_FEATURE_UNAVAILABLE } from "../lib/mock/fixtures";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 import { cn } from "../lib/utils";
 
@@ -46,21 +45,19 @@ function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
   );
 }
 
-/** Copy/export act on this row's own recording, loaded on demand -- the
- * sidebar only ever holds the small projected `RecordingHistoryMeta`, not
- * full segments (see `listRecordings`' doc comment on why), so these need
- * their own `loadRecording` call rather than reading the already-loaded
- * entry a click on the row itself would show. */
+/** Copy acts on this row's own recording, loaded on demand -- the sidebar
+ * only ever holds the small projected `RecordingHistoryMeta`, not full
+ * segments (see `listRecordings`' doc comment on why), so this needs its own
+ * `loadRecording` call rather than reading the already-loaded entry a click
+ * on the row itself would show. Opening the folder needs no such load --
+ * `openRecordingFolder` only needs the id. */
 function useHistoryRowActions(id: string) {
   const handleCopy = async () => {
     const entry = await loadRecording(id);
     await navigator.clipboard.writeText(combinedText(collapseDegenerateSegments(entry.segments)));
   };
-  const handleExport = async (format: "txt" | "srt") => {
-    const entry = await loadRecording(id);
-    await saveTranscript(entry.segments, format);
-  };
-  return { handleCopy, handleExport };
+  const handleOpenFolder = () => openRecordingFolder(id);
+  return { handleCopy, handleOpenFolder };
 }
 
 function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
@@ -103,7 +100,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
     useConfirmClick(() => {
       void deleteHistoryEntry(meta.id);
     });
-  const { handleCopy, handleExport } = useHistoryRowActions(meta.id);
+  const { handleCopy, handleOpenFolder } = useHistoryRowActions(meta.id);
   const { day, time } = formatDateTime(meta.createdAt);
   const selected = viewedRecordingId === meta.id;
 
@@ -224,7 +221,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
               variant="ghost"
               size="sm"
               className="h-6 px-2 opacity-0 group-hover:opacity-100"
-              aria-label="保存"
+              aria-label="その他の操作"
               onClick={(e) => e.stopPropagation()}
             >
               <MoreHorizontal className="h-3 w-3" />
@@ -241,23 +238,17 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
               <Copy className="h-4 w-4" />
               コピー
             </DropdownMenuItem>
-            {/* Also disabled in the browser preview, which has no native save
-                dialog -- same as TranscriptToolbar's copy of this menu. */}
+            {/* Unlike copy, this doesn't need a transcript -- even an
+                unanalyzed (record-only) row has a WAV to open a folder for.
+                Disabled in the browser preview, which has no native file
+                manager -- same as TranscriptToolbar's copy of this button. */}
             <DropdownMenuItem
-              disabled={!meta.transcribed || useMockBackend}
-              title={useMockBackend ? MOCK_EXPORT_UNAVAILABLE : undefined}
-              onSelect={() => void handleExport("txt")}
+              disabled={useMockBackend}
+              title={useMockBackend ? MOCK_NATIVE_FEATURE_UNAVAILABLE : undefined}
+              onSelect={() => void handleOpenFolder()}
             >
-              <Download className="h-4 w-4" />
-              .txt として保存
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={!meta.transcribed || useMockBackend}
-              title={useMockBackend ? MOCK_EXPORT_UNAVAILABLE : undefined}
-              onSelect={() => void handleExport("srt")}
-            >
-              <Download className="h-4 w-4" />
-              .srt として保存
+              <FolderOpen className="h-4 w-4" />
+              フォルダを開く
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

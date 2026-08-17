@@ -70,6 +70,29 @@ export function clampSidebarWidth(width: number): number {
 }
 
 /**
+ * Where recordings and their transcripts get written automatically, instead
+ * of the app's own cache directory (WAV/sidecar JSON) and a manual save
+ * dialog (transcript) that used to require the user to act after every take.
+ *
+ * `directory` and `enabled` are independent: turning auto-save off keeps the
+ * chosen folder remembered rather than forgetting it, so re-enabling later
+ * doesn't require picking it again. Only `enabled && directory !== ""`
+ * actually redirects anything -- see `recordingLocation.ts`.
+ */
+export interface AutoSaveSettings {
+  enabled: boolean;
+  /** Absolute path chosen via the native folder picker. Empty = not set. */
+  directory: string;
+  transcriptFormat: "srt" | "txt";
+}
+
+export const DEFAULT_AUTO_SAVE_SETTINGS: AutoSaveSettings = {
+  enabled: false,
+  directory: "",
+  transcriptFormat: "srt",
+};
+
+/**
  * Reads back whatever JSON is at `key`, field-validates it against `defaults`
  * (so a stale/foreign shape can't leak wrong types into state), and never
  * lets a corrupt or unavailable `localStorage` stop the app from starting.
@@ -203,3 +226,15 @@ const sidebarSettings = definePersistedSettings<SidebarSettings>(
 );
 export const loadSidebarSettings = sidebarSettings.load;
 export const saveSidebarSettings = sidebarSettings.save;
+
+const autoSaveSettings = definePersistedSettings<AutoSaveSettings>(
+  "autosave-settings",
+  DEFAULT_AUTO_SAVE_SETTINGS,
+  (parsed, d) => ({
+    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
+    directory: typeof parsed.directory === "string" ? parsed.directory : d.directory,
+    transcriptFormat: parsed.transcriptFormat === "txt" ? "txt" : "srt",
+  }),
+);
+export const loadAutoSaveSettings = autoSaveSettings.load;
+export const saveAutoSaveSettings = autoSaveSettings.save;

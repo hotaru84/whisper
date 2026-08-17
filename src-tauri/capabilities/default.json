@@ -12,6 +12,7 @@
       "identifier": "fs:allow-write-text-file",
       "allow": [{ "path": "**" }]
     },
+    "opener:allow-reveal-item-in-dir",
     "fs:allow-appcache-read-recursive",
     "fs:allow-appcache-write-recursive",
     "core:window:allow-minimize",

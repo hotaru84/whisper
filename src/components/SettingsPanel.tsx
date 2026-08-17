@@ -6,9 +6,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Slider } from "./ui/slider";
 import { Switch } from "./ui/switch";
 import { Textarea } from "./ui/textarea";
+import { Button } from "./ui/button";
+import { FolderOpen } from "lucide-react";
 import { InfoTooltip } from "./InfoTooltip";
 import { useAppStore } from "../store/appStore";
 import { SUPPORTED_LANGUAGES } from "../lib/asr";
+import { pickAutoSaveDirectory } from "../lib/export/autoSave";
+import { useMockBackend } from "../lib/env";
+import { MOCK_NATIVE_FEATURE_UNAVAILABLE } from "../lib/mock/fixtures";
 import { cn } from "../lib/utils";
 
 /**
@@ -83,6 +88,8 @@ export function SettingsPanel() {
   const updateVadSettings = useAppStore((s) => s.updateVadSettings);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
   const updateAudioEventSettings = useAppStore((s) => s.updateAudioEventSettings);
+  const autoSaveSettings = useAppStore((s) => s.autoSaveSettings);
+  const updateAutoSaveSettings = useAppStore((s) => s.updateAutoSaveSettings);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   // Locked for the whole take, paused included: the streaming transcriber
   // re-reads `settings` on every window, so a change part-way through would
@@ -91,22 +98,97 @@ export function SettingsPanel() {
   const locked = recordingPhase !== "stopped";
   const glossaryChars = Array.from(settings.glossary).length;
   const fixedSpeakerCount = diarizeSettings.numSpeakers > 0;
+  const handlePickAutoSaveDirectory = async () => {
+    const directory = await pickAutoSaveDirectory();
+    if (directory) updateAutoSaveSettings({ directory });
+  };
 
   return (
-    // Both categories start open: before this dialog existed, every setting
+    // Every category starts open: before this dialog existed, every setting
     // sat in one always-open panel, so nothing needed an extra click to
     // find. Splitting into categories organizes them but must not hide any
     // of them behind a second click by default -- a user reported not being
     // able to find a setting for exactly this reason when this had three
-    // categories (the third, mic/app-audio, has since moved to the titlebar --
+    // categories (the mic/app-audio one has since moved to the titlebar --
     // see TitleBarControls.tsx -- since those are switched often enough to
     // want one click, not two). Anyone who wants a quieter view can still
     // collapse a category; this only changes the starting state.
+    //
+    // 保存設定 (autosave) leads rather than trails: where a take's files end
+    // up matters more, and is checked less often, than the decode/accuracy
+    // knobs below it -- worth seeing first without scrolling, not buried
+    // under the two categories someone tunes far more frequently.
     <Accordion
       type="multiple"
       className={cn("w-full", locked && "pointer-events-none opacity-60")}
-      defaultValue={["transcription", "accuracy"]}
+      defaultValue={["autosave", "transcription", "accuracy"]}
     >
+      <AccordionItem value="autosave">
+        <AccordionTrigger>保存設定</AccordionTrigger>
+        <AccordionContent>
+          <div className="flex flex-col gap-4">
+            <div className="flex items-center gap-2">
+              <Switch
+                id="autosave-enabled"
+                checked={autoSaveSettings.enabled}
+                onCheckedChange={(checked) => updateAutoSaveSettings({ enabled: checked })}
+              />
+              <Label htmlFor="autosave-enabled">録音・文字起こしを自動保存する</Label>
+              <InfoTooltip>
+                有効にすると、録音のWAVファイルはアプリ内部の代わりに下のフォルダへ直接保存され、
+                文字起こしも解析が終わるたびに同じフォルダへ自動で書き出されます。無効のときは
+                これまで通りアプリ内部にのみ保存されます。
+              </InfoTooltip>
+            </div>
+
+            <div className="flex flex-col gap-1.5 pl-6">
+              <Label htmlFor="autosave-directory">保存先フォルダ</Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="autosave-directory"
+                  readOnly
+                  value={autoSaveSettings.directory}
+                  placeholder="未設定（アプリ内部に保存）"
+                  className="font-mono text-xs"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handlePickAutoSaveDirectory()}
+                  disabled={useMockBackend}
+                  title={useMockBackend ? MOCK_NATIVE_FEATURE_UNAVAILABLE : undefined}
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  フォルダを選択
+                </Button>
+              </div>
+              {autoSaveSettings.enabled && !autoSaveSettings.directory && (
+                <p className="text-xs text-muted-foreground">
+                  フォルダを選択すると有効になります。
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 pl-6">
+              <Label htmlFor="autosave-format">文字起こしの保存形式</Label>
+              <Select
+                value={autoSaveSettings.transcriptFormat}
+                onValueChange={(v) => updateAutoSaveSettings({ transcriptFormat: v === "txt" ? "txt" : "srt" })}
+              >
+                <SelectTrigger id="autosave-format" className="w-28">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="srt">SRT</SelectItem>
+                  <SelectItem value="txt">TXT</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </AccordionContent>
+      </AccordionItem>
+
       <AccordionItem value="transcription">
         <AccordionTrigger>文字起こし</AccordionTrigger>
         <AccordionContent>
