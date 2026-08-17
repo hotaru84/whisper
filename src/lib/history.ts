@@ -1,5 +1,6 @@
 import { readDir, readTextFile, writeTextFile, remove, exists } from "@tauri-apps/plugin-fs";
 import { appCacheDir, join } from "@tauri-apps/api/path";
+import { invoke } from "@tauri-apps/api/core";
 import type { TranscriptSegment } from "./transcript";
 import type { AudioEvent } from "./asr";
 import { useMockBackend } from "./env";
@@ -214,6 +215,85 @@ export async function listRecordings(): Promise<RecordingHistoryMeta[]> {
   }
 
   return metas.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+}
+
+/**
+ * Shortest interrupted take worth putting in front of the user. Below this a
+ * recovered entry is noise: a take that was started and lost within a second
+ * has nothing in it to recover, and the WAV is more likely a stray file than
+ * something someone wants back.
+ */
+const MIN_RECOVERABLE_SEC = 1;
+
+/**
+ * Files a sidecar for any WAV that has none, so a recording whose app never
+ * got to stop it is still browsable.
+ *
+ * The gap this closes: `listRecordings` enumerates sidecars, and the sidecar is
+ * only written once a take stops (`recordingPipeline.ts`). Anything that ends a
+ * take without going through `stopRecording` -- the webview reloading
+ * mid-recording (WebView2 recreates its renderer after some resumes from
+ * suspend, and the reload takes every bit of the frontend's in-memory state
+ * with it), a crash, a power cut -- therefore leaves a perfectly good WAV that
+ * the app can neither list, play, nor be asked to transcribe. The audio was
+ * never at risk (`wav::Writer` keeps the header current after every append);
+ * only the record of its existence was.
+ *
+ * Recovered entries are filed exactly like a record-only take: `transcribed:
+ * false`, no segments, so the sidebar shows them with the "unanalyzed" badge
+ * and the user can run the normal analysis on them whenever they like. The
+ * live transcript that was on screen at the time is genuinely gone -- it only
+ * ever lived in the store -- but re-analyzing the WAV reproduces it, and better
+ * (a full-file pass beats the 15s streaming windows).
+ *
+ * Must only run when no take is in progress: a live recording's WAV also has
+ * no sidecar yet, and filing it as an interrupted take would leave two writers'
+ * worth of bookkeeping pointing at the same file. `appStore.ts` calls this once
+ * at startup for exactly that reason.
+ */
+export async function recoverInterruptedRecordings(language: string): Promise<string[]> {
+  // Nothing to recover: the mock store lives in memory and dies with the page,
+  // so an "interrupted" take leaves no file behind to find.
+  if (useMockBackend) return [];
+
+  const dir = await recordingsDir();
+  if (!(await exists(dir))) return [];
+
+  const entries = await readDir(dir);
+  const filed = new Set(
+    entries
+      .filter((e) => !e.isDirectory && e.name.endsWith(".json"))
+      .map((e) => e.name.slice(0, -".json".length)),
+  );
+
+  const recovered: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory || !entry.name.endsWith(".wav")) continue;
+    const id = entry.name.slice(0, -".wav".length);
+    if (filed.has(id) || !parseCreatedAt(id)) continue;
+    try {
+      // Reads the WAV's header, not its samples -- these files run to
+      // hundreds of megabytes (see `recording_duration_sec` in capture.rs).
+      const durationSec = await invoke<number>("recording_duration_sec", { name: id });
+      if (durationSec < MIN_RECOVERABLE_SEC) continue;
+      await saveRecordingHistory(id, {
+        durationSec,
+        language,
+        transcribed: false,
+        usedDiarize: false,
+        usedVad: false,
+        usedAudioEvents: false,
+        segments: [],
+        audioEvents: [],
+      });
+      recovered.push(id);
+    } catch (err) {
+      // One unreadable leftover must not stop the others from coming back --
+      // same reasoning as `listRecordings` skipping a corrupt sidecar.
+      console.warn(`[history] could not recover interrupted recording ${id}:`, err);
+    }
+  }
+  return recovered;
 }
 
 /** Loads the full transcript and audio events for one history entry. */

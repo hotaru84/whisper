@@ -39,6 +39,7 @@ pub fn run() {
             capture::start_capture,
             capture::append_capture,
             capture::finish_capture,
+            capture::recording_duration_sec,
             diarize::diarize_recording,
             events::detect_audio_events,
             events::detect_events_window,

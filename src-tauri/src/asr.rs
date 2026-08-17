@@ -108,6 +108,35 @@ fn configure_native_logging() {
 
 #[tauri::command]
 pub async fn init_model(app: AppHandle) -> Result<(), String> {
+    // Already resident: report ready and stop here.
+    //
+    // The frontend has its own idempotency flag (`AsrClient.init`), but it
+    // lives in a JS object the webview throws away whenever the page is
+    // reloaded -- which is exactly what WebView2 does when its renderer is
+    // recreated after the PC resumes from suspend. The mount effect then runs
+    // again and calls this command on a model that never went anywhere.
+    //
+    // Without this guard that means re-reading the ~574MB GGUF (a minutes-long
+    // blocking overlay) *and* holding two contexts at once: the load below
+    // finishes before the assignment that drops the old one, so RAM and VRAM
+    // both peak at double. On a GPU with little VRAM to spare, that second
+    // load is also the one that fails.
+    //
+    // `is_some()` rather than a separate "loaded" flag, so there is only one
+    // source of truth. Read into a bool in its own scope so the guard is
+    // provably dropped before the await below -- holding a `MutexGuard` across
+    // one would make this future non-Send.
+    let already_loaded = { app.state::<AsrState>().0.lock().unwrap().is_some() };
+    if already_loaded {
+        let _ = app.emit(
+            "asr:model-ready",
+            ModelReadyPayload {
+                device: build_backend(),
+            },
+        );
+        return Ok(());
+    }
+
     configure_native_logging();
     let app_for_load = app.clone();
     // Loading a ~600MB GGUF file is blocking CPU/IO work; keep it off the async runtime.

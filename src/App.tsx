@@ -51,6 +51,7 @@ function App() {
   const refreshAudioInputDevices = useAppStore((s) => s.refreshAudioInputDevices);
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
   const refreshRecordingHistory = useAppStore((s) => s.refreshRecordingHistory);
+  const recoverInterruptedRecordings = useAppStore((s) => s.recoverInterruptedRecordings);
   const errorMessage = useAppStore((s) => s.errorMessage);
   const sidebar = useAppStore((s) => s.sidebar);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
@@ -91,6 +92,9 @@ function App() {
     // hitting record with a target already in mind.
     void refreshAppAudioApps();
     void refreshRecordingHistory();
+    // Startup is the only safe moment for this (a live take's WAV looks the
+    // same on disk), and it refreshes the list itself when it finds anything.
+    void recoverInterruptedRecordings();
     // Dev diagnostic hooks: window.__debugTranscribe(url, overrides) and
     // window.__store for inspecting/driving the zustand store from the console.
     Object.assign(window as unknown as Record<string, unknown>, {
@@ -98,7 +102,13 @@ function App() {
       __debugStreamTranscribe: debugStreamTranscribeUrl,
       __store: useAppStore,
     });
-  }, [initModel, refreshAudioInputDevices, refreshAppAudioApps, refreshRecordingHistory]);
+  }, [
+    initModel,
+    refreshAudioInputDevices,
+    refreshAppAudioApps,
+    refreshRecordingHistory,
+    recoverInterruptedRecordings,
+  ]);
 
   return (
     <TooltipProvider>

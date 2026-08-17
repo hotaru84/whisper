@@ -7,7 +7,7 @@
 //! what users actually get.
 
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -122,6 +122,53 @@ pub fn read(path: &Path) -> Result<Vec<f32>, String> {
         .chunks_exact(n)
         .map(|frame| frame.iter().sum::<f32>() / n as f32)
         .collect())
+}
+
+/// How long a WAV runs, read from its 44-byte header rather than its samples.
+///
+/// [`read`] would answer this too, but it pulls the whole file into memory --
+/// unacceptable for the one caller here, which asks about every stray file in
+/// the recordings directory at startup and would otherwise page in gigabytes to
+/// produce a handful of floats.
+///
+/// Only the canonical header [`Writer`] itself writes is understood (fmt at
+/// offset 12, data at 36); anything else is an error rather than a guess, since
+/// the only files this is pointed at are ones this app wrote.
+///
+/// The declared data size is clamped to what is actually on disk. A recording
+/// whose app was killed mid-write -- the case this exists for -- can have a
+/// header describing samples that never reached the file, and reporting a
+/// duration longer than the audio would desynchronise every timeline derived
+/// from it.
+pub fn duration_sec(path: &Path) -> Result<f32, String> {
+    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut header = [0u8; HEADER_LEN as usize];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" || &header[12..16] != b"fmt " {
+        return Err(format!("{}: not a canonical RIFF/WAVE header", path.display()));
+    }
+
+    let u16_at = |o: usize| u16::from_le_bytes([header[o], header[o + 1]]) as u64;
+    let u32_at = |o: usize| {
+        u32::from_le_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]]) as u64
+    };
+
+    let channels = u16_at(22);
+    let rate = u32_at(24);
+    let bits = u16_at(34);
+    let bytes_per_sec = rate * channels * (bits / 8);
+    if bytes_per_sec == 0 {
+        return Err(format!("{}: unusable format in the WAV header", path.display()));
+    }
+
+    let on_disk = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len()
+        .saturating_sub(HEADER_LEN);
+    let data_bytes = u32_at(DATA_SIZE_OFFSET as usize).min(on_disk);
+    Ok(data_bytes as f32 / bytes_per_sec as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +402,48 @@ mod tests {
 
         let back = read(&path).expect("read truncated");
         assert_eq!(back.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_the_duration_of_a_still_open_recording_from_the_header() {
+        // The interrupted-take case `duration_sec` exists for: the writer is
+        // still open (the app was reloaded out from under it), so `finish` was
+        // never called, yet the file must already report its real length.
+        let path = temp_path("duration-open");
+        let mut w = Writer::create(&path).expect("create");
+        w.append(&vec![0.1; SAMPLE_RATE as usize * 2]).expect("append");
+
+        let secs = duration_sec(&path).expect("duration");
+        assert!((secs - 2.0).abs() < 1e-4, "{secs}");
+        assert!((secs - w.duration_sec()).abs() < 1e-4);
+
+        drop(w);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duration_ignores_samples_the_header_promises_but_the_file_lacks() {
+        let path = temp_path("duration-truncated");
+        let mut w = Writer::create(&path).expect("create");
+        w.append(&vec![0.1; SAMPLE_RATE as usize]).expect("append");
+        w.finish().expect("finish");
+
+        let mut bytes = std::fs::read(&path).expect("read raw");
+        bytes.truncate(HEADER_LEN as usize + SAMPLE_RATE as usize); // half the samples
+        std::fs::write(&path, &bytes).expect("rewrite");
+
+        let secs = duration_sec(&path).expect("duration");
+        assert!((secs - 0.5).abs() < 1e-4, "{secs}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duration_rejects_a_file_that_is_not_a_wav() {
+        let path = temp_path("duration-garbage");
+        std::fs::write(&path, b"not a wav file, but long enough to fill a header buffer!!")
+            .expect("write");
+        assert!(duration_sec(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }

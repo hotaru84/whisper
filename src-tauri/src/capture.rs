@@ -107,6 +107,29 @@ pub async fn append_capture(app: AppHandle, request: Request<'_>) -> Result<(), 
     .map_err(|e| e.to_string())?
 }
 
+/// How long an existing recording runs, without opening it for playback.
+///
+/// Exists for the interrupted-take recovery in `history.ts`: a take whose
+/// frontend was reloaded mid-recording (WebView2 recreating its renderer after
+/// a resume from suspend, say) never reached `finish_capture`, so its duration
+/// was never reported to anyone and no sidecar was written. The WAV itself is
+/// intact -- [`wav::Writer`] keeps the header current after every append -- so
+/// the duration can be recovered from it and the take filed in history after
+/// the fact.
+///
+/// Takes a name rather than a path, and resolves it through the same
+/// `recording_path` the writer uses, so this cannot be pointed at an arbitrary
+/// file on disk.
+#[tauri::command]
+pub async fn recording_duration_sec(app: AppHandle, name: String) -> Result<f32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = recording_path(&app, &name)?;
+        wav::duration_sec(&path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Closes the recording and reports where it landed and how long it runs.
 #[tauri::command]
 pub async fn finish_capture(app: AppHandle) -> Result<CaptureInfo, String> {

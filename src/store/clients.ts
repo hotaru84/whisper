@@ -1,10 +1,10 @@
 /**
- * The two Tauri IPC client singletons the store drives, plus the one piece of
- * global wiring (`onAudioDeviceChange`) that reaches into the store on its
- * own rather than through a store action. Kept apart from `appStore.ts` so
- * "which external client does this" has one obvious home; the recording
- * lifecycle (`appStore.ts`) and the accuracy pipeline (`recordingPipeline.ts`)
- * both import from here.
+ * The two Tauri IPC client singletons the store drives, plus the pieces of
+ * global wiring (`onAudioDeviceChange`, `startSleepWatch`) that reach into the
+ * store on their own rather than through a store action. Kept apart from
+ * `appStore.ts` so "which external client does this" has one obvious home; the
+ * recording lifecycle (`appStore.ts`) and the accuracy pipeline
+ * (`recordingPipeline.ts`) both import from here.
  *
  * `useAppStore` is imported for the callbacks below to call, not at module
  * top level -- each callback only runs after the whole module graph
@@ -14,6 +14,7 @@
  */
 import { AsrClient } from "../lib/asr";
 import { AppAudioClient, onAudioDeviceChange } from "../lib/audio";
+import { startSleepWatch } from "../lib/sleepWatch";
 import { useAppStore } from "./appStore";
 
 // One instance shared by the app-list refresh and the actual capture start/stop:
@@ -40,4 +41,24 @@ export const asrClient = new AsrClient({
 // unplugged, without the UI needing to poll for it.
 onAudioDeviceChange(() => {
   void useAppStore.getState().refreshAudioInputDevices();
+});
+
+// Tells the user when the machine was asleep during a take.
+//
+// A suspend costs audio without breaking anything visible: no frames are
+// captured while the process is frozen, so the recording simply skips that
+// stretch and every derived number stays self-consistent (see
+// `sleepWatch.ts`). Whether the recorder survives the resume is a separate
+// question, handled separately (`handleMicDropout`) -- this notice is about
+// the audio that was already missed by the time anything could react.
+//
+// Only a live take is worth interrupting for. A suspend while idle or while
+// browsing history costs nothing, and a notice there would be noise.
+startSleepWatch((gapSec) => {
+  const { recordingPhase } = useAppStore.getState();
+  if (recordingPhase === "stopped") return;
+  const minutes = Math.max(1, Math.round(gapSec / 60));
+  useAppStore.setState({
+    refineNotice: `PC がスリープしていた約 ${minutes} 分間の音声は録音されていません（前後の音声はつながって記録されます）。`,
+  });
 });

@@ -55,6 +55,25 @@ const CAPTURE_SAMPLE_RATE: usize = 16_000;
 const CHUNK_MS: u64 = 100;
 const CHUNK_SAMPLES: usize = CAPTURE_SAMPLE_RATE * CHUNK_MS as usize / 1000;
 
+/// How far behind wall clock the output is allowed to fall before the loop
+/// gives up on backfilling silence and simply resynchronises.
+///
+/// The silence padding below exists for scheduling jitter, which is measured
+/// in milliseconds. A gap orders of magnitude larger than that means this loop
+/// did not run at all for a while -- overwhelmingly: the PC suspended, since
+/// `Instant` keeps advancing across modern-standby (S0) sleep. Backfilling
+/// such a gap would be both pointless and harmful: pointless because the
+/// microphone did not capture that stretch either (the frontend is frozen too,
+/// so no mic frames exist to mix it with) and `AudioMixer` discards anything
+/// past 5 queued seconds anyway; harmful because it is emitted as one tight
+/// burst of `CHUNK_MS` messages -- an hour of sleep is 36,000 IPC sends with
+/// no pause between them, which is a CPU spike and an IPC flood at the exact
+/// moment the machine is busiest coming back up.
+///
+/// Matched to `AudioMixer`'s own queue cap: beyond it, output would be dropped
+/// by the consumer regardless of what is sent here.
+const MAX_CATCHUP_SAMPLES: u64 = 5 * CAPTURE_SAMPLE_RATE as u64;
+
 /// One application currently capable of being targeted: it has an active
 /// WASAPI audio session, so `new_application_loopback_client` can capture it.
 #[derive(Serialize, Clone)]
@@ -385,7 +404,9 @@ pub fn capture_loop(
         // stream's total duration matches how long capture actually ran.
         flush_due_chunks(&mut pending, &mut sent_samples, started, channel)?;
         let elapsed_samples = (started.elapsed().as_secs_f64() * CAPTURE_SAMPLE_RATE as f64) as u64;
-        if elapsed_samples > sent_samples {
+        // Capped for the same reason the loop above is: stopping a capture that
+        // sat through a suspend must not write out hours of silence.
+        if elapsed_samples > sent_samples && elapsed_samples - sent_samples <= MAX_CATCHUP_SAMPLES {
             let silence = vec![0.0f32; (elapsed_samples - sent_samples) as usize];
             channel.send(InvokeResponseBody::Raw(f32_to_le_bytes(&silence))).map_err(|e| e.to_string())?;
         }
@@ -410,6 +431,18 @@ fn flush_due_chunks(
         let elapsed_samples = (started.elapsed().as_secs_f64() * CAPTURE_SAMPLE_RATE as f64) as u64;
         if elapsed_samples < *sent_samples + CHUNK_SAMPLES as u64 {
             break;
+        }
+
+        // Suspended (or otherwise stalled) for longer than any backfill could
+        // usefully cover -- skip the gap instead of emitting it. See
+        // MAX_CATCHUP_SAMPLES. `pending` goes with it: whatever WASAPI hands
+        // back after a resume belongs to the far side of the gap, and mixing
+        // pre-suspend audio into post-resume mic frames is exactly the
+        // misalignment this whole wall-clock scheme exists to prevent.
+        if elapsed_samples - *sent_samples > MAX_CATCHUP_SAMPLES {
+            *sent_samples = elapsed_samples;
+            pending.clear();
+            continue;
         }
 
         let chunk: Vec<f32> = if pending.len() >= CHUNK_SAMPLES {

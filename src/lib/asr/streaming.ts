@@ -25,6 +25,25 @@ const WINDOW_SEC = 15;
 // of audio -- comfortable at ~2s of GPU time per window.
 const MAX_CARRY_SEC = 5;
 
+// How many times in a row a window may fail to transcribe before its audio is
+// dropped from the live pass.
+//
+// Failures here are not the transcript's problem to solve: the same audio is on
+// disk, and the post-stop pass re-reads all of it. What matters is that a
+// backend which has stopped working -- the realistic case being a GPU device
+// lost across a suspend/resume, after which every whisper call fails -- cannot
+// make the recording itself worse. Holding the failed window would grow the
+// buffer without bound for the rest of the meeting (nothing else ever frees
+// it), so after a few honest attempts the window is dropped and the cursor
+// advances past it, exactly as a silent window is dropped.
+const MAX_WINDOW_FAILURES = 3;
+
+// How long to wait after a failure before trying again.
+//
+// Without it the retry cadence is "every incoming frame", i.e. ~10 hopeless
+// calls a second into a backend that is already failing.
+const RETRY_BACKOFF_MS = 2_000;
+
 /** A chunk of transcript emitted mid-recording, with its offset from recording start. */
 export interface StreamingSegment {
   offsetSec: number;
@@ -46,16 +65,31 @@ export interface StreamingSegment {
  *
  * Transcription is serialized: the model pipeline is not re-entrant, so at most
  * one `transcribe` call is in flight at a time.
+ *
+ * A failing backend degrades rather than derails: windows are retried with a
+ * backoff and eventually dropped (see `MAX_WINDOW_FAILURES`), so the live
+ * transcript thins out or stops while the recording itself carries on
+ * untouched.
  */
 export class StreamingTranscriber {
   private frames: Float32Array[] = [];
   private pendingSamples = 0; // samples held in `frames` (uncommitted)
   private committedSamples = 0; // samples committed so far (recording start = 0)
   private processing = false;
+  private failures = 0;
+  /** Wall-clock time before which no new attempt is made (see RETRY_BACKOFF_MS). */
+  private retryAfter = 0;
 
   constructor(
     private readonly transcribe: (audio: Float32Array) => Promise<TranscribeResult>,
     private readonly onSegment: (seg: StreamingSegment) => void,
+    private readonly options: {
+      /** Reports that a window's audio was given up on, for a user-facing
+       * notice. The recording is unaffected -- see `MAX_WINDOW_FAILURES`. */
+      onWindowDropped?: (err: unknown) => void;
+      /** Test seam; production uses RETRY_BACKOFF_MS. */
+      retryBackoffMs?: number;
+    } = {},
   ) {}
 
   /** Feed one captured PCM frame (called from the recorder's onFrame). */
@@ -79,6 +113,7 @@ export class StreamingTranscriber {
   private async maybeProcess(): Promise<void> {
     if (this.processing) return;
     if (this.pendingSamples < WINDOW_SEC * SR) return;
+    if (Date.now() < this.retryAfter) return;
     this.processing = true;
     try {
       await this.drain(false);
@@ -127,7 +162,30 @@ export class StreamingTranscriber {
       return;
     }
 
-    const result = await this.transcribe(audio);
+    let result: TranscribeResult;
+    try {
+      result = await this.transcribe(audio);
+      this.failures = 0;
+    } catch (err) {
+      this.failures += 1;
+      this.retryAfter = Date.now() + (this.options.retryBackoffMs ?? RETRY_BACKOFF_MS);
+      if (this.failures < MAX_WINDOW_FAILURES) {
+        // Keep the audio and try again later. Returning without advancing the
+        // cursor is also what stops `drain`'s loop (its no-progress guard), so
+        // this cannot spin.
+        console.warn("[asr] streaming window failed, will retry:", err);
+        return;
+      }
+      // Given up on: drop the window so the buffer cannot grow for the rest of
+      // the recording, and let the caller say so. The audio is still on disk
+      // and the post-stop pass covers it.
+      console.warn("[asr] giving up on a streaming window after repeated failures:", err);
+      this.failures = 0;
+      this.dropFromFront(windowLen);
+      this.committedSamples += windowLen;
+      this.options.onWindowDropped?.(err);
+      return;
+    }
     const chunks = result.chunks ?? [];
 
     // Decide how much to commit, and how far to advance the audio cursor.
