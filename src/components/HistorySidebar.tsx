@@ -24,7 +24,7 @@ import { SettingsDialog } from "./SettingsDialog";
 import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
 import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
-import { combinedText } from "../lib/transcript";
+import { combinedText, collapseDegenerateSegments } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
 import { useMockBackend } from "../lib/env";
 import { MOCK_EXPORT_UNAVAILABLE } from "../lib/mock/fixtures";
@@ -54,7 +54,7 @@ function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
 function useHistoryRowActions(id: string) {
   const handleCopy = async () => {
     const entry = await loadRecording(id);
-    await navigator.clipboard.writeText(combinedText(entry.segments));
+    await navigator.clipboard.writeText(combinedText(collapseDegenerateSegments(entry.segments)));
   };
   const handleExport = async (format: "txt" | "srt") => {
     const entry = await loadRecording(id);

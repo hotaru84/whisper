@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   combinedText,
   combinedChunks,
+  collapseDegenerateSegments,
   nonBlankChunks,
   projectOntoNonBlankChunks,
   segmentsFromResult,
@@ -280,5 +281,77 @@ describe("projectOntoNonBlankChunks", () => {
 
   it("returns an empty array for a result with no chunks", () => {
     expect(projectOntoNonBlankChunks({}, [true, false])).toEqual([]);
+  });
+});
+
+function seg(
+  id: number,
+  startOffsetSec: number,
+  text: string,
+  durationSec: number,
+  speaker?: number | null,
+): TranscriptSegment {
+  const s: TranscriptSegment = {
+    id,
+    startOffsetSec,
+    text,
+    chunks: [{ text, timestamp: [0, durationSec] }],
+  };
+  if (speaker !== undefined) s.speaker = speaker;
+  return s;
+}
+
+describe("collapseDegenerateSegments", () => {
+  it("collapses a run of identical segments whose time never advances", () => {
+    // The shape of a stalled decode: "ん" repeated many times, each cue
+    // starting at (or before) the previous one's end.
+    const out = collapseDegenerateSegments([
+      seg(1, 10.0, "ん", 0.3),
+      seg(2, 10.3, "ん", 0.3),
+      seg(3, 10.6, "ん", 0.3),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: 1, startOffsetSec: 10.0, text: "ん" });
+    expect(out[0].chunks[0].timestamp[0]).toBe(0);
+    expect(out[0].chunks[0].timestamp[1]).toBeCloseTo(0.9);
+  });
+
+  it("does not collapse the same phrase spoken again after real time passes", () => {
+    const out = collapseDegenerateSegments([seg(1, 0, "はい", 1), seg(2, 5, "はい", 1)]);
+    expect(out).toHaveLength(2);
+  });
+
+  it("does not collapse across a speaker change even when text and timing match", () => {
+    const out = collapseDegenerateSegments([
+      seg(1, 0, "はい", 0.5, 0),
+      seg(2, 0.5, "はい", 0.5, 1),
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out.map((s) => s.speaker)).toEqual([0, 1]);
+  });
+
+  it("never merges an excluded-gap placeholder, on either side", () => {
+    const placeholder: TranscriptSegment = {
+      id: 2,
+      startOffsetSec: 1,
+      text: "",
+      chunks: [{ text: "", timestamp: [0, 1] }],
+      excludedReason: "Music",
+    };
+    const out = collapseDegenerateSegments([seg(1, 0, "a", 1), placeholder, seg(3, 2, "a", 1)]);
+    expect(out).toHaveLength(3);
+  });
+
+  it("leaves a transcript with no repeats untouched", () => {
+    const out = collapseDegenerateSegments([seg(1, 0, "first", 1), seg(2, 1, "second", 1)]);
+    expect(out).toHaveLength(2);
+    expect(out.map((s) => s.text)).toEqual(["first", "second"]);
+  });
+
+  it("does not mutate the input segments", () => {
+    const input = [seg(1, 10.0, "ん", 0.3), seg(2, 10.3, "ん", 0.3)];
+    const snapshotBefore = JSON.parse(JSON.stringify(input));
+    collapseDegenerateSegments(input);
+    expect(input).toEqual(snapshotBefore);
   });
 });

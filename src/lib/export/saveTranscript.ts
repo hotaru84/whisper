@@ -2,7 +2,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { useMockBackend } from "../env";
 import type { TranscriptSegment } from "../transcript";
-import { combinedText, combinedChunks } from "../transcript";
+import { combinedText, combinedChunks, collapseDegenerateSegments } from "../transcript";
 import { chunksToSrt, prepareCues } from "./srt";
 
 export type ExportFormat = "txt" | "srt";
@@ -30,8 +30,15 @@ export async function saveTranscript(segments: TranscriptSegment[], format: Expo
   });
   if (!path) return false;
 
+  // Both formats collapse degenerate repeats (collapseDegenerateSegments) so
+  // a stalled decode's repeated cues don't survive into either export --
+  // chunksToSrt/prepareCues additionally repairs SRT-specific timing
+  // artefacts (min length, overlaps), which .txt has no equivalent of.
+  const displaySegments = collapseDegenerateSegments(segments);
   const content =
-    format === "srt" ? chunksToSrt(prepareCues(combinedChunks(segments))) : combinedText(segments);
+    format === "srt"
+      ? chunksToSrt(prepareCues(combinedChunks(displaySegments)))
+      : combinedText(displaySegments);
   await writeTextFile(path, content);
   return true;
 }

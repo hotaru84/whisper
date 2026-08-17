@@ -1,16 +1,8 @@
 import type { TranscriptChunk } from "../asr";
-
-/** Cues whose normalized text matches and whose start does not sit past the
- * prior cue's end by more than this are treated as the same utterance
- * repeated by a stalled decode, not two separate ones. */
-const COLLAPSE_TOLERANCE_SEC = 0.05;
+import { COLLAPSE_TOLERANCE_SEC, normalizeForCollapse } from "../transcript";
 
 /** Floor on a displayed cue's duration -- see `prepareCues`. */
 const MIN_CUE_LEN_SEC = 0.2;
-
-function normalizeForCollapse(text: string): string {
-  return text.trim();
-}
 
 /**
  * Repairs display-layer artefacts in a cue list before export, without
@@ -31,13 +23,16 @@ function normalizeForCollapse(text: string): string {
  * 1. Drop empty-text cues (defensive -- `combinedChunks` already does this).
  * 2. Stable-sort by start time.
  * 3. Collapse degenerate repeated runs: a cue is folded into the previous one
- *    only when its normalized text matches *and* its start does not advance
- *    past the previous cue's end by more than `COLLAPSE_TOLERANCE_SEC` --
- *    i.e. the same text came back without time having moved, which a real
- *    repeated utterance ("はい、はい") does not do. This cannot delete a
- *    legitimate repetition (its start advances past the tolerance) and
- *    cannot delete a single spoken cue (a lone "はい" has nothing adjacent to
- *    collapse into).
+ *    only when its normalized text matches, its speaker matches (so two
+ *    different people saying the same short phrase back-to-back never lose
+ *    one of them), *and* its start does not advance past the previous cue's
+ *    end by more than `COLLAPSE_TOLERANCE_SEC` -- i.e. the same text came
+ *    back without time having moved, which a real repeated utterance
+ *    ("はい、はい") does not do. This cannot delete a legitimate repetition
+ *    (its start advances past the tolerance) and cannot delete a single
+ *    spoken cue (a lone "はい" has nothing adjacent to collapse into). Shared
+ *    with `collapseDegenerateSegments` in `lib/transcript.ts`, the equivalent
+ *    for the live/history transcript view -- see its doc comment.
  * 4. Enforce `MIN_CUE_LEN_SEC` so a near-zero-length cue is still readable.
  * 5. Repair overlaps by trimming the earlier cue's end to the next cue's
  *    start -- unless that would violate step 4's floor, in which case the
@@ -59,6 +54,7 @@ export function prepareCues(chunks: TranscriptChunk[]): TranscriptChunk[] {
       prev &&
       prevEnd !== undefined &&
       normalizeForCollapse(prev.text) === normalizeForCollapse(cue.text) &&
+      (prev.speaker ?? null) === (cue.speaker ?? null) &&
       cue.timestamp[0] <= prevEnd + COLLAPSE_TOLERANCE_SEC
     ) {
       const cueEnd = cue.timestamp[1] ?? cue.timestamp[0];

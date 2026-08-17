@@ -5,7 +5,7 @@ import { TranscriptToolbar } from "./TranscriptToolbar";
 import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
 import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
-import { combinedText, type TranscriptSegment } from "../lib/transcript";
+import { combinedText, collapseDegenerateSegments, type TranscriptSegment } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
 import { cn } from "../lib/utils";
 
@@ -42,7 +42,13 @@ export function TranscriptPanel() {
   const currentRecordingId = playback.recordingId;
 
   const hasTranscript = segments.length > 0;
-  const text = combinedText(segments);
+  // A rendering-only view of `segments`: folds a stalled decode's repeated
+  // cues (see collapseDegenerateSegments's doc comment) into one row. Never
+  // fed back into the store -- `segments` itself, and everything keyed off
+  // its ids (history persistence, refine-pass bookkeeping), stays
+  // uncollapsed.
+  const displaySegments = collapseDegenerateSegments(segments);
+  const text = combinedText(displaySegments);
   const isRefining = processing === "refining";
   // Whether the recording on screen is specifically the one the accuracy
   // pass is running against -- `can.cancelAnalysis` alone doesn't say
@@ -72,7 +78,7 @@ export function TranscriptPanel() {
   // ascending time order, so a linear scan doubles as "latest match".
   let activeSegmentId: number | null = null;
   if (globalPlaybackTimeSec != null) {
-    for (const seg of segments) {
+    for (const seg of displaySegments) {
       if (isSeekable(seg) && seg.startOffsetSec <= globalPlaybackTimeSec)
         activeSegmentId = seg.id;
     }
@@ -80,7 +86,7 @@ export function TranscriptPanel() {
 
   const { scrollContainerRef, activeRowRef, autoScroll, jumpToLatest } = useTranscriptScrollTracking({
     recordingPhase,
-    segmentsLength: segments.length,
+    segmentsLength: displaySegments.length,
     isPlaying: playback.isPlaying,
     activeSegmentId,
     seekSeq: playback.seekSeq,
@@ -179,7 +185,7 @@ export function TranscriptPanel() {
             )}
           >
             <div className="flex flex-col gap-0.5 p-3">
-              {segments.map((seg) => {
+              {displaySegments.map((seg) => {
                 const onSeek = isSeekable(seg)
                   ? () =>
                       seekTo(seg.startOffsetSec - playback.timelineOffsetSec)

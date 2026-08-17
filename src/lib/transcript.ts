@@ -163,6 +163,75 @@ export function segmentsFromResult(
   return segments;
 }
 
+/** Cues whose normalized text matches and whose start does not sit past the
+ * prior cue's end by more than this are treated as the same utterance
+ * repeated by a stalled decode, not two separate ones. Shared by
+ * `collapseDegenerateSegments` below and `prepareCues` in
+ * `lib/export/srt.ts`, which does the same collapse for SRT export -- one
+ * threshold, so the two never quietly disagree on what counts as "the same
+ * span". */
+export const COLLAPSE_TOLERANCE_SEC = 0.05;
+
+/** Text equality for the degenerate-repeat check above: trimmed, nothing
+ * fancier. A stalled decode re-emits the identical string; this is not meant
+ * to catch near-duplicates. */
+export function normalizeForCollapse(text: string): string {
+  return text.trim();
+}
+
+/**
+ * Collapses adjacent *display* segments that are a stalled decode repeating
+ * itself: matching text (after `normalizeForCollapse`), matching speaker,
+ * and a start that has not advanced past the previous one's end by more than
+ * `COLLAPSE_TOLERANCE_SEC` -- the shape whisper.cpp's degenerate-loop
+ * hallucinations actually take (many short adjacent cues, same text, same or
+ * barely-advancing timestamps), not a real repeated utterance like "はい、
+ * はい" (whose start genuinely advances). Mirrors `prepareCues` in
+ * `lib/export/srt.ts`, which does the same thing for SRT export -- this is
+ * the equivalent for everywhere else a transcript is shown or copied
+ * (`TranscriptPanel`, which both the live view and history view render
+ * through, `HistorySidebar`'s row-level copy, and `saveTranscript`'s .txt
+ * export).
+ *
+ * Purely a rendering transform: never mutates its input and is never fed
+ * back into the store's own `segments`. History persistence, the segment
+ * `id`s playback seeking keys off, and refine-pass bookkeeping all still
+ * operate on the uncollapsed list -- only what gets displayed or copied
+ * changes. Excluded-gap placeholders (blank `text`, see `excludedReason`)
+ * never participate, on either side of a merge: they are a different kind of
+ * row with their own reason to show, and collapsing across one would
+ * misrepresent why the gap is there.
+ */
+export function collapseDegenerateSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
+  const collapsed: TranscriptSegment[] = [];
+  for (const seg of segments) {
+    const prev = collapsed[collapsed.length - 1];
+    const prevDuration = prev?.chunks[0]?.timestamp[1] ?? 0;
+    const prevEnd = prev ? prev.startOffsetSec + prevDuration : undefined;
+    const segIsPlaceholder = seg.text.trim() === "";
+    const prevIsPlaceholder = prev ? prev.text.trim() === "" : true;
+    if (
+      prev &&
+      prevEnd !== undefined &&
+      !segIsPlaceholder &&
+      !prevIsPlaceholder &&
+      normalizeForCollapse(prev.text) === normalizeForCollapse(seg.text) &&
+      (prev.speaker ?? null) === (seg.speaker ?? null) &&
+      seg.startOffsetSec <= prevEnd + COLLAPSE_TOLERANCE_SEC
+    ) {
+      const segDuration = seg.chunks[0]?.timestamp[1] ?? 0;
+      const mergedEnd = Math.max(prevEnd, seg.startOffsetSec + segDuration);
+      const prevChunk = prev.chunks[0];
+      if (prevChunk) {
+        prev.chunks = [{ ...prevChunk, timestamp: [prevChunk.timestamp[0], mergedEnd - prev.startOffsetSec] }];
+      }
+      continue;
+    }
+    collapsed.push({ ...seg, chunks: seg.chunks.map((c) => ({ ...c })) });
+  }
+  return collapsed;
+}
+
 /** The raw AudioSet name of the first noise/music-family event overlapping
  * `[start, end)`, or `undefined` if none is found -- e.g. `events` was not
  * given, or (in principle) the exclusion came from a since-changed pass.
