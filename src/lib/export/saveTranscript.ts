@@ -3,7 +3,7 @@ import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { useMockBackend } from "../env";
 import type { TranscriptSegment } from "../transcript";
 import { combinedText, combinedChunks } from "../transcript";
-import { chunksToSrt } from "./srt";
+import { chunksToSrt, prepareCues } from "./srt";
 
 export type ExportFormat = "txt" | "srt";
 
@@ -30,7 +30,8 @@ export async function saveTranscript(segments: TranscriptSegment[], format: Expo
   });
   if (!path) return false;
 
-  const content = format === "srt" ? chunksToSrt(combinedChunks(segments)) : combinedText(segments);
+  const content =
+    format === "srt" ? chunksToSrt(prepareCues(combinedChunks(segments))) : combinedText(segments);
   await writeTextFile(path, content);
   return true;
 }

@@ -18,14 +18,16 @@ import { isNoiseOrMusicEvent } from "./audioEvents";
  * overlapping this segment; a number is a cluster index, stable only within one
  * recording -- not a stable identity across recordings.
  *
- * `excludedReason` marks a segment that `events::classify_chunks` decided was
- * not speech (see `segmentsFromResult`'s `excluded` parameter): `text` is
- * always `""` for these, and `excludedReason` holds the raw AudioSet label
- * (e.g. `"Music"`) of whichever overlapping event caused the exclusion, or is
- * itself absent if none could be attributed. Rendered by `TranscriptPanel` as
- * a placeholder rather than a normal line, so a listener can tell *why* a gap
- * exists instead of the silent hole the transcript used to leave -- see the
- * design plan.
+ * `excludedReason` marks a segment that was decided not to be speech, either
+ * by `events::classify_chunks` (see `segmentsFromResult`'s `excluded`
+ * parameter) or by `asr::mark_silent_segments`'s RMS check (see `silent`):
+ * `text` is always `""` for these, and `excludedReason` holds the raw
+ * AudioSet label (e.g. `"Music"`) of whichever overlapping event caused an
+ * audio-event exclusion, the literal `"無音"` for a silence flag, or is
+ * itself absent if neither could be attributed. Rendered by `TranscriptPanel`
+ * as a placeholder rather than a normal line, so a listener can tell *why* a
+ * gap exists instead of the silent hole the transcript used to leave -- see
+ * the design plan.
  */
 export interface TranscriptSegment {
   id: number;
@@ -48,6 +50,24 @@ export interface TranscriptSegment {
  */
 export function nonBlankChunks(result: { chunks?: TranscriptChunk[] }): TranscriptChunk[] {
   return (result.chunks ?? []).filter((c) => c.text.trim() !== "");
+}
+
+/**
+ * Projects a raw per-chunk array -- indexed the same way as
+ * `TranscribeResult.chunks`/`silence` (i.e. including any blank-text chunk)
+ * -- down onto `nonBlankChunks(result)`'s indexing, the convention
+ * `segmentsFromResult`'s `speakers`/`excluded`/`silent` parameters all share.
+ * `mark_silent_segments` in Rust flags every chunk it was given, blank or
+ * not, so this keeps that array from silently drifting out of alignment with
+ * `nonBlankChunks` the same way `nonBlankChunks`'s own doc comment warns
+ * about for `speakers`.
+ */
+export function projectOntoNonBlankChunks<T>(result: { chunks?: TranscriptChunk[] }, values: T[]): T[] {
+  const out: T[] = [];
+  (result.chunks ?? []).forEach((c, i) => {
+    if (c.text.trim() !== "") out.push(values[i]);
+  });
+  return out;
 }
 
 /**
@@ -75,6 +95,13 @@ export function nonBlankChunks(result: { chunks?: TranscriptChunk[] }): Transcri
  * if given, is used only to label *why* -- it must be on the same 0-based
  * timeline as `chunks` (the same one `classify_chunks` itself used), same
  * requirement as `speakers`/`excluded`.
+ *
+ * `silent`, if given, is `asr::mark_silent_segments`'s per-chunk flag
+ * (projected through `projectOntoNonBlankChunks` -- it is not OR'd into
+ * `excluded`, so the two reasons stay distinguishable in `excludedReason`).
+ * Checked only when `excluded?.[i]` is falsy: an audio-event label is more
+ * specific than a bare RMS-silence flag, so it takes precedence when a chunk
+ * happens to trip both.
  */
 export function segmentsFromResult(
   result: { text: string; chunks?: TranscriptChunk[] },
@@ -83,6 +110,7 @@ export function segmentsFromResult(
   speakers?: Array<number | null>,
   excluded?: boolean[],
   events?: AudioEvent[],
+  silent?: boolean[],
 ): TranscriptSegment[] {
   const chunks = nonBlankChunks(result);
 
@@ -108,6 +136,17 @@ export function segmentsFromResult(
         text: "",
         chunks: [{ text: "", timestamp: [0, duration] }],
         excludedReason: events ? findExclusionReason(start, end, events) : undefined,
+      });
+      return;
+    }
+
+    if (silent?.[i]) {
+      segments.push({
+        id: startId + i,
+        startOffsetSec: baseSec + start,
+        text: "",
+        chunks: [{ text: "", timestamp: [0, duration] }],
+        excludedReason: "無音",
       });
       return;
     }

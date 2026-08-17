@@ -20,8 +20,9 @@ import type {
   AudioEventSettings,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
-import { isCancelledError } from "../lib/asr";
-import { nonBlankChunks, segmentsFromResult } from "../lib/transcript";
+import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE } from "../lib/asr";
+import { SILENCE_RMS } from "../lib/asr/diagnostics";
+import { nonBlankChunks, projectOntoNonBlankChunks, segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory } from "../lib/history";
 import { toErrorMessage } from "../lib/errors";
 import type { AsrSettings } from "./persistedSettings";
@@ -140,6 +141,31 @@ export async function runAccuracyPipeline(
       "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
     );
   }
+  // A regression signal, not an accuracy score (see QualityReport's doc
+  // comment): voicedGapSec is audio the RMS gate says holds speech but no
+  // cue covers, so a few seconds of it is worth surfacing even though the
+  // pipeline gave no error.
+  if ((result.quality?.voicedGapSec ?? 0) >= 1) {
+    notices.push(
+      `音声があるのに文字起こしされなかった区間が約${result.quality!.voicedGapSec.toFixed(1)}秒あります（無音以外の理由でスキップされた可能性があります）。`,
+    );
+  }
+  // mark_silent_segments flags rather than drops (see its doc comment), so
+  // this is purely informational -- the flagged chunks already render as a
+  // "無音" placeholder via segmentsFromResult's `silent` parameter.
+  if (result.silence && result.silence.length === result.chunks.length) {
+    const silentDurationSec = result.chunks.reduce((sum, c, i) => {
+      if (!result.silence![i].silent) return sum;
+      const end = c.timestamp[1] ?? c.timestamp[0];
+      return sum + Math.max(0, end - c.timestamp[0]);
+    }, 0);
+    const silentCount = result.silence.filter((m) => m.silent).length;
+    if (silentCount > 0) {
+      notices.push(
+        `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${SILENCE_RMS}）。`,
+      );
+    }
+  }
 
   // Diarization and audio tagging both read the same WAV on its own 0-based
   // timeline, so they have to run on result.chunks *before* segmentsFromResult
@@ -156,8 +182,14 @@ export async function runAccuracyPipeline(
       );
     } catch (err) {
       if (isCancelledError(err)) return { cancelled: true };
+      // Distinguished from a genuine failure so the common case -- diarization
+      // defaults on, but its model files are an opt-in download most installs
+      // never make -- reads the same as vadUnavailable's calm guidance rather
+      // than an alarming "failed" notice on every single recording.
       notices.push(
-        `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        String(err).includes(DIARIZATION_MODEL_UNAVAILABLE)
+          ? "話者分離用のモデルファイルが見つからないため、話者ラベルなしで実行しました。README の手順でモデルを配置すると有効になります。"
+          : `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
       );
     }
   }
@@ -453,6 +485,9 @@ export async function refineRecording(
       }));
     }
 
+    const silent = result.silence
+      ? projectOntoNonBlankChunks(result, result.silence.map((m) => m.silent))
+      : undefined;
     const refined = segmentsFromResult(
       result,
       baseSec,
@@ -460,6 +495,7 @@ export async function refineRecording(
       speakers,
       excluded,
       newEvents,
+      silent,
     );
     // One segment per non-blank chunk, always -- an excluded chunk becomes a
     // blank placeholder rather than being dropped (see

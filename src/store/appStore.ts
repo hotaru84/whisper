@@ -13,7 +13,7 @@ import type {
   StreamingSegment,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
-import { segmentsFromResult } from "../lib/transcript";
+import { segmentsFromResult, projectOntoNonBlankChunks } from "../lib/transcript";
 import {
   saveRecordingHistory,
   listRecordings,
@@ -684,7 +684,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       // ids -- this entry has no "session" of its own to rebase onto, and
       // saveRecordingHistory always stores under that same convention (see
       // refineRecording's persistence step).
-      const refined = segmentsFromResult(result, 0, 1, speakers, excluded, newEvents);
+      const silent = result.silence
+        ? projectOntoNonBlankChunks(result, result.silence.map((m) => m.silent))
+        : undefined;
+      const refined = segmentsFromResult(result, 0, 1, speakers, excluded, newEvents, silent);
       if (!refined.some((s) => s.text.trim() !== "")) {
         // Mirrors refineRecording's own guard: an empty (or all-excluded-
         // placeholder) result is far more likely a setting change gone wrong

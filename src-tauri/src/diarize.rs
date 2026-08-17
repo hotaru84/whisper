@@ -22,9 +22,18 @@ use tauri::{AppHandle, Manager};
 /// kept as an implementation detail behind [`diarize`].
 #[derive(Debug, Clone)]
 pub struct DiarizeSettings {
-    /// Off by default: diarization adds a second model-loading + inference pass
-    /// after every recording, which is not free, and most recordings are one
-    /// speaker (dictation) where it has nothing to contribute.
+    /// On by default: this app is positioned as a meeting-transcription tool,
+    /// where multiple speakers are the common case, not the exception --
+    /// diarization has real value in exactly the recordings this app targets.
+    /// The extra model-loading + inference pass this adds after every
+    /// recording is the cost of that.
+    ///
+    /// Safe to default on only because `asr::collect_segments`'s `vad`
+    /// parameter keeps cue timestamps off whisper.cpp's VAD-compressed
+    /// timeline (see that function's doc comment) -- `assign_speakers` below
+    /// assigns speakers purely by overlapping these timestamps against
+    /// diarizer segments, so a wrong timeline would produce confidently wrong
+    /// labels, not just missing ones.
     pub enabled: bool,
     /// Clustering distance threshold: lower splits speakers more readily,
     /// higher merges more readily. Matches sherpa-onnx's own default of 0.5.
@@ -44,7 +53,7 @@ pub struct DiarizeSettings {
 impl Default for DiarizeSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             threshold: 0.5,
             num_speakers: -1,
             min_duration_on: 0.3,
@@ -199,6 +208,18 @@ fn resolve_embedding_model_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(resource_dir.join("resources/models/diarization/embedding.onnx"))
 }
 
+/// Returned by `diarize_recording` when the optional diarization model files
+/// have not been downloaded (README's "話者分離モデルの配置") -- the expected
+/// state for any install that has not opted into that download, not a
+/// genuine failure. Distinguished from `diarize`'s own "model files exist but
+/// sherpa-onnx rejected them" error (a real misconfiguration worth surfacing
+/// as one) so the frontend can show calm, VAD-`vad_unavailable`-style
+/// guidance instead of an alarming "diarization failed" notice on every
+/// recording for the majority of installs that never downloaded these
+/// optional models -- now that diarization defaults to enabled
+/// (`DiarizeSettings::default`), that would otherwise fire every time.
+pub const MODEL_UNAVAILABLE: &str = "__diarization_model_unavailable__";
+
 /// Diarizes a finished recording and returns, for each `chunks` interval, the
 /// speaker it overlaps most (or `null` if none). One entry per input chunk, in
 /// the same order, so the frontend can zip the result directly onto the
@@ -226,6 +247,9 @@ pub async fn diarize_recording(
         let samples = crate::wav::read(std::path::Path::new(&path))?;
         let segmentation_model = resolve_segmentation_model_path(&app)?;
         let embedding_model = resolve_embedding_model_path(&app)?;
+        if !segmentation_model.exists() || !embedding_model.exists() {
+            return Err(MODEL_UNAVAILABLE.to_string());
+        }
         crate::cancel::check(&cancel)?;
 
         let settings = DiarizeSettings {
@@ -328,9 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_favor_auto_speaker_count_and_are_disabled_by_default() {
+    fn default_settings_favor_auto_speaker_count_and_are_enabled_by_default() {
         let settings = DiarizeSettings::default();
-        assert!(!settings.enabled);
+        assert!(settings.enabled);
         assert_eq!(settings.num_speakers, -1);
     }
 }

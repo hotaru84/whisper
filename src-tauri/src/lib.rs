@@ -11,6 +11,9 @@ pub mod cancel;
 pub mod capture;
 // The CER metric lives here rather than in the example so `cargo test` covers it.
 pub mod cer;
+// Reference-free structural quality metrics (gaps, out-of-order cues) shared
+// by the app and the accuracy harness.
+pub mod cues;
 // Speaker diarization (sherpa-onnx) and merging its output onto whisper's
 // transcript segments.
 pub mod diarize;

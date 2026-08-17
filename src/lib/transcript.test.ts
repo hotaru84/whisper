@@ -3,6 +3,7 @@ import {
   combinedText,
   combinedChunks,
   nonBlankChunks,
+  projectOntoNonBlankChunks,
   segmentsFromResult,
   type TranscriptSegment,
 } from "./transcript";
@@ -233,5 +234,51 @@ describe("segmentsFromResult", () => {
     const out = segmentsFromResult(result, 0, 1, undefined, [true, false]);
     expect(combinedText(out)).toBe("議事録を始めます。");
     expect(combinedChunks(out)).toEqual([{ text: "議事録を始めます。", timestamp: [2, 5] }]);
+  });
+
+  it("turns a silent-flagged chunk into a 無音 placeholder", () => {
+    const out = segmentsFromResult(result, 0, 1, undefined, undefined, undefined, [true, false]);
+    expect(out).toHaveLength(2);
+    expect(out[0].text).toBe("");
+    expect(out[0].excludedReason).toBe("無音");
+    expect(out[1].text).toBe("議事録を始めます。");
+  });
+
+  it("prefers the audio-event exclusion reason over a silence flag on the same chunk", () => {
+    const events = [{ start: 0, end: 2, name: "Music", index: 0, prob: 0.8 }];
+    const out = segmentsFromResult(result, 0, 1, undefined, [true, false], events, [true, false]);
+    expect(out[0].excludedReason).toBe("Music");
+  });
+
+  it("ignores the silent array when it is not given at all", () => {
+    const out = segmentsFromResult(result, 0, 1);
+    expect(out.every((s) => s.text !== "")).toBe(true);
+  });
+});
+
+describe("projectOntoNonBlankChunks", () => {
+  it("drops the entries lined up with a blank-text chunk", () => {
+    const withBlank = {
+      chunks: [
+        { text: "a", timestamp: [0, 1] as [number, number] },
+        { text: "  ", timestamp: [1, 2] as [number, number] },
+        { text: "b", timestamp: [2, 3] as [number, number] },
+      ],
+    };
+    expect(projectOntoNonBlankChunks(withBlank, [true, true, false])).toEqual([true, false]);
+  });
+
+  it("passes every value through when there are no blank chunks", () => {
+    const noBlanks = {
+      chunks: [
+        { text: "a", timestamp: [0, 1] as [number, number] },
+        { text: "b", timestamp: [1, 2] as [number, number] },
+      ],
+    };
+    expect(projectOntoNonBlankChunks(noBlanks, [1, 2])).toEqual([1, 2]);
+  });
+
+  it("returns an empty array for a result with no chunks", () => {
+    expect(projectOntoNonBlankChunks({}, [true, false])).toEqual([]);
   });
 });

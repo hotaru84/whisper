@@ -34,12 +34,38 @@ export interface TranscribeOptions {
   glossary?: string;
 }
 
+/**
+ * Reference-free structural quality metrics, mirroring Rust's
+ * `cues::QualityReport`. These are a regression gate (did this decode lose or
+ * reorder audio?), not an accuracy score -- see `src-tauri/src/cues.rs`.
+ */
+export interface QualityReport {
+  zeroLengthCues: number;
+  outOfOrderPairs: number;
+  tailGapSec: number;
+  gapTotalSec: number;
+  voicedGapSec: number;
+}
+
+/** Mirrors Rust's `asr::SilenceMark`. `rms` is `null` when the chunk's padded
+ * interval fell outside the audio, so nothing could be measured. */
+export interface SilenceMark {
+  silent: boolean;
+  rms: number | null;
+}
+
 export interface TranscribeResult {
   text: string;
   chunks: TranscriptChunk[];
   /** True when VAD was requested but its model file was missing, so the pass
    * ran without it. Only ever set by `transcribeRecording`. */
   vadUnavailable?: boolean;
+  /** All-zero from `transcribeWindow`; filled in by `transcribeRecording`. */
+  quality?: QualityReport;
+  /** Parallel to `chunks` (same index, same length), from
+   * `asr::mark_silent_segments`. Empty from `transcribeWindow`, which never
+   * calls it. */
+  silence?: SilenceMark[];
 }
 
 /**
@@ -49,7 +75,12 @@ export interface TranscribeResult {
  * transcription, not a decoding parameter.
  */
 export interface DiarizeSettings {
-  /** Off by default -- see `diarize::DiarizeSettings` for why. */
+  /** On by default -- see `diarize::DiarizeSettings` for why. Relies on
+   * `collect_segments`'s `vad` parameter keeping cue timestamps off
+   * whisper.cpp's VAD-compressed timeline: diarization assigns speakers
+   * purely by overlapping these timestamps against diarizer segments, so a
+   * wrong timeline would produce confidently wrong labels, not just missing
+   * ones. */
   enabled: boolean;
   threshold: number;
   /** -1 = estimate the speaker count automatically. */
@@ -59,12 +90,20 @@ export interface DiarizeSettings {
 }
 
 export const DEFAULT_DIARIZE_SETTINGS: DiarizeSettings = {
-  enabled: false,
+  enabled: true,
   threshold: 0.5,
   numSpeakers: -1,
   minDurationOn: 0.3,
   minDurationOff: 0.5,
 };
+
+/** Mirrors `diarize::MODEL_UNAVAILABLE` in Rust: the optional diarization
+ * model files have not been downloaded (README's "話者分離モデルの配置"), not
+ * a genuine failure -- now that diarization defaults to enabled, this is the
+ * expected state for most fresh installs. Substring match for the same
+ * reason as `isCancelledError`: Tauri wraps a command's `Err(String)` on the
+ * way out. */
+export const DIARIZATION_MODEL_UNAVAILABLE = "__diarization_model_unavailable__";
 
 /**
  * Voice-activity-detection knobs for the second pass, mirroring the

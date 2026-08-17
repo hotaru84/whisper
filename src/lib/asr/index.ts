@@ -3,11 +3,14 @@ export {
   DEFAULT_DIARIZE_SETTINGS,
   DEFAULT_VAD_SETTINGS,
   DEFAULT_AUDIO_EVENT_SETTINGS,
+  DIARIZATION_MODEL_UNAVAILABLE,
 } from "./client";
 export type {
   AsrClientHandlers,
   TranscribeOptions,
   TranscribeResult,
+  QualityReport,
+  SilenceMark,
   DiarizeSettings,
   VadSettings,
   AudioEventSettings,

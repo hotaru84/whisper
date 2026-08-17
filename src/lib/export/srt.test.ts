@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chunksToSrt } from "./srt";
+import { chunksToSrt, prepareCues } from "./srt";
 
 describe("chunksToSrt", () => {
   it("returns an empty string for no chunks", () => {
@@ -64,5 +64,56 @@ describe("chunksToSrt", () => {
     ]);
     expect(srt).toContain("話者1: First");
     expect(srt).toContain("話者2: Second");
+  });
+});
+
+describe("prepareCues", () => {
+  it("expands a near-zero-length cue to the minimum floor", () => {
+    const [cue] = prepareCues([{ text: "はい", timestamp: [1, 1.01] }]);
+    expect(cue.timestamp).toEqual([1, 1.2]);
+  });
+
+  it("collapses a degenerate repeated cue that arrives without time advancing", () => {
+    // Same text, second cue starting essentially where the first ended: the
+    // shape of a stalled decode re-emitting the same span, not a second
+    // utterance.
+    const cues = prepareCues([
+      { text: "はい", timestamp: [1, 2] },
+      { text: "はい", timestamp: [2.01, 3] },
+    ]);
+    expect(cues).toHaveLength(1);
+    expect(cues[0].timestamp).toEqual([1, 3]);
+  });
+
+  it("does not collapse the same text spoken again after real time has passed", () => {
+    const cues = prepareCues([
+      { text: "はい", timestamp: [0, 1] },
+      { text: "はい", timestamp: [3, 4] },
+    ]);
+    expect(cues).toHaveLength(2);
+    expect(cues.map((c) => c.timestamp)).toEqual([
+      [0, 1],
+      [3, 4],
+    ]);
+  });
+
+  it("trims an overlap by pulling the earlier cue's end back to the next cue's start", () => {
+    const cues = prepareCues([
+      { text: "前半", timestamp: [0, 2] },
+      { text: "後半", timestamp: [1.5, 3] },
+    ]);
+    expect(cues[0].timestamp).toEqual([0, 1.5]);
+    expect(cues[1].timestamp).toEqual([1.5, 3]);
+  });
+
+  it("leaves an overlap in place rather than shrinking a cue below the minimum floor", () => {
+    const cues = prepareCues([
+      { text: "前半", timestamp: [0, 2] },
+      { text: "後半", timestamp: [0.1, 3] },
+    ]);
+    // Trimming the first cue to end at 0.1 would leave a 0.1s cue, under
+    // MIN_CUE_LEN_SEC -- the overlap is left as-is instead.
+    expect(cues[0].timestamp).toEqual([0, 2]);
+    expect(cues[1].timestamp).toEqual([0.1, 3]);
   });
 });

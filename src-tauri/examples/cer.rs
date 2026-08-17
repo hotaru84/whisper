@@ -14,6 +14,12 @@
 //! build_full_params, collect_segments}` -- the same code the Tauri command uses
 //! -- so a number measured here reflects what the app actually produces.
 //!
+//! Also reports `whisper_scribe_lib::cues::analyze`'s reference-free structural
+//! metrics (dropped/reordered/collapsed cues) alongside CER. Those catch a
+//! decode-setting change that starts losing audio even when it does not move
+//! CER much -- see `cues.rs`'s doc comment for why they are a regression gate,
+//! not an accuracy score.
+//!
 //! Fixtures live in `fixtures/` as pairs: `<name>.wav` (16 kHz mono) plus
 //! `<name>.txt` (the reference transcript, UTF-8). They are gitignored.
 
@@ -24,6 +30,7 @@ use std::time::Instant;
 use whisper_rs::{WhisperContext, WhisperContextParameters};
 use whisper_scribe_lib::asr::{build_full_params, collect_segments, DecodeSettings};
 use whisper_scribe_lib::cer::score;
+use whisper_scribe_lib::cues::{self, QualityReport};
 use whisper_scribe_lib::wav::{self, SAMPLE_RATE};
 
 // ---------------------------------------------------------------------------
@@ -54,6 +61,8 @@ Usage: cargo run --release --example cer [options]
   --language <code>       ISO 639-1, or 'auto'     (default: ja)
   --beam <n>              beam size                (default: 5)
   --entropy-thold <f>     repetition guard         (default: 2.8)
+  --no-speech-thold <f>   no-speech chunk drop threshold (default: 0.6, higher = fewer dropped)
+  --logprob-thold <f>     decode-failure threshold (default: -1.0, lower = fewer dropped)
   --suppress-nst <bool>   drop non-speech tokens   (default: false)
   --threads <n>           CPU thread cap
   --prompt <text>         glossary fed as initial_prompt (~224 token budget)
@@ -99,6 +108,12 @@ fn parse_args() -> Result<Args, String> {
             "--entropy-thold" => {
                 args.settings.entropy_thold = value()?.parse().map_err(|e| format!("{e}"))?
             }
+            "--no-speech-thold" => {
+                args.settings.no_speech_thold = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--logprob-thold" => {
+                args.settings.logprob_thold = value()?.parse().map_err(|e| format!("{e}"))?
+            }
             "--suppress-nst" => args.settings.suppress_nst = parse_bool(&value()?)?,
             "--prompt" => args.settings.prompt = Some(value()?),
             "--prompt-file" => {
@@ -127,6 +142,7 @@ struct Outcome {
     audio_sec: f32,
     elapsed_sec: f32,
     hypothesis: String,
+    quality: QualityReport,
 }
 
 fn json_escape(s: &str) -> String {
@@ -208,10 +224,12 @@ fn run() -> Result<(), String> {
 
     println!("model        : {}", args.model.display());
     println!(
-        "settings     : language={:?} beam={} entropy_thold={} suppress_nst={} threads={}",
+        "settings     : language={:?} beam={} entropy_thold={} no_speech_thold={} logprob_thold={} suppress_nst={} threads={}",
         args.settings.language.as_deref().unwrap_or("auto"),
         args.settings.beam_size,
         args.settings.entropy_thold,
+        args.settings.no_speech_thold,
+        args.settings.logprob_thold,
         args.settings.suppress_nst,
         args.settings.n_threads,
     );
@@ -241,19 +259,22 @@ fn run() -> Result<(), String> {
         let mut state = ctx.create_state().map_err(|e| e.to_string())?;
         let params = build_full_params(&args.settings);
         state.full(params, &audio).map_err(|e| e.to_string())?;
-        let result = collect_segments(&state)?;
+        let result = collect_segments(&state, args.settings.vad_model_path.is_some())?;
         let elapsed_sec = started.elapsed().as_secs_f32();
 
         let (distance, ref_len, hyp_len) = score(&reference, &result.text, args.keep_punct);
+        let audio_sec = audio.len() as f32 / SAMPLE_RATE as f32;
+        let quality = cues::analyze(&result.chunks, audio_sec, &audio);
 
         outcomes.push(Outcome {
             name: name.clone(),
             ref_len,
             hyp_len,
             distance,
-            audio_sec: audio.len() as f32 / SAMPLE_RATE as f32,
+            audio_sec,
             elapsed_sec,
             hypothesis: result.text,
+            quality,
         });
     }
 
@@ -298,14 +319,45 @@ fn run() -> Result<(), String> {
         total_cer
     );
 
+    // Structural quality: a regression gate independent of the reference text
+    // (see cues.rs), so it stays meaningful even for fixtures without a .txt.
+    // CER can hold steady while these get worse -- a decode-setting change
+    // that trims a hallucination but starts dropping a chunk elsewhere would
+    // not necessarily move the CER needle much either way.
+    println!();
+    println!(
+        "{:<28} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "fixture", "zero_len", "reordered", "tail_gap", "gap_total", "voiced_gap"
+    );
+    println!("{}", "-".repeat(82));
+    for o in &outcomes {
+        let q = &o.quality;
+        println!(
+            "{:<28} {:>10} {:>10} {:>9.1}s {:>9.1}s {:>9.1}s",
+            o.name, q.zero_length_cues, q.out_of_order_pairs, q.tail_gap_sec, q.gap_total_sec, q.voiced_gap_sec
+        );
+    }
+    println!("{}", "-".repeat(82));
+    println!(
+        "{:<28} {:>10} {:>10} {:>9.1}s {:>9.1}s {:>9.1}s",
+        "TOTAL",
+        outcomes.iter().map(|o| o.quality.zero_length_cues).sum::<usize>(),
+        outcomes.iter().map(|o| o.quality.out_of_order_pairs).sum::<usize>(),
+        outcomes.iter().map(|o| o.quality.tail_gap_sec).sum::<f32>(),
+        outcomes.iter().map(|o| o.quality.gap_total_sec).sum::<f32>(),
+        outcomes.iter().map(|o| o.quality.voiced_gap_sec).sum::<f32>(),
+    );
+
     if let Some(json_path) = &args.json {
         let mut s = String::from("{\n");
         s.push_str(&format!("  \"model\": \"{}\",\n", json_escape(&args.model.display().to_string())));
         s.push_str(&format!(
-            "  \"settings\": {{ \"language\": \"{}\", \"beam_size\": {}, \"entropy_thold\": {}, \"suppress_nst\": {}, \"n_threads\": {} }},\n",
+            "  \"settings\": {{ \"language\": \"{}\", \"beam_size\": {}, \"entropy_thold\": {}, \"no_speech_thold\": {}, \"logprob_thold\": {}, \"suppress_nst\": {}, \"n_threads\": {} }},\n",
             json_escape(args.settings.language.as_deref().unwrap_or("auto")),
             args.settings.beam_size,
             args.settings.entropy_thold,
+            args.settings.no_speech_thold,
+            args.settings.logprob_thold,
             args.settings.suppress_nst,
             args.settings.n_threads
         ));
@@ -319,7 +371,7 @@ fn run() -> Result<(), String> {
                 o.distance as f64 / o.ref_len as f64 * 100.0
             };
             s.push_str(&format!(
-                "    {{ \"name\": \"{}\", \"ref_len\": {}, \"hyp_len\": {}, \"errors\": {}, \"cer_percent\": {:.4}, \"audio_sec\": {:.2}, \"elapsed_sec\": {:.2}, \"hypothesis\": \"{}\" }}{}\n",
+                "    {{ \"name\": \"{}\", \"ref_len\": {}, \"hyp_len\": {}, \"errors\": {}, \"cer_percent\": {:.4}, \"audio_sec\": {:.2}, \"elapsed_sec\": {:.2}, \"quality\": {{ \"zero_length_cues\": {}, \"out_of_order_pairs\": {}, \"tail_gap_sec\": {:.2}, \"gap_total_sec\": {:.2}, \"voiced_gap_sec\": {:.2} }}, \"hypothesis\": \"{}\" }}{}\n",
                 json_escape(&o.name),
                 o.ref_len,
                 o.hyp_len,
@@ -327,6 +379,11 @@ fn run() -> Result<(), String> {
                 cer,
                 o.audio_sec,
                 o.elapsed_sec,
+                o.quality.zero_length_cues,
+                o.quality.out_of_order_pairs,
+                o.quality.tail_gap_sec,
+                o.quality.gap_total_sec,
+                o.quality.voiced_gap_sec,
                 json_escape(&o.hypothesis),
                 if i + 1 == outcomes.len() { "" } else { "," }
             ));

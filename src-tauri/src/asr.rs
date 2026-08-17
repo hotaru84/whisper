@@ -209,6 +209,31 @@ pub struct TranscribeResult {
     /// down the transcription it was supposed to improve.
     #[serde(default)]
     pub vad_unavailable: bool,
+    /// Reference-free structural metrics (gaps, out-of-order cues) computed
+    /// over `chunks`. `transcribe_window` leaves this at its all-zero default
+    /// since a 15s window is too short for the metrics to mean anything;
+    /// `transcribe_recording` fills it in. See `crate::cues` for what each
+    /// field catches.
+    #[serde(default)]
+    pub quality: crate::cues::QualityReport,
+    /// Parallel to `chunks` (same index, same length once populated) --
+    /// `silence[i]` describes whether `chunks[i]` was judged to hold no
+    /// speech by `mark_silent_segments`. Empty from `transcribe_window`,
+    /// which never calls it. A parallel array rather than fields on
+    /// `TranscribeChunk` itself, matching how diarization speakers and
+    /// audio-event exclusion also ride alongside `chunks` by index.
+    #[serde(default)]
+    pub silence: Vec<SilenceMark>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SilenceMark {
+    pub silent: bool,
+    /// `None` when the chunk's interval (padded by `SILENCE_MARGIN_SEC`)
+    /// falls outside the audio -- there was nothing to measure, so nothing
+    /// is reported, and `silent` is `false` (see `mark_silent_segments`).
+    pub rms: Option<f32>,
 }
 
 /// Every decoding knob that affects transcription quality, in one place.
@@ -270,7 +295,7 @@ pub struct DecodeSettings {
     /// opposite case -- it cannot skip silence on the way in, since a meeting's
     /// pauses sit in the middle of audio that still has to be decoded as one
     /// piece -- so `transcribe_recording` fills this in by default. See
-    /// `drop_silent_segments` for the RMS-based safety net that stays regardless.
+    /// `mark_silent_segments` for the RMS-based safety net that stays regardless.
     pub vad_model_path: Option<String>,
     pub vad_threshold: f32,
     pub vad_min_speech_duration_ms: i32,
@@ -278,6 +303,39 @@ pub struct DecodeSettings {
     pub vad_max_speech_duration_s: f32,
     pub vad_speech_pad_ms: i32,
     pub vad_samples_overlap: f32,
+    /// whisper.cpp uses this threshold in two places that pull in opposite
+    /// directions, both gated jointly with `logprob_thold`:
+    ///
+    /// - Output suppression (whisper.cpp:7585-7586): a chunk with
+    ///   `no_speech_prob > no_speech_thold && avg_logprobs < logprob_thold`
+    ///   is dropped outright -- no output, and not even added to the rolling
+    ///   context for later chunks.
+    /// - Temperature-fallback retry (whisper.cpp:7554-7555): the *same* two
+    ///   thresholds, compared the other way (`avg_logprobs < logprob_thold &&
+    ///   no_speech_prob < no_speech_thold`), decide whether a decode is
+    ///   judged to have failed and gets retried at a higher temperature.
+    ///
+    /// A chunk with high `no_speech_prob` and bad `avg_logprobs` -- exactly
+    /// what a distant mic or overlapping speech produces -- fails neither
+    /// check outright: it does not clear the retry condition (`no_speech_prob`
+    /// is not `<` the threshold), so it is never retried, yet it does clear
+    /// the suppression condition, so its output is thrown away anyway. This
+    /// is the leading structural-loss suspect this field exists to let the
+    /// CER harness A/B (see README's "精度の測定"). whisper.cpp's own default
+    /// is `0.6`; README documents that *lowering* it (toward 0.1) does not
+    /// suppress silence hallucinations -- raising it, to stop suppressing
+    /// chunks whisper only weakly believes are speechless, is the untested
+    /// direction this field opens up.
+    pub no_speech_thold: f32,
+    /// See `no_speech_thold`'s doc comment for the two whisper.cpp conditions
+    /// this jointly gates. whisper.cpp's own default is `-1.0`; lowering it
+    /// (more negative) makes `avg_logprobs < logprob_thold` harder to
+    /// satisfy, which cuts both ways: fewer chunks get suppressed as
+    /// no-speech (the goal), but also fewer genuinely bad decodes become
+    /// eligible for a temperature-fallback retry. Change one of `this` or
+    /// `no_speech_thold` per run (README's "比較は一度に一項目だけ"), never
+    /// both, or a structural-metric delta cannot be attributed to either.
+    pub logprob_thold: f32,
 }
 
 impl Default for DecodeSettings {
@@ -300,6 +358,11 @@ impl Default for DecodeSettings {
             vad_max_speech_duration_s: f32::MAX,
             vad_speech_pad_ms: 30,
             vad_samples_overlap: 0.1,
+            // whisper.cpp's own defaults (whisper.cpp:5955-5956) -- unchanged
+            // until a run with a different value is measured to help (see the
+            // field doc comments).
+            no_speech_thold: 0.6,
+            logprob_thold: -1.0,
         }
     }
 }
@@ -336,6 +399,8 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
     params.set_translate(settings.translate);
     params.set_suppress_nst(settings.suppress_nst);
     params.set_entropy_thold(settings.entropy_thold);
+    params.set_no_speech_thold(settings.no_speech_thold);
+    params.set_logprob_thold(settings.logprob_thold);
     params.set_n_threads(settings.n_threads);
     // Each streaming window is its own `full()` call over <= 30s of audio, i.e.
     // always whisper's "first chunk", so the prompt conditions every window. That
@@ -376,6 +441,12 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
 /// off the segment boundary. Returns `None` when no token in the segment has
 /// a computed `t_dtw` (DTW disabled, or nothing but non-text tokens), so the
 /// caller can fall back to the segment-level timestamp.
+///
+/// **Only valid when VAD did not run on this decode.** `t_dtw` comes from
+/// `whisper_full_get_token_data_from_state`, which whisper.cpp never maps
+/// back off the VAD-compressed sample timeline (whisper.cpp:8041-8043) the
+/// way it does for the segment-level `t0`/`t1` (whisper.cpp:7953-7990). See
+/// `collect_segments`'s `vad` parameter, which is what actually gates this.
 fn dtw_segment_bounds(segment: &whisper_rs::WhisperSegment) -> Option<(i64, i64)> {
     let mut bounds: Option<(i64, i64)> = None;
     for i in 0..segment.n_tokens() {
@@ -397,16 +468,86 @@ fn dtw_segment_bounds(segment: &whisper_rs::WhisperSegment) -> Option<(i64, i64)
     bounds
 }
 
+/// Cue length floor, in centiseconds (200ms).
+///
+/// A Japanese mora runs roughly 100-150ms, so a one-token cue like "はい" is
+/// physically 200-300ms -- this is the shortest span whisper's own timing
+/// granularity can be expected to resolve. Below it, treat the bound as an
+/// artefact of coarse timestamps rather than a genuine sub-200ms utterance.
+const MIN_CUE_SPAN_CS: i64 = 20;
+
+/// Reconciles a DTW-derived token span against whisper's own segment
+/// envelope, and enforces [`MIN_CUE_SPAN_CS`].
+///
+/// DTW's job is to refine *within* the segment whisper already committed to,
+/// not contradict it -- so `dtw`, when present, is clamped into `envelope`
+/// rather than trusted outright. If DTW disagrees badly with the envelope
+/// (a stray token, or the VAD timeline issue documented on
+/// `dtw_segment_bounds` resurfacing some other way), the clamp is where that
+/// becomes visible as a tightened span instead of silently producing a bound
+/// whisper itself never reported.
+///
+/// No outlier rejection beyond the envelope clamp: whisper.cpp's DTW
+/// backtrace is monotonic in both token index and time
+/// (whisper.cpp:8677-8760, 8925-8950), so the min/max across a segment's
+/// tokens is never a statistical outlier -- it is simply the first and last
+/// token whisper assigned to the segment.
+///
+/// The floor expands the span symmetrically around its midpoint, then slides
+/// (never truncates) to stay inside `envelope` if that expansion would
+/// spill past it. If `envelope` itself is shorter than `min_span_cs`, it is
+/// returned unchanged: this function invents timing precision, never speech
+/// whisper didn't claim.
+fn sanitize_bounds(dtw: Option<(i64, i64)>, envelope: (i64, i64), min_span_cs: i64) -> (i64, i64) {
+    let e0 = envelope.0.max(0);
+    let e1 = envelope.1.max(e0);
+
+    let (t0, t1) = match dtw {
+        None => (e0, e1),
+        Some((d0, d1)) => {
+            let (d0, d1) = if d0 <= d1 { (d0, d1) } else { (d1, d0) };
+            (d0.clamp(e0, e1), d1.clamp(e0, e1))
+        }
+    };
+
+    if e1 - e0 < min_span_cs || t1 - t0 >= min_span_cs {
+        return (t0, t1);
+    }
+
+    let mid = (t0 + t1) / 2;
+    let mut new_t0 = mid - min_span_cs / 2;
+    let mut new_t1 = new_t0 + min_span_cs;
+    if new_t0 < e0 {
+        new_t1 += e0 - new_t0;
+        new_t0 = e0;
+    }
+    if new_t1 > e1 {
+        new_t0 -= new_t1 - e1;
+        new_t1 = e1;
+    }
+    (new_t0, new_t1)
+}
+
 /// Collects whisper's segments into the shape the frontend consumes.
 /// Timestamps are converted from whisper's centiseconds to seconds.
 ///
-/// When DTW token-level timestamps were computed (see `init_model`), segment
-/// bounds are taken from the DTW-aligned token span rather than the single
-/// timestamp token whisper's default segmentation happens to emit -- DTW
-/// tracks attention alignment through the decoder and lands much closer to
-/// the actual speech boundaries, which matters because diarization assigns
-/// speakers by overlapping these timestamps against diarizer segments.
-pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeResult, String> {
+/// `vad` must reflect whether VAD actually ran on this decode (i.e. whether
+/// `DecodeSettings::vad_model_path` was `Some` and resolved), not just
+/// whether the caller wanted it. When it did, DTW token bounds are **not**
+/// used, even though they were computed: whisper.cpp decodes VAD-enabled
+/// audio against a VAD-compressed sample buffer (whisper.cpp:7749-7762), and
+/// while `whisper_full_get_segment_t0/t1_from_state` map that back to the
+/// original timeline (whisper.cpp:7953-7990, with a 100ms floor),
+/// `whisper_full_get_token_data_from_state` -- what `dtw_segment_bounds`
+/// reads -- returns the raw, unconverted value (whisper.cpp:8041-8043). Using
+/// it under VAD would silently place every DTW-derived boundary on the wrong
+/// (compressed) timeline, which matters most for diarization: it assigns
+/// speakers by overlapping these timestamps against diarizer segments. With
+/// `vad == false`, DTW bounds are safe and preferred -- they track attention
+/// alignment through the decoder and land closer to the actual speech
+/// boundaries than the single timestamp token whisper's default segmentation
+/// emits.
+pub fn collect_segments(state: &whisper_rs::WhisperState, vad: bool) -> Result<TranscribeResult, String> {
     let n_segments = state.full_n_segments();
     let mut chunks = Vec::with_capacity(n_segments.max(0) as usize);
     let mut text = String::new();
@@ -418,8 +559,9 @@ pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeRe
         // tokens, and segment boundaries can land mid-UTF-8, which the strict
         // accessor rejects outright.
         let seg_text = segment.to_str_lossy().map_err(|e| e.to_string())?.into_owned();
-        let (t0_cs, t1_cs) = dtw_segment_bounds(&segment)
-            .unwrap_or((segment.start_timestamp(), segment.end_timestamp()));
+        let envelope = (segment.start_timestamp(), segment.end_timestamp());
+        let dtw = if vad { None } else { dtw_segment_bounds(&segment) };
+        let (t0_cs, t1_cs) = sanitize_bounds(dtw, envelope, MIN_CUE_SPAN_CS);
         let t0 = t0_cs as f32 / 100.0;
         let t1 = t1_cs as f32 / 100.0;
         text.push_str(&seg_text);
@@ -432,6 +574,8 @@ pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeRe
         text,
         chunks,
         vad_unavailable: false,
+        quality: crate::cues::QualityReport::default(),
+        silence: Vec::new(),
     })
 }
 
@@ -496,7 +640,8 @@ pub async fn transcribe_window(
             .full(params, &samples)
             .map_err(|e| e.to_string())?;
 
-        collect_segments(&whisper_state)
+        // No VAD in the live path -- `settings` never sets `vad_model_path`.
+        collect_segments(&whisper_state, false)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -527,7 +672,10 @@ pub const SILENCE_RMS: f32 = 1e-3;
 /// conservative value rather than guessing a smaller one down.
 const SILENCE_MARGIN_SEC: f32 = 1.0;
 
-fn rms(samples: &[f32]) -> f32 {
+/// Shared with `cues::analyze`, which needs the same RMS definition to decide
+/// whether a gap between cues held speech that was lost rather than silence
+/// that was correctly skipped.
+pub(crate) fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -535,7 +683,7 @@ fn rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f64).sqrt() as f32
 }
 
-/// Removes segments whose own audio contains no speech.
+/// Flags segments whose own audio contains no speech, without removing them.
 ///
 /// Handed silence, whisper does not return nothing -- it confidently invents a
 /// stock phrase (「ご視聴ありがとうございました」) or loops a few characters, and
@@ -544,33 +692,135 @@ fn rms(samples: &[f32]) -> f32 {
 /// silent window; the whole-file pass cannot, because a meeting's pauses are in
 /// the middle of the audio it has to decode as one piece.
 ///
-/// The test is the audio, never the text: a segment is dropped only when the
+/// The test is the audio, never the text: a segment is flagged only when the
 /// recording is silent across its interval *and* a second either side. Text-based
 /// filtering would eventually delete a real sentence for resembling a stock
 /// phrase; this cannot, because silent audio provably has no speech in it.
-pub fn drop_silent_segments(result: TranscribeResult, samples: &[f32]) -> TranscribeResult {
+///
+/// Named `mark_` rather than `drop_`: this used to filter chunks out
+/// entirely, which left a silent gap in the transcript indistinguishable from
+/// a decode that simply produced nothing there -- neither the user nor
+/// `cues::QualityReport` could tell those two cases apart. Marking instead of
+/// dropping lets the frontend render a placeholder
+/// (`TranscriptSegment.excludedReason`, the same mechanism
+/// `events::classify_chunks` already uses for non-speech audio events) so a
+/// listener can tell why a gap exists, while `chunks` -- and therefore
+/// `cues::analyze`'s view of the decode -- stays exactly what whisper
+/// produced.
+pub fn mark_silent_segments(result: TranscribeResult, samples: &[f32]) -> (TranscribeResult, Vec<SilenceMark>) {
     let sr = crate::wav::SAMPLE_RATE as f32;
-    let vad_unavailable = result.vad_unavailable;
-    let kept: Vec<TranscribeChunk> = result
+    let marks: Vec<SilenceMark> = result
         .chunks
-        .into_iter()
-        .filter(|chunk| {
+        .iter()
+        .map(|chunk| {
             let from = ((chunk.timestamp.0 - SILENCE_MARGIN_SEC) * sr).max(0.0) as usize;
             let to = (((chunk.timestamp.1 + SILENCE_MARGIN_SEC) * sr) as usize).min(samples.len());
             // An interval that lands outside the audio tells us nothing about
-            // whether it holds speech, so keep the segment.
+            // whether it holds speech, so it is not flagged.
             if from >= to {
-                return true;
+                return SilenceMark { silent: false, rms: None };
             }
-            rms(&samples[from..to]) >= SILENCE_RMS
+            let measured = rms(&samples[from..to]);
+            SilenceMark { silent: measured < SILENCE_RMS, rms: Some(measured) }
         })
         .collect();
 
-    TranscribeResult {
-        text: kept.iter().map(|c| c.text.as_str()).collect(),
-        chunks: kept,
-        vad_unavailable,
+    (result, marks)
+}
+
+/// Padding added on each side of a gap before re-decoding it, in seconds.
+///
+/// Just enough to give the decoder a little context on either side rather
+/// than a hard cut mid-word; not meant to recover surrounding audio -- the
+/// chunks returned from a padded decode are always clamped back to the gap's
+/// own bounds before merging (see `redecode_voiced_gaps`), so widening this
+/// only changes how much context whisper sees, never how much of the
+/// neighboring, already-transcribed audio can leak into the result.
+const GAP_REDECODE_MARGIN_SEC: f32 = 0.5;
+
+/// Re-decodes gaps between cues whose underlying audio is not silent.
+///
+/// Mitigates whisper.cpp's "single timestamp ending" behavior
+/// (whisper.cpp:7725-7731): a decode that ends on a lone timestamp token
+/// jumps `seek` forward by a full 30-second chunk without ever decoding the
+/// audio in between. The main pass has no way to notice this from the
+/// inside -- `full()` owns its seek loop end to end -- so this runs
+/// afterward, over exactly the gaps `cues::analyze` would report as
+/// `voiced_gap_sec`.
+///
+/// Each gap is decoded in total isolation via a fresh `WhisperState`, with no
+/// token context carried in from the chunks on either side. That is a real
+/// cost -- context is the main pass's whole advantage over the live pass --
+/// so this is deliberately narrow: it can only help a gap that whisper simply
+/// never attempted, not one it attempted badly. A gap decode's own output is
+/// clamped to the gap's exact bounds before merging, so it can only add
+/// cues inside the gap, never touch or duplicate what is already on either
+/// side of it. Does nothing, and costs nothing beyond one RMS check per gap,
+/// when there are no voiced gaps to begin with.
+pub fn redecode_voiced_gaps(
+    ctx: &WhisperContext,
+    settings: &DecodeSettings,
+    vad: bool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    chunks: Vec<TranscribeChunk>,
+    samples: &[f32],
+) -> Result<Vec<TranscribeChunk>, String> {
+    let sr = crate::wav::SAMPLE_RATE as f32;
+    let mut inserted: Vec<TranscribeChunk> = Vec::new();
+
+    for pair in chunks.windows(2) {
+        let gap_start = pair[0].timestamp.1;
+        let gap_end = pair[1].timestamp.0;
+        if gap_end - gap_start <= 0.0 {
+            continue;
+        }
+
+        let padded_from = ((gap_start - GAP_REDECODE_MARGIN_SEC) * sr).max(0.0) as usize;
+        let padded_to = (((gap_end + GAP_REDECODE_MARGIN_SEC) * sr) as usize).min(samples.len());
+        if padded_from >= padded_to || rms(&samples[padded_from..padded_to]) < SILENCE_RMS {
+            continue;
+        }
+
+        crate::cancel::check(cancel)?;
+
+        let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+        let mut params = build_full_params(settings);
+        let abort_flag = std::sync::Arc::clone(cancel);
+        let abort: Box<dyn FnMut() -> bool> =
+            Box::new(move || abort_flag.load(std::sync::atomic::Ordering::Relaxed));
+        params.set_abort_callback_safe(abort);
+        if let Err(e) = state.full(params, &samples[padded_from..padded_to]) {
+            crate::cancel::check(cancel)?;
+            return Err(e.to_string());
+        }
+
+        let offset_sec = padded_from as f32 / sr;
+        for c in collect_segments(&state, vad)?.chunks {
+            // Clamp to the gap's own bounds: a decode given padded context can
+            // legitimately place a token in the padding, but that padding
+            // overlaps audio the main pass already transcribed, so anything
+            // outside [gap_start, gap_end) would duplicate an existing cue
+            // rather than fill the gap.
+            let t0 = (c.timestamp.0 + offset_sec).max(gap_start);
+            let t1 = (c.timestamp.1 + offset_sec).min(gap_end);
+            if t1 > t0 {
+                inserted.push(TranscribeChunk { text: c.text, timestamp: (t0, t1) });
+            }
+        }
     }
+
+    if inserted.is_empty() {
+        return Ok(chunks);
+    }
+    let mut merged = chunks;
+    merged.extend(inserted);
+    merged.sort_by(|a, b| {
+        a.timestamp
+            .0
+            .partial_cmp(&b.timestamp.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(merged)
 }
 
 /// Re-transcribes a finished recording in one pass over the whole file.
@@ -648,6 +898,10 @@ pub async fn transcribe_recording(
             vad_threshold,
             ..DecodeSettings::default()
         };
+        // Whether VAD actually ran, not just whether it was requested -- a
+        // missing model file above falls back to `None` and still has to
+        // decode (and collect segments) as if VAD were off.
+        let vad_active = settings.vad_model_path.is_some();
         let mut params = build_full_params(&settings);
 
         // whisper calls this far more often than once per percent; emitting only
@@ -685,12 +939,82 @@ pub async fn transcribe_recording(
             return Err(e.to_string());
         }
 
-        let mut result = drop_silent_segments(collect_segments(&whisper_state)?, &samples);
+        let mut result = collect_segments(&whisper_state, vad_active)?;
+        result.chunks = redecode_voiced_gaps(ctx, &settings, vad_active, &cancel, result.chunks, &samples)?;
+        result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
+
+        let (mut result, silence) = mark_silent_segments(result, &samples);
         result.vad_unavailable = vad_unavailable;
+        result.silence = silence;
+        let duration_sec = samples.len() as f32 / crate::wav::SAMPLE_RATE as f32;
+        result.quality = crate::cues::analyze(&result.chunks, duration_sec, &samples);
         Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod sanitize_bounds_tests {
+    use super::sanitize_bounds;
+
+    #[test]
+    fn no_dtw_returns_the_envelope_unchanged_when_it_already_meets_the_floor() {
+        assert_eq!(sanitize_bounds(None, (100, 300), 20), (100, 300));
+    }
+
+    #[test]
+    fn dtw_within_the_envelope_is_kept_as_is() {
+        assert_eq!(sanitize_bounds(Some((110, 290)), (100, 300), 20), (110, 290));
+    }
+
+    #[test]
+    fn dtw_spilling_past_the_envelope_is_clamped_into_it() {
+        // A stray token (or the VAD timeline issue) pushing DTW outside what
+        // whisper itself reported must never widen the cue past the envelope.
+        assert_eq!(sanitize_bounds(Some((50, 400)), (100, 300), 20), (100, 300));
+    }
+
+    #[test]
+    fn a_swapped_dtw_pair_is_normalised_before_clamping() {
+        assert_eq!(sanitize_bounds(Some((290, 110)), (100, 300), 20), (110, 290));
+    }
+
+    #[test]
+    fn a_short_span_is_expanded_symmetrically_around_its_midpoint() {
+        // dtw=(145,155): midpoint 150, floored to a 20cs span -> (140, 160).
+        assert_eq!(sanitize_bounds(Some((145, 155)), (0, 1000), 20), (140, 160));
+    }
+
+    #[test]
+    fn expansion_slides_rather_than_truncates_at_the_envelope_start() {
+        // Midpoint 5 wants (-5, 15), but the envelope starts at 0: slide the
+        // whole window right instead of clipping it to (0, 15) (a 15cs span).
+        assert_eq!(sanitize_bounds(Some((0, 10)), (0, 1000), 20), (0, 20));
+    }
+
+    #[test]
+    fn expansion_slides_rather_than_truncates_at_the_envelope_end() {
+        assert_eq!(sanitize_bounds(Some((990, 1000)), (0, 1000), 20), (980, 1000));
+    }
+
+    #[test]
+    fn an_envelope_shorter_than_the_floor_is_returned_unchanged() {
+        // Nothing to expand into: whisper only claimed 100-110, and 10cs of
+        // silence-filling time must not be invented on either side of it.
+        assert_eq!(sanitize_bounds(None, (100, 110), 20), (100, 110));
+        assert_eq!(sanitize_bounds(Some((102, 108)), (100, 110), 20), (102, 108));
+    }
+
+    #[test]
+    fn a_zero_length_envelope_is_returned_unchanged() {
+        assert_eq!(sanitize_bounds(None, (150, 150), 20), (150, 150));
+    }
+
+    #[test]
+    fn a_negative_envelope_is_normalised_to_zero() {
+        assert_eq!(sanitize_bounds(None, (-50, 30), 20), (0, 30));
+    }
 }
 
 #[cfg(test)]
@@ -719,36 +1043,44 @@ mod silence_tests {
             text: chunks.iter().map(|c| c.text.as_str()).collect(),
             chunks,
             vad_unavailable: false,
+            quality: crate::cues::QualityReport::default(),
+            silence: Vec::new(),
         }
     }
 
     #[test]
-    fn drops_a_hallucination_sitting_in_a_silent_stretch() {
-        // 10s of silence: whatever whisper claims is there, is not.
+    fn flags_a_hallucination_sitting_in_a_silent_stretch() {
+        // 10s of silence: whatever whisper claims is there, is not -- but the
+        // chunk stays, and the transcript's own text is untouched.
         let audio = tone(10.0, 0.0);
-        let out = drop_silent_segments(
+        let (out, marks) = mark_silent_segments(
             result(vec![chunk("ご視聴ありがとうございました", 3.0, 6.0)]),
             &audio,
         );
-        assert!(out.chunks.is_empty());
-        assert_eq!(out.text, "");
+        assert_eq!(out.chunks.len(), 1);
+        assert_eq!(out.text, "ご視聴ありがとうございました");
+        assert_eq!(marks.len(), 1);
+        assert!(marks[0].silent);
+        assert!(marks[0].rms.unwrap() < SILENCE_RMS);
     }
 
     #[test]
-    fn keeps_segments_backed_by_audible_audio() {
-        let out = drop_silent_segments(result(vec![chunk("おはようございます", 1.0, 4.0)]), &tone(10.0, 0.2));
+    fn does_not_flag_segments_backed_by_audible_audio() {
+        let (out, marks) =
+            mark_silent_segments(result(vec![chunk("おはようございます", 1.0, 4.0)]), &tone(10.0, 0.2));
         assert_eq!(out.chunks.len(), 1);
         assert_eq!(out.text, "おはようございます");
+        assert!(!marks[0].silent);
     }
 
     #[test]
-    fn keeps_speech_and_drops_only_the_silent_pause_between_it() {
+    fn flags_only_the_silent_pause_between_two_speech_segments() {
         // speech | silence | speech, 10s each.
         let mut audio = tone(10.0, 0.2);
         audio.extend(tone(10.0, 0.0));
         audio.extend(tone(10.0, 0.2));
 
-        let out = drop_silent_segments(
+        let (out, marks) = mark_silent_segments(
             result(vec![
                 chunk("前半です", 1.0, 8.0),
                 chunk("ご視聴ありがとうございました", 12.0, 18.0),
@@ -756,47 +1088,53 @@ mod silence_tests {
             ]),
             &audio,
         );
+        // Nothing is removed: all three chunks and their text survive.
         assert_eq!(
             out.chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            vec!["前半です", "後半です"]
+            vec!["前半です", "ご視聴ありがとうございました", "後半です"]
         );
-        assert_eq!(out.text, "前半です後半です");
+        assert_eq!(marks.iter().map(|m| m.silent).collect::<Vec<_>>(), vec![false, true, false]);
     }
 
     #[test]
-    fn a_timestamp_off_by_under_a_second_still_keeps_real_speech() {
+    fn a_timestamp_off_by_under_a_second_still_reads_as_real_speech() {
         // The reason for the margin: whisper's timestamps are coarse, so a segment
-        // can point just past the speech it transcribed. Dropping that would delete
-        // a real sentence, which is far worse than keeping a hallucination.
+        // can point just past the speech it transcribed. Flagging that as silent
+        // would mislabel a real sentence, which is far worse than a false negative
+        // on a hallucination.
         let mut audio = tone(5.0, 0.2);
         audio.extend(tone(10.0, 0.0));
         // Claims 5.3-6.0, which is silent; the speech ends at 5.0.
-        let out = drop_silent_segments(result(vec![chunk("実際の発話", 5.3, 6.0)]), &audio);
-        assert_eq!(out.chunks.len(), 1);
+        let (_, marks) = mark_silent_segments(result(vec![chunk("実際の発話", 5.3, 6.0)]), &audio);
+        assert!(!marks[0].silent);
     }
 
     #[test]
-    fn quiet_speech_just_above_the_threshold_survives() {
-        let out = drop_silent_segments(
+    fn quiet_speech_just_above_the_threshold_is_not_flagged() {
+        let (_, marks) = mark_silent_segments(
             result(vec![chunk("小さな声", 1.0, 4.0)]),
             &tone(10.0, SILENCE_RMS * 2.0),
         );
-        assert_eq!(out.chunks.len(), 1);
+        assert!(!marks[0].silent);
     }
 
     #[test]
-    fn keeps_segments_whose_timestamps_fall_outside_the_audio() {
-        // Nothing to measure means no evidence to drop on.
-        let out = drop_silent_segments(result(vec![chunk("末尾", 30.0, 32.0)]), &tone(5.0, 0.2));
-        assert_eq!(out.chunks.len(), 1);
+    fn segments_whose_timestamps_fall_outside_the_audio_are_not_flagged() {
+        // Nothing to measure means no evidence to flag on.
+        let (_, marks) = mark_silent_segments(result(vec![chunk("末尾", 30.0, 32.0)]), &tone(5.0, 0.2));
+        assert!(!marks[0].silent);
+        assert_eq!(marks[0].rms, None);
     }
 
     #[test]
     fn handles_an_empty_result_and_empty_audio() {
-        assert!(drop_silent_segments(result(vec![]), &tone(5.0, 0.2)).chunks.is_empty());
+        let (out, marks) = mark_silent_segments(result(vec![]), &tone(5.0, 0.2));
+        assert!(out.chunks.is_empty());
+        assert!(marks.is_empty());
         // No audio at all: keep the text rather than silently erasing a transcript.
-        let out = drop_silent_segments(result(vec![chunk("a", 0.0, 1.0)]), &[]);
+        let (out, marks) = mark_silent_segments(result(vec![chunk("a", 0.0, 1.0)]), &[]);
         assert_eq!(out.chunks.len(), 1);
+        assert!(!marks[0].silent);
     }
 
     #[test]
