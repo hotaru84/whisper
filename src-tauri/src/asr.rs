@@ -738,6 +738,25 @@ pub fn mark_silent_segments(result: TranscribeResult, samples: &[f32]) -> (Trans
 /// neighboring, already-transcribed audio can leak into the result.
 const GAP_REDECODE_MARGIN_SEC: f32 = 0.5;
 
+/// Gap length floor, in seconds, below which a redecode is not attempted.
+///
+/// Every redecode costs roughly the same ~2s of GPU time as the main pass's
+/// own 30-second windows regardless of how little audio the gap actually
+/// holds -- whisper.cpp always encodes a full 30s window and silence-pads
+/// anything shorter (see README's "GPU コストは同じ約2秒"). Without a floor,
+/// ordinary inter-sentence pauses (breath, hesitation, room tone) that clear
+/// `SILENCE_RMS` each pay that full cost even though they hold nothing
+/// whisper actually dropped, and a real recording has many of them -- this
+/// was measured to multiply the whole-file pass's runtime several times over.
+///
+/// The failure mode this function exists to catch -- whisper.cpp abandoning
+/// a whole 30s chunk on a lone timestamp token -- only ever produces gaps on
+/// that same order, so a short pause clearing this floor is not the case
+/// this function is for. `cues::analyze`'s `voiced_gap_sec` is a cheap way
+/// to check the trade-off on a real recording (`examples/reanalyze.rs`) if
+/// this needs re-tuning.
+const MIN_GAP_REDECODE_SEC: f32 = 1.5;
+
 /// Re-decodes gaps between cues whose underlying audio is not silent.
 ///
 /// Mitigates whisper.cpp's "single timestamp ending" behavior
@@ -746,7 +765,7 @@ const GAP_REDECODE_MARGIN_SEC: f32 = 0.5;
 /// audio in between. The main pass has no way to notice this from the
 /// inside -- `full()` owns its seek loop end to end -- so this runs
 /// afterward, over exactly the gaps `cues::analyze` would report as
-/// `voiced_gap_sec`.
+/// `voiced_gap_sec`, longer than [`MIN_GAP_REDECODE_SEC`].
 ///
 /// Each gap is decoded in total isolation via a fresh `WhisperState`, with no
 /// token context carried in from the chunks on either side. That is a real
@@ -755,7 +774,7 @@ const GAP_REDECODE_MARGIN_SEC: f32 = 0.5;
 /// never attempted, not one it attempted badly. A gap decode's own output is
 /// clamped to the gap's exact bounds before merging, so it can only add
 /// cues inside the gap, never touch or duplicate what is already on either
-/// side of it. Does nothing, and costs nothing beyond one RMS check per gap,
+/// side of it. Does nothing, and costs nothing beyond one comparison per gap,
 /// when there are no voiced gaps to begin with.
 pub fn redecode_voiced_gaps(
     ctx: &WhisperContext,
@@ -771,7 +790,7 @@ pub fn redecode_voiced_gaps(
     for pair in chunks.windows(2) {
         let gap_start = pair[0].timestamp.1;
         let gap_end = pair[1].timestamp.0;
-        if gap_end - gap_start <= 0.0 {
+        if gap_end - gap_start < MIN_GAP_REDECODE_SEC {
             continue;
         }
 

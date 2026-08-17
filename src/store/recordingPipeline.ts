@@ -172,14 +172,26 @@ export async function runAccuracyPipeline(
   // rebases anything -- see nonBlankChunks' doc comment.
   const targets = nonBlankChunks(result).map((c) => c.timestamp);
 
+  // Independent Rust-side commands -- diarization is sherpa-onnx, audio
+  // tagging loads its own model per call (see events.rs's module doc), and
+  // neither touches the whisper model's mutex the way transcribeRecording
+  // above does -- so they're started together rather than one `await`ed
+  // before the other even begins. Both invoke() calls fire before either is
+  // awaited, so the two spawn_blocking passes actually overlap instead of
+  // stacking their multi-minute runtimes back to back.
+  const diarizePromise =
+    diarizeSettings.enabled && targets.length > 0
+      ? asrClient.diarizeRecording(path, targets, diarizeSettings)
+      : undefined;
+  const audioEventsPromise =
+    audioEventSettings.enabled && targets.length > 0
+      ? asrClient.detectAudioEvents(path, targets, audioEventSettings)
+      : undefined;
+
   let speakers: Array<number | null> | undefined;
-  if (diarizeSettings.enabled && targets.length > 0) {
+  if (diarizePromise) {
     try {
-      speakers = await asrClient.diarizeRecording(
-        path,
-        targets,
-        diarizeSettings,
-      );
+      speakers = await diarizePromise;
     } catch (err) {
       if (isCancelledError(err)) return { cancelled: true };
       // Distinguished from a genuine failure so the common case -- diarization
@@ -196,13 +208,9 @@ export async function runAccuracyPipeline(
 
   let excluded: boolean[] | undefined;
   let newEvents: AudioEvent[] = [];
-  if (audioEventSettings.enabled && targets.length > 0) {
+  if (audioEventsPromise) {
     try {
-      const eventResult = await asrClient.detectAudioEvents(
-        path,
-        targets,
-        audioEventSettings,
-      );
+      const eventResult = await audioEventsPromise;
       excluded = eventResult.exclude;
       newEvents = eventResult.events;
     } catch (err) {
