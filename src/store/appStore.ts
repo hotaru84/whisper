@@ -14,7 +14,14 @@ import type {
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
 import { segmentsFromResult } from "../lib/transcript";
-import { saveRecordingHistory, listRecordings, loadRecording, deleteRecording, wavPath } from "../lib/history";
+import {
+  saveRecordingHistory,
+  listRecordings,
+  loadRecording,
+  deleteRecording,
+  wavPath,
+  recoverInterruptedRecordings as recoverInterruptedRecordingsOnDisk,
+} from "../lib/history";
 import type { RecordingHistoryMeta, RecordingHistoryEntry } from "../lib/history";
 import {
   startPcmRecording,
@@ -223,6 +230,11 @@ interface AppState {
   refreshAudioInputDevices: () => Promise<void>;
   refreshAppAudioApps: () => Promise<void>;
   refreshRecordingHistory: () => Promise<void>;
+  /** Files any recording whose take never got to stop -- see
+   * `recoverInterruptedRecordings` in `history.ts` for what leaves one behind.
+   * Startup only, and self-guarded so it can only ever run once: a live take's
+   * WAV is indistinguishable from an interrupted one on disk. */
+  recoverInterruptedRecordings: () => Promise<void>;
   loadHistoryEntry: (id: string) => Promise<void>;
   /** Backs out of viewing whatever recording is currently shown (browsed
    * from the sidebar, or just finished) to the same blank state a fresh
@@ -398,6 +410,59 @@ let recordingPaused = false;
 // there would let a mode change land between start and stop and send a
 // record-only take down the refine path (or worse, the reverse).
 let recordingRecordOnly = false;
+// Whether `recoverInterruptedRecordings` has already run for this app session.
+// Module state rather than a store field because nothing renders it, and
+// because it must survive every `set()` that resets recording state.
+let recoveryAttempted = false;
+
+/**
+ * The microphone stopped delivering audio on its own (see `pcmRecorder.ts`'s
+ * `onDropout`): the device was removed, or the audio graph did not survive
+ * whatever the machine just did -- a resume from suspend being the usual
+ * culprit.
+ *
+ * Stopping is the safe response, and the only one that loses nothing. The take
+ * cannot continue (a dead capture never revives), and leaving it "recording"
+ * means the user goes on believing the meeting is being captured while the WAV
+ * stops growing -- the failure mode this whole path exists to remove. Stopping
+ * runs the normal post-stop pipeline instead, so everything up to the dropout
+ * is transcribed, filed in history and playable.
+ *
+ * The notice is set before stopping so it survives into the stopped screen:
+ * `stopRecording`'s own pipeline only overwrites `refineNotice` when it has
+ * something of its own to say.
+ */
+function handleMicDropout(reason: "ended" | "stalled"): void {
+  // Keyed on the recorder itself rather than `recordingPhase`: the two
+  // disagree at both ends of a take (the phase flips after the recorder is
+  // built, and `stopRecording` clears the recorder before its pipeline
+  // finishes), and "is there something to stop" is the actual question.
+  if (!activeRecorder) return;
+  const cause =
+    reason === "ended"
+      ? "マイクが切断されたため"
+      : "マイクからの音声が途絶えたため（PC のスリープなどが原因の可能性があります）";
+  useAppStore.setState({
+    refineNotice: `${cause}、録音を終了しました。ここまでの録音は保存されています。`,
+  });
+  void useAppStore.getState().stopRecording();
+}
+
+/**
+ * How long the current take has actually captured, in seconds, or null when no
+ * take is running.
+ *
+ * Derived from the sample count rather than wall clock, which is the only
+ * version that stays true: samples do not accumulate while paused, and they do
+ * not accumulate while the machine is suspended either (the process is frozen;
+ * no frames arrive). A clock-based elapsed time silently drifts past the real
+ * recording length on the first suspend and never comes back -- and the WAV,
+ * the transcript offsets and every seek position are all sample-derived, so the
+ * clock would be the one thing disagreeing with all of them.
+ */
+export function activeRecordedSec(): number | null {
+  return activeRecorder ? activeRecorder.capturedSamples() / WHISPER_SAMPLE_RATE : null;
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
@@ -477,6 +542,29 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Best-effort, like the other list refreshes -- the sidebar just stays
       // at whatever it last had.
       console.warn("[history] failed to list recordings:", err);
+    }
+  },
+
+  recoverInterruptedRecordings: async () => {
+    // Once per app run, and never while a take exists: the WAV of a recording
+    // that is still being written looks exactly like one that was interrupted,
+    // and filing it would hand the same id to two different code paths.
+    if (recoveryAttempted) return;
+    if (get().recordingPhase !== "stopped" || get().startingRecording) return;
+    recoveryAttempted = true;
+    try {
+      const recovered = await recoverInterruptedRecordingsOnDisk(get().settings.language);
+      if (recovered.length === 0) return;
+      await get().refreshRecordingHistory();
+      set({
+        refineNotice:
+          `前回終了できなかった録音を ${recovered.length} 件、履歴に復元しました（未解析）。` +
+          `履歴から選んで「解析」を実行すると文字起こしできます。`,
+      });
+    } catch (err) {
+      // Best-effort, like the other startup refreshes: the recordings that
+      // were already listable are unaffected either way.
+      console.warn("[history] failed to recover interrupted recordings:", err);
     }
   },
 
@@ -691,6 +779,19 @@ export const useAppStore = create<AppState>((set, get) => ({
         : new StreamingTranscriber(
             (audio) => asrClient.transcribe(audio, get().settings),
             appendStreamingSegment,
+            {
+              // The live pass gave up on a window -- the realistic cause being
+              // the GPU backend not surviving a suspend/resume, after which
+              // every call fails. Worth saying, but not worth stopping for:
+              // the recording is untouched and the post-stop pass re-reads the
+              // whole file, so the text comes back when the take ends.
+              onWindowDropped: () => {
+                set({
+                  refineNotice:
+                    "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の精度向上パスで文字起こしされます）。",
+                });
+              },
+            },
           );
 
       // Live audio-event preview, only when the feature is on -- see
@@ -764,12 +865,16 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
 
-      const controller = await startPcmRecording((frame) => {
-        const mixed = appAudioActive ? mixer.mix(frame) : frame;
-        streamer?.pushFrame(mixed);
-        eventStreamer?.pushFrame(mixed);
-        if (captureStarted) capture.push(mixed);
-      }, get().settings.inputDeviceId || undefined);
+      const controller = await startPcmRecording(
+        (frame) => {
+          const mixed = appAudioActive ? mixer.mix(frame) : frame;
+          streamer?.pushFrame(mixed);
+          eventStreamer?.pushFrame(mixed);
+          if (captureStarted) capture.push(mixed);
+        },
+        get().settings.inputDeviceId || undefined,
+        handleMicDropout,
+      );
       activeRecorder = controller;
       activeStreamer = streamer;
       activeEventStreamer = eventStreamer;

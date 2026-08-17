@@ -228,4 +228,74 @@ describe("StreamingTranscriber", () => {
     expect(segments.length).toBe(0);
     expect(calls).toBeLessThanOrEqual(6);
   });
+
+  // The suspend/resume case: whisper's GPU backend can come back from a
+  // suspend unusable, after which every window fails. The recording must not
+  // pay for that -- neither in memory nor in a retry storm.
+  describe("when the backend keeps failing", () => {
+    it("retries, then drops the window instead of buffering it forever", async () => {
+      let calls = 0;
+      const dropped: unknown[] = [];
+      const t = new StreamingTranscriber(
+        () => {
+          calls++;
+          return Promise.reject(new Error("device lost"));
+        },
+        () => {},
+        { onWindowDropped: (err) => dropped.push(err), retryBackoffMs: 0 },
+      );
+
+      // Three windows' worth: without the give-up path this audio would all
+      // still be held, and every frame would trigger another attempt.
+      await feed(t, 45);
+      await t.finish();
+
+      expect(dropped.length).toBeGreaterThan(0);
+      // Retries are bounded per window, not per frame (450 frames were fed).
+      expect(calls).toBeLessThanOrEqual(12);
+    });
+
+    it("recovers and commits again once the backend comes back", async () => {
+      let failuresLeft = 2; // fewer than MAX_WINDOW_FAILURES, so nothing is dropped
+      const dropped: unknown[] = [];
+      const segments: StreamingSegment[] = [];
+      const t = new StreamingTranscriber(
+        (audio) => {
+          if (failuresLeft > 0) {
+            failuresLeft--;
+            return Promise.reject(new Error("device lost"));
+          }
+          return wordsMock(audio);
+        },
+        (s) => segments.push(s),
+        { onWindowDropped: (err) => dropped.push(err), retryBackoffMs: 0 },
+      );
+
+      await feed(t, 45);
+      await t.finish();
+
+      expect(dropped).toEqual([]);
+      // The retried window's audio was kept, so its words are still committed.
+      const words = segments.flatMap((s) => s.chunks.map((c) => c.text.trim()));
+      expect(words).toContain("w0");
+      expect(words).toContain("w40");
+    });
+
+    it("backs off instead of retrying on every frame", async () => {
+      let calls = 0;
+      const t = new StreamingTranscriber(
+        () => {
+          calls++;
+          return Promise.reject(new Error("device lost"));
+        },
+        () => {},
+        { retryBackoffMs: 60_000 }, // longer than this test's lifetime
+      );
+
+      await feed(t, 45);
+
+      // One attempt, then the backoff holds off every subsequent frame.
+      expect(calls).toBe(1);
+    });
+  });
 });

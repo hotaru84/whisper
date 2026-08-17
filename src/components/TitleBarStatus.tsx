@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
-import { useAppStore, type RecordingPhase } from "../store/appStore";
+import { useAppStore, activeRecordedSec, type RecordingPhase } from "../store/appStore";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
@@ -8,12 +8,22 @@ import { formatTimestamp, formatDateTime } from "../lib/format";
  * second. Local to this component -- nothing else in the app needs a live
  * clock, so it isn't worth a store field.
  *
- * Sums only the *active* spans rather than measuring from a single start
- * timestamp: paused time is not recorded, so counting it would make the
- * display disagree with the WAV's real duration and with every segment offset.
- * Accumulating across spans is also what keeps a resume from resetting the
- * readout to 0:00, which a plain `Date.now() - startedAt` keyed on the phase
- * would do every time.
+ * Read from the recorder's captured-sample count (`activeRecordedSec`) rather
+ * than measured here, so the readout is the recording's real length and not an
+ * estimate of it. Two things break a clock-based version, and only one of them
+ * is fixable by being careful with timestamps:
+ *
+ * - Paused spans are not recorded, so counting them would make the display
+ *   disagree with the WAV and with every segment offset. (Summing active spans
+ *   handled this, which is what this used to do.)
+ * - A suspended machine records nothing either, but *does* keep the clock
+ *   running. There is no arrangement of `Date.now()` readings that can tell how
+ *   much of the elapsed time the process was frozen for -- the sample count is
+ *   the only thing that knows.
+ *
+ * The wall-clock sum survives as a fallback for the window between the record
+ * button being pressed and the recorder actually existing (`startingRecording`),
+ * where there are no samples to read yet.
  */
 function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
   const [elapsed, setElapsed] = useState(0);
@@ -29,12 +39,10 @@ function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
 
     const spanStart = Date.now();
     const base = activeSecRef.current;
-    const id = setInterval(
-      () => setElapsed(Math.floor(base + (Date.now() - spanStart) / 1000)),
-      500,
-    );
+    const tick = () => activeRecordedSec() ?? base + (Date.now() - spanStart) / 1000;
+    const id = setInterval(() => setElapsed(Math.floor(tick())), 500);
     return () => {
-      activeSecRef.current = base + (Date.now() - spanStart) / 1000;
+      activeSecRef.current = tick();
       clearInterval(id);
     };
   }, [recordingPhase]);
