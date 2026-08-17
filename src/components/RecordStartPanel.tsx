@@ -8,7 +8,11 @@ import {
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import { RecordButton } from "./RecordButton";
-import { useAppStore, effectiveRecordOnly, type RecordingModeChoice } from "../store/appStore";
+import {
+  useAppStore,
+  effectiveRecordOnly,
+  type RecordingModeChoice,
+} from "../store/appStore";
 
 const NO_APP_TARGET = "__none__";
 
@@ -32,7 +36,8 @@ const RECORDING_MODE_OPTIONS: {
     value: "recordOnly",
     icon: FileAudio,
     label: "録音のみ",
-    description: "文字起こしはあとでまとめて実行します。録音中は GPU を使わないためバッテリーが長持ちします。",
+    description:
+      "文字起こしはあとでまとめて実行します。録音中は GPU を使わないためバッテリーが長持ちします。",
   },
   {
     value: "analyze",
@@ -56,28 +61,48 @@ function MicPicker() {
 
   const currentValue = settings.inputDeviceId || "__default__";
   const currentLabel =
-    audioInputDevices.find((d) => d.deviceId === settings.inputDeviceId)?.label ?? "既定のマイク";
+    audioInputDevices.find((d) => d.deviceId === settings.inputDeviceId)
+      ?.label ?? "既定のマイク";
   const label = `マイク: ${currentLabel}`;
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label={label} title={label}>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-label={label}
+          title={label}
+        >
           <Mic className="h-3.5 w-3.5" />
+          {currentLabel}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" collisionPadding={8} className="w-auto min-w-56 max-w-96">
+      <DropdownMenuContent
+        align="start"
+        collisionPadding={8}
+        className="w-auto min-w-56 max-w-96"
+      >
         <DropdownMenuRadioGroup
           value={currentValue}
-          onValueChange={(v) => updateSettings({ inputDeviceId: v === "__default__" ? "" : v })}
+          onValueChange={(v) =>
+            updateSettings({ inputDeviceId: v === "__default__" ? "" : v })
+          }
         >
-          <DropdownMenuRadioItem value="__default__">既定のマイク</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="__default__">
+            既定のマイク
+          </DropdownMenuRadioItem>
           {/* Wrapped, not truncated: a cut-off device name is exactly the
               ambiguity this menu exists to resolve (which physical mic is
               which), so a long label grows the row instead of hiding its
               own tail behind an ellipsis. */}
           {audioInputDevices.map((d) => (
-            <DropdownMenuRadioItem key={d.deviceId} value={d.deviceId} className="whitespace-normal break-words">
+            <DropdownMenuRadioItem
+              key={d.deviceId}
+              value={d.deviceId}
+              className="whitespace-normal break-words"
+            >
               {d.label}
             </DropdownMenuRadioItem>
           ))}
@@ -100,9 +125,14 @@ function TargetAppPicker() {
   const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
   const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
 
-  const currentValue = appAudioTargetPid != null ? String(appAudioTargetPid) : NO_APP_TARGET;
-  const currentApp = appAudioApps.find((a) => a.processId === appAudioTargetPid);
-  const label = currentApp ? `対象アプリ: ${currentApp.name}` : "対象アプリなし（マイクのみ）";
+  const currentValue =
+    appAudioTargetPid != null ? String(appAudioTargetPid) : NO_APP_TARGET;
+  const currentApp = appAudioApps.find(
+    (a) => a.processId === appAudioTargetPid,
+  );
+  const label = currentApp
+    ? `対象アプリ: ${currentApp.name}`
+    : "対象アプリなし（マイクのみ）";
 
   return (
     <DropdownMenu
@@ -114,25 +144,41 @@ function TargetAppPicker() {
         <Button
           type="button"
           variant={appAudioTargetPid != null ? "secondary" : "ghost"}
-          size="icon-sm"
+          size="sm"
           aria-label={label}
           title={label}
         >
           {currentApp?.icon ? (
-            <img src={currentApp.icon} alt="" className="h-3.5 w-3.5 shrink-0" />
+            <img
+              src={currentApp.icon}
+              alt=""
+              className="h-3.5 w-3.5 shrink-0"
+            />
           ) : (
             <Cast className="h-3.5 w-3.5" />
           )}
+          {label}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" collisionPadding={8} className="w-auto min-w-56 max-w-96">
+      <DropdownMenuContent
+        align="start"
+        collisionPadding={8}
+        className="w-auto min-w-56 max-w-96"
+      >
         <DropdownMenuRadioGroup
           value={currentValue}
-          onValueChange={(v) => setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))}
+          onValueChange={(v) =>
+            setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))
+          }
         >
-          <DropdownMenuRadioItem value={NO_APP_TARGET}>対象アプリなし（マイクのみ）</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value={NO_APP_TARGET}>
+            対象アプリなし（マイクのみ）
+          </DropdownMenuRadioItem>
           {appAudioApps.map((a) => (
-            <DropdownMenuRadioItem key={a.processId} value={String(a.processId)}>
+            <DropdownMenuRadioItem
+              key={a.processId}
+              value={String(a.processId)}
+            >
               <span className="flex items-center gap-1.5 whitespace-normal break-words">
                 {a.icon ? (
                   <img src={a.icon} alt="" className="h-4 w-4 shrink-0" />
@@ -168,7 +214,8 @@ function RecordingModePicker() {
   const setRecordingMode = useAppStore((s) => s.setRecordingMode);
 
   const current =
-    RECORDING_MODE_OPTIONS.find((o) => o.value === recordingMode.mode) ?? RECORDING_MODE_OPTIONS[0];
+    RECORDING_MODE_OPTIONS.find((o) => o.value === recordingMode.mode) ??
+    RECORDING_MODE_OPTIONS[0];
   const recordOnly = effectiveRecordOnly(recordingMode, powerSource);
   const batteryKnown = powerSource !== "unknown";
 
@@ -176,7 +223,9 @@ function RecordingModePicker() {
   // -- the two-button layout this replaced showed that at a glance via which
   // button was filled in, so the live resolution is spelled out here instead.
   const triggerLabel =
-    recordingMode.mode === "auto" ? `自動（${recordOnly ? "録音のみ" : "解析"}）` : current.label;
+    recordingMode.mode === "auto"
+      ? `自動（${recordOnly ? "録音のみ" : "解析"}）`
+      : current.label;
   const triggerTitle =
     recordingMode.mode === "auto" && !batteryKnown
       ? "自動：この環境では電源状態を取得できないため、常に解析として扱われます。"
@@ -195,13 +244,21 @@ function RecordingModePicker() {
           {triggerLabel}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" collisionPadding={8} className="w-auto min-w-56 max-w-96">
+      <DropdownMenuContent
+        align="start"
+        collisionPadding={8}
+        className="w-auto min-w-56 max-w-96"
+      >
         <DropdownMenuRadioGroup
           value={recordingMode.mode}
           onValueChange={(v) => setRecordingMode(v as RecordingModeChoice)}
         >
           {RECORDING_MODE_OPTIONS.map((opt) => (
-            <DropdownMenuRadioItem key={opt.value} value={opt.value} title={opt.description}>
+            <DropdownMenuRadioItem
+              key={opt.value}
+              value={opt.value}
+              title={opt.description}
+            >
               <opt.icon className="h-4 w-4 shrink-0 text-muted-foreground" />
               {opt.label}
             </DropdownMenuRadioItem>
@@ -227,16 +284,16 @@ function RecordingModePicker() {
  */
 export function RecordStartPanel() {
   return (
-    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4">
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-8">
       <RecordButton />
-      <div className="flex items-center gap-1">
+      <p className="text-sm text-muted-foreground">
+        録音を開始すると、ここに文字起こし結果が表示されます。
+      </p>
+      <div className="flex flex-col gap-2">
         <MicPicker />
         <TargetAppPicker />
         <RecordingModePicker />
       </div>
-      <p className="text-sm text-muted-foreground">
-        録音を開始すると、ここに文字起こし結果が表示されます。
-      </p>
     </div>
   );
 }
