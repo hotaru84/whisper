@@ -26,6 +26,8 @@ import { loadRecording } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText } from "../lib/transcript";
 import { saveTranscript } from "../lib/export/saveTranscript";
+import { useMockBackend } from "../lib/env";
+import { MOCK_EXPORT_UNAVAILABLE } from "../lib/mock/fixtures";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 import { cn } from "../lib/utils";
 
@@ -239,15 +241,19 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
               <Copy className="h-4 w-4" />
               コピー
             </DropdownMenuItem>
+            {/* Also disabled in the browser preview, which has no native save
+                dialog -- same as TranscriptToolbar's copy of this menu. */}
             <DropdownMenuItem
-              disabled={!meta.transcribed}
+              disabled={!meta.transcribed || useMockBackend}
+              title={useMockBackend ? MOCK_EXPORT_UNAVAILABLE : undefined}
               onSelect={() => void handleExport("txt")}
             >
               <Download className="h-4 w-4" />
               .txt として保存
             </DropdownMenuItem>
             <DropdownMenuItem
-              disabled={!meta.transcribed}
+              disabled={!meta.transcribed || useMockBackend}
+              title={useMockBackend ? MOCK_EXPORT_UNAVAILABLE : undefined}
               onSelect={() => void handleExport("srt")}
             >
               <Download className="h-4 w-4" />

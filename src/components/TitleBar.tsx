@@ -3,7 +3,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
 import { TitleBarControls } from "./TitleBarControls";
 import { TitleBarStatus } from "./TitleBarStatus";
-import { runningInTauri } from "../lib/env";
+import { runningInTauri, useMockBackend } from "../lib/env";
+import { MOCK_BADGE_TITLE } from "../lib/mock/fixtures";
 
 // `null` outside Tauri: `getCurrentWindow()` itself reads Tauri-injected
 // globals at call time, which don't exist in a plain browser tab -- without
@@ -59,8 +60,20 @@ export function TitleBar() {
       className="relative z-[60] flex h-9 shrink-0 items-center gap-1 border-b border-border bg-background pl-1 text-foreground select-none"
     >
       <TitleBarControls />
-      <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center justify-center px-2">
+      <div data-tauri-drag-region className="flex min-w-0 flex-1 items-center justify-center gap-2 px-2">
         <TitleBarStatus />
+        {/* Dev-only, and only outside Tauri: without it the browser preview
+            is indistinguishable from the real app right up until someone
+            reads the fake transcript and believes it. `useMockBackend` is
+            itself gated on `import.meta.env.DEV`, so this cannot ship. */}
+        {useMockBackend && (
+          <span
+            title={MOCK_BADGE_TITLE}
+            className="shrink-0 rounded-sm border border-signal/60 px-1.5 py-0.5 text-[10px] leading-none font-semibold tracking-wide text-signal"
+          >
+            MOCK
+          </span>
+        )}
       </div>
       <div className="flex h-full items-stretch">
         <button

@@ -1,4 +1,6 @@
 import { readFile } from "@tauri-apps/plugin-fs";
+import { useMockBackend } from "../env";
+import { mockDurationSec, mockIdFromPath, silentWavBytes } from "../mock/fixtures";
 
 /**
  * Turns a recording's on-disk WAV path into a URL the webview's `<audio>`
@@ -17,7 +19,15 @@ import { readFile } from "@tauri-apps/plugin-fs";
  * -- callers own that lifecycle (see `createPlaybackController`'s `dispose`).
  */
 export async function wavToBlobUrl(path: string): Promise<string> {
-  const bytes = await readFile(path);
+  // No file to read outside Tauri: stand in a silent WAV of the right length
+  // (see `silentWavBytes`) so the timeline, the slider, the playhead and the
+  // transcript's follow-along all behave exactly as they do for a real
+  // recording -- there is just no sound. Without this, `readFile` rejected
+  // and every finished or selected recording showed a 0:00, unseekable
+  // timeline.
+  const bytes = useMockBackend
+    ? silentWavBytes(mockDurationSec(mockIdFromPath(path)))
+    : await readFile(path);
   const blob = new Blob([bytes], { type: "audio/wav" });
   return URL.createObjectURL(blob);
 }

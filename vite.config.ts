@@ -23,7 +23,17 @@ export default defineConfig(async () => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // Bind every interface (unless TAURI_DEV_HOST names one), so `npm run dev`
+    // is reachable from outside the machine/container running it -- a remote
+    // dev container's preview proxy, a phone on the LAN. Localhost-only was
+    // why the browser-preview entry point (`.claude/launch.json`) never
+    // worked. Dev server only: `npm run tauri build` serves `frontendDist`
+    // and never runs this.
+    host: host || true,
+    // Vite rejects requests whose Host header isn't localhost/an IP, which is
+    // exactly what a preview proxy sends. Dev-only, and this server has
+    // nothing behind it but the frontend's own source.
+    allowedHosts: true,
     hmr: host
       ? {
           protocol: "ws",

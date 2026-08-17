@@ -15,6 +15,7 @@ All commands are run from the repo root.
 ```powershell
 npm install                    # setup
 npm run tauri dev              # dev: Vite dev server (localhost:1420) + native Tauri window
+npm run dev                    # frontend only, in a plain browser (localhost:1420) — see "Browser-only dev mode"
 npm run tauri build -- --no-bundle   # portable exe only, fastest way to sanity-check a build
 npm run tauri build            # full NSIS installer build (~600-650MB, bundles the model)
 npm run build                  # tsc typecheck + vite build (frontend only, no Tauri)
@@ -32,7 +33,10 @@ scripts\win-build-env.bat cargo run --release --example tokens -- "<text>"  # co
 
 **Never invoke `cargo build`/`cargo tauri` directly — always go through `npm run tauri ...`.** The `tauri` npm script is a wrapper (`scripts/win-build-env.bat`) that sets up `cl.exe`, Ninja, `LIBCLANG_PATH`, and checks `VULKAN_SDK` before calling the Tauri CLI. Without it, the nested CMake `ExternalProject` that builds Vulkan shaders fails to find a compiler. Build settings that must stay declarative (Ninja generator, short target dir `C:/wsbuild` to dodge `MAX_PATH`) live in `.cargo/config.toml` at the repo root — it must stay there, not under `src-tauri/`, because Cargo searches upward from the current directory rather than from the manifest.
 
-Opening `http://localhost:1420` directly in a browser (instead of the Tauri window) shows the UI but transcription will not work — `invoke()`/`listen()` only function inside the Tauri runtime.
+### Browser-only dev mode
+`npm run dev` (no Tauri, no Rust, works on any OS) serves the frontend at `http://localhost:1420` with every backend call faked — see `useMockBackend` in `src/lib/env.ts` for the full list of what is mocked and where. A `MOCK` badge in the titlebar marks the session. Good for UI/layout/state-machine work: recording, the live and refine passes, history browsing, playback (silent, but the timeline and seeking are real), diarization labels, audio events, and the 解析/解析中止 toggle all behave. Not usable for: real transcription, audible playback, app-audio (WASAPI) capture, transcript export, and the window controls — those need the Tauri runtime.
+
+Mock behavior is gated on `import.meta.env.DEV` *and* on `isTauri()` being false, so `npm run tauri dev`/`tauri build` never take these paths. When adding a Tauri command, add its mock branch at the same time — an unmocked `invoke()` is a rejected promise that tends to get swallowed by a caller's `catch` and turn into a silently dead corner of the UI.
 
 ### Running a single frontend test
 Vitest picks up `src/**/*.test.ts`. Use `npx vitest run path/to/file.test.ts` or `npx vitest run -t "test name"`.

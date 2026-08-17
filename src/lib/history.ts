@@ -3,6 +3,7 @@ import { appCacheDir, join } from "@tauri-apps/api/path";
 import type { TranscriptSegment } from "./transcript";
 import type { AudioEvent } from "./asr";
 import { useMockBackend } from "./env";
+import { rememberMockDuration, seedMockRecordings } from "./mock/fixtures";
 
 /**
  * Persists finished recordings so the history sidebar can browse them across
@@ -48,8 +49,11 @@ export interface RecordingHistoryEntry extends RecordingHistoryMeta {
 
 /** On-disk JSON shape. Kept separate from `RecordingHistoryEntry` because
  * `createdAt` round-trips through JSON as a string, and derived fields
- * (`preview`) are computed on read rather than trusted from disk. */
-interface StoredRecording {
+ * (`preview`) are computed on read rather than trusted from disk.
+ *
+ * Exported only so `mock/fixtures.ts` can type its seeded entries against it
+ * (a type-only import, so it adds no runtime edge back to this module). */
+export interface StoredRecording {
   durationSec: number;
   language: string;
   /**
@@ -70,7 +74,11 @@ interface StoredRecording {
 // JSON files on disk, so history can be filed/browsed/deleted while
 // exercising screen transitions in a plain browser. Resets on reload, same
 // as every other piece of mock state in this app.
-const mockStore = new Map<string, StoredRecording>();
+//
+// Seeded rather than empty: the sidebar, playback, re-analysis and deletion
+// are all reachable the moment the page opens instead of only after a real
+// microphone recording -- see `seedMockRecordings`' doc comment.
+const mockStore = new Map<string, StoredRecording>(useMockBackend ? seedMockRecordings() : []);
 
 async function recordingsDir(): Promise<string> {
   return join(await appCacheDir(), "recordings");
@@ -156,6 +164,10 @@ export async function saveRecordingHistory(
   };
   if (useMockBackend) {
     mockStore.set(id, stored);
+    // Keeps the synthetic WAV `wavToBlobUrl` hands to playback the same
+    // length as the entry the sidebar shows, including for a take whose
+    // duration only became known when the (mock) capture finished.
+    rememberMockDuration(id, stored.durationSec);
     return;
   }
   await writeTextFile(await jsonPath(id), JSON.stringify(stored));

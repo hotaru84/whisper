@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { WHISPER_SAMPLE_RATE } from "../audio/resample";
 import { useMockBackend } from "../env";
+import { rememberMockDuration } from "../mock/fixtures";
 
 /**
  * How much audio to accumulate before handing it to the backend.
@@ -99,10 +100,12 @@ export class RecordingCapture {
   async finish(): Promise<CaptureInfo> {
     this.closed = true;
     if (useMockBackend) {
-      return {
-        path: `mock-recordings/${this.mockName}.wav`,
-        durationSec: Math.max(1, (Date.now() - this.mockStartedAt) / 1000),
-      };
+      const durationSec = Math.max(1, (Date.now() - this.mockStartedAt) / 1000);
+      // `fileTakeProvisionally` loads playback for this take *before* it files
+      // it in history, so the mock WAV's length has to be registered here
+      // rather than looked up from the (not yet written) history entry.
+      rememberMockDuration(this.mockName, durationSec);
+      return { path: `mock-recordings/${this.mockName}.wav`, durationSec };
     }
     this.flush();
     await this.tail;

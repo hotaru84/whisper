@@ -29,12 +29,25 @@
 - [x] 閉じるボタンの位置を変更: サイドバー表示切替ボタン（`toggleSidebar`）を廃止し、サイドバーは Home 画面で常時表示に変更。そのボタンがあった位置（タイトルバー左）に「戻る」ボタンを新設し、`TranscriptPanel.tsx` 内にあった小さな×ボタンを置き換えた（`src/components/TitleBarControls.tsx` 全面書き換え、`src/App.tsx`、`src/store/appStore.ts`／`src/store/persistedSettings.ts` から `sidebar.visible`/`toggleSidebar` を削除）
 - [x] `npm run build`／`npm run lint`／`npx vitest run` 再確認（全通過、100テスト）
 
+## 追加修正3（モックレイヤーがブラウザで実際には動いていなかった件）
+
+上記モックレイヤーは未検証のままで、実際にブラウザで開くと途中から無言で死んでいた。原因と対処:
+
+- [x] dev サーバに到達できない: `vite.config.ts` の `server.host` が `false`（127.0.0.1 のみ bind）で `allowedHosts` 未設定だったため、コンテナ/リモートのプレビュープロキシ経由では届かなかった。`host: host || true` + `allowedHosts: true` に変更（dev サーバのみ。`TAURI_DEV_HOST` の優先は維持、`devUrl` は `localhost:1420` のまま）
+- [x] 依存が入っていない環境で `npm run dev` が起動しない: `.claude/hooks/session-start.sh` + `.claude/settings.json`（SessionStart hook）で `npm install` するようにした（web セッションのみ、`CLAUDE_CODE_REMOTE` でガード）
+- [x] 再生が常に 0:00: `audio/playback.ts` の `readFile`（plugin-fs）が未モックだった。録音長ぶんの**無音 WAV**（8kHz/8bit/mono）を合成して blob URL にする分岐を追加。`createPlaybackController` は無変更のまま、シーク・速度変更・`ended` が実機と同じ挙動になる
+- [x] エクスポートが未処理 rejection: `saveTranscript.ts` は `false`（キャンセル扱い）を返すようにし、`TranscriptToolbar.tsx`／`HistorySidebar.tsx` の .txt/.srt 項目自体を disabled に（ネイティブ保存ダイアログが必要なため、ブラウザでは非対応で確定）
+- [x] アプリ音声ピッカーが常に空: `audio/appAudio.ts` の3メソッドをモック（ダミー2件、キャプチャは no-op）
+- [x] 精度向上パスの結果が常に1行 `[0,3]` 固定だった: 録音の実長に沿って複数チャンクに分割（`mockRefinedResult`）。行クリックのシーク・アクティブ行ハイライト・話者ラベル・SRT 出力が確認できるようになった
+- [x] 音響イベントが常に空: 10秒ごとのダミーイベントを返すように変更
+- [x] 履歴が起動時に空: サンプル2件（解析済み＋録音のみ）をシード（`seedMockRecordings`）
+- [x] モックデータを `src/lib/mock/fixtures.ts` に集約、`TitleBar.tsx` に `MOCK` バッジを追加
+- [x] Chromium（Playwright）で実際に目視・自動確認: バッジ表示、履歴2件、行選択→文字起こし5行＋話者ラベル、再生の時間進行（1.7s→シークで90.2s、duration 184s）、アプリ音声2件、保存メニューの disabled、録音開始→ライブ文字起こし→停止→精度向上パス→履歴追加（19.2s, transcribed=true）まで通し。`pageerror`・console error/warning ともに 0
+
 ## 未検証
 
-- 上記モックレイヤー・今回の追加修正は実際のブラウザでの目視確認ができていない（このセッションのブラウザプレビューツールが `localhost:1420`（ユーザー自身の `npm run dev` プロセス）にネットワーク到達できず、コンソール確認・スクリーンショットとも失敗した）。ユーザー自身のブラウザで `npm run dev` → `http://localhost:1420` を開いての確認が必要
-- Tauri ネイティブウィンドウでの実際の目視確認（`npm run tauri dev`）
+- Tauri ネイティブウィンドウでの実際の目視確認（`npm run tauri dev`）。上記の変更のうちネイティブ経路に触れるのは `vite.config.ts` の bind 先と Host 検査のみで、モック分岐はすべて `isTauri() === true` で無効になる
 - モンキーテストで報告された2つの不具合（ゴミ画面フラッシュ、録音開始の遷移遅延）が実機で解消されているかの再現確認
-- 保存（.txt/.srt エクスポート）ボタンはモック未対応（`saveTranscript.ts` は非対象 -- クリックすると失敗するが画面遷移には影響しない）
 
 ---
 **STATUS**: 実装済み（レビュー・実機確認待ち）
