@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use whisper_rs::{DtwMode, DtwModelPreset, DtwParameters, WhisperContext, WhisperContextParameters};
-use whisper_scribe_lib::asr::{build_full_params, collect_segments, mark_silent_segments, redecode_voiced_gaps, DecodeSettings};
+use whisper_scribe_lib::asr::{
+    build_full_params, collect_segments, mark_silent_segments, redecode_voiced_gaps, DecodeSettings, SILENCE_RMS,
+};
 use whisper_scribe_lib::diarize::{self, DiarizeSettings};
 use whisper_scribe_lib::wav::{self, SAMPLE_RATE};
 
@@ -85,10 +87,11 @@ fn run() -> Result<(), String> {
 
     let mut result = collect_segments(&state, vad_active)?;
     let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    result.chunks = redecode_voiced_gaps(&ctx, &settings, vad_active, &cancel, result.chunks, &samples)?;
+    result.chunks =
+        redecode_voiced_gaps(&ctx, &settings, vad_active, &cancel, result.chunks, &samples, SILENCE_RMS)?;
     result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
 
-    let (mut result, silence) = mark_silent_segments(result, &samples);
+    let (mut result, silence) = mark_silent_segments(result, &samples, SILENCE_RMS);
     result.silence = silence;
     result.quality = whisper_scribe_lib::cues::analyze(&result.chunks, duration_sec, &samples);
     let elapsed_sec = started.elapsed().as_secs_f32();

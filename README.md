@@ -551,18 +551,24 @@ CER の計算そのもの（正規化と編集距離）は `src-tauri/src/cer.rs
     （`asr::DecodeSettings`、`cargo run --example cer -- --no-speech-thold <f> --logprob-thold <f>` で A/B できる）
     はどちらも whisper-rs が公開済みで、フォーク不要な構造的損失(音声区間そのものが出力に現れない現象)への
     対処として先に試す価値がある——ただしこれは語彙の正しさではなく構造(`cues::QualityReport`)にしか効かない。
-- **無音のウィンドウはモデルに渡さない。** `StreamingTranscriber` は RMS が `SILENCE_RMS`（`src/lib/asr/diagnostics.ts`）
-  を下回るウィンドウを文字起こしせず読み飛ばす。whisper に無音を渡すと定型句（「ご視聴ありがとうございました」）を
+- **無音のウィンドウはモデルに渡さない。** `StreamingTranscriber` は RMS が `SILENCE_RMS`（`src/lib/asr/diagnostics.ts`
+  の既定値、`HallucinationSettings.silenceRms` で上書き可能）を下回るウィンドウを文字起こしせず読み飛ばす。
+  whisper に無音を渡すと定型句（「ご視聴ありがとうございました」）を
   でっち上げたり「なぜなぜなぜ…」のような反復ループに陥る。**特に録音停止時に頻発する** — 停止ボタンを押すまでの
   間が端数ウィンドウとして強制的に文字起こしされるため。出力側でテキストを見て弾く方法は「はいはいはい」のような
-  正当な発話を消す危険があるので、入力側で塞いでいる。閾値は保守的に設定してあり、それでも幻覚が残る場合は
+  正当な発話を消す危険があるので、入力側で塞いでいる。既定値は保守的に設定してあり、それでも幻覚が残る場合は
   `logPcmStats` が毎ウィンドウ出力する `rms=` を静かな区間で確認し、その直下まで上げること（当て推量で上げない）。
-- **反復ループ対策に `entropy_thold` を 2.8 へ引き上げている（既定 2.4）。ただし短い反復には効かない。**
+  設定パネルの「幻覚対策（上級者向け）」から調整でき、逐次パス（`isNearSilent`）・精度向上パスの無音フラグ付け
+  （`asr::mark_silent_segments`）・ボイスギャップ再デコード判定（`asr::redecode_voiced_gaps`）の3箇所に同じ値が
+  渡るので、パス間で無音の定義がずれることはない。
+- **反復ループ対策に `entropy_thold` を既定 2.8 へ引き上げている（whisper.cpp既定 2.4）。ただし短い反復には効かない。**
   判定が `result_len > 32 && entropy < entropy_thold`（whisper.cpp:7527）とトークン数で足切りされているため、
   「なぜ」×13 程度の短いループは**判定自体が実行されない**。短い反復は上記の無音ゲートで入口を塞ぐ方が確実。 Whisper は同じ語句を延々と出力し続ける
   degenerate loop に陥ることがある。移行前の transformers.js 実装は `no_repeat_ngram_size: 3` でこれを抑えていたが、
   whisper.cpp に同等のパラメータは無い。代わりに `result_len > 32 && entropy < entropy_thold` で高温度リトライへ
   フォールバックする仕組みがあるので、その閾値を上げている（実測で entropy 2.60 のループが既定値 2.4 を素通りした）。
+  `HallucinationSettings.entropyThold`（設定パネル「幻覚対策（上級者向け）」）で上書き可能で、逐次パス
+  （`transcribe_window` の `X-Entropy-Thold` ヘッダ）・精度向上パス（`transcribe_recording` の引数）の両方に反映される。
 - **やってはいけないこと: 確定済みテキストを `initial_prompt` として次ウィンドウに渡す。** 表記の一貫性という点では
   魅力的だが、生成結果を入力に戻す構造は反復ループを自己増幅させる。実際に試したところ同じ語句が繰り返し出力される
   不具合が再現したため撤去した。**ユーザーが書いた固定の用語集を渡すのは別物で、これは安全**（自己増幅しない）。

@@ -86,6 +86,8 @@ export function SettingsPanel() {
   const updateDiarizeSettings = useAppStore((s) => s.updateDiarizeSettings);
   const vadSettings = useAppStore((s) => s.vadSettings);
   const updateVadSettings = useAppStore((s) => s.updateVadSettings);
+  const hallucinationSettings = useAppStore((s) => s.hallucinationSettings);
+  const updateHallucinationSettings = useAppStore((s) => s.updateHallucinationSettings);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
   const updateAudioEventSettings = useAppStore((s) => s.updateAudioEventSettings);
   const autoSaveSettings = useAppStore((s) => s.autoSaveSettings);
@@ -121,7 +123,7 @@ export function SettingsPanel() {
     <Accordion
       type="multiple"
       className={cn("w-full", locked && "pointer-events-none opacity-60")}
-      defaultValue={["autosave", "transcription", "accuracy"]}
+      defaultValue={["autosave", "transcription", "hallucination", "accuracy"]}
     >
       <AccordionItem value="autosave">
         <AccordionTrigger>保存設定</AccordionTrigger>
@@ -255,6 +257,72 @@ export function SettingsPanel() {
               <p className="text-xs text-muted-foreground">
                 変更は自動で保存され、次の文字起こしから反映されます。
               </p>
+            </div>
+          </div>
+        </AccordionContent>
+      </AccordionItem>
+
+      <AccordionItem value="hallucination">
+        <AccordionTrigger>幻覚対策（上級者向け）</AccordionTrigger>
+        <AccordionContent>
+          <div className="flex flex-col gap-4">
+            <p className="text-xs text-muted-foreground">
+              無音や低SNRのノイズに対して whisper が定型句を作文したり、同じ語句を繰り返す「幻覚」を起こす
+              ことがあります。以下は事前の値をコンソールログ（<code>rms=</code>）で確認したうえで、
+              当て推量ではなく実測に基づいて調整してください。逐次パス・精度向上パスの両方に反映されます。
+            </p>
+
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="silence-rms-input">無音判定の RMS しきい値</Label>
+                <InfoTooltip>
+                  この値を下回る音量の区間は「無音」として扱われ、逐次パスではモデルに渡さずスキップし、
+                  精度向上パスでは文字起こし後に無音フラグを付けます（削除はされません）。上げすぎると
+                  小さな声を無音側に倒してしまうため、静かな区間で実測した <code>rms=</code> の値のすぐ下まで
+                  だけ上げるのが安全です（既定 0.001）。
+                </InfoTooltip>
+              </div>
+              <div className="flex items-center gap-3">
+                <Input
+                  id="silence-rms-input"
+                  type="number"
+                  min={0}
+                  max={0.05}
+                  step={0.0005}
+                  value={hallucinationSettings.silenceRms}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v >= 0) updateHallucinationSettings({ silenceRms: v });
+                  }}
+                  className="w-28 font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="entropy-thold-input">反復ループ対策の閾値（entropy_thold）</Label>
+                <InfoTooltip>
+                  32トークンを超える出力のエントロピーがこの値を下回ると、より高い温度で再デコードします。
+                  上げるほど長い反復ループを検出しやすくなりますが、短い反復（十数文字程度）にはこの仕組み自体が
+                  効きません。whisper.cpp の既定は 2.4、このアプリの既定は 2.8 です。
+                </InfoTooltip>
+              </div>
+              <div className="flex items-center gap-3">
+                <Input
+                  id="entropy-thold-input"
+                  type="number"
+                  min={0}
+                  max={5}
+                  step={0.1}
+                  value={hallucinationSettings.entropyThold}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v > 0) updateHallucinationSettings({ entropyThold: v });
+                  }}
+                  className="w-28 font-mono"
+                />
+              </div>
             </div>
           </div>
         </AccordionContent>

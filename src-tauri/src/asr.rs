@@ -612,6 +612,14 @@ pub async fn transcribe_window(
         .and_then(|v| v.to_str().ok())
         .map(percent_decode)
         .filter(|s| !s.trim().is_empty());
+    // User-adjustable repetition-loop guard (see DecodeSettings::entropy_thold).
+    // Absent or unparseable falls back to DecodeSettings::default()'s 2.8, same
+    // as before this header existed.
+    let entropy_thold = request
+        .headers()
+        .get("X-Entropy-Thold")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f32>().ok());
 
     tauri::async_runtime::spawn_blocking(move || {
         // IPC bytes aren't guaranteed 4-byte aligned, so decode via from_le_bytes
@@ -632,6 +640,7 @@ pub async fn transcribe_window(
             language,
             translate,
             prompt,
+            entropy_thold: entropy_thold.unwrap_or_else(|| DecodeSettings::default().entropy_thold),
             ..DecodeSettings::default()
         };
         let params = build_full_params(&settings);
@@ -707,7 +716,11 @@ pub(crate) fn rms(samples: &[f32]) -> f32 {
 /// listener can tell why a gap exists, while `chunks` -- and therefore
 /// `cues::analyze`'s view of the decode -- stays exactly what whisper
 /// produced.
-pub fn mark_silent_segments(result: TranscribeResult, samples: &[f32]) -> (TranscribeResult, Vec<SilenceMark>) {
+pub fn mark_silent_segments(
+    result: TranscribeResult,
+    samples: &[f32],
+    silence_rms: f32,
+) -> (TranscribeResult, Vec<SilenceMark>) {
     let sr = crate::wav::SAMPLE_RATE as f32;
     let marks: Vec<SilenceMark> = result
         .chunks
@@ -721,7 +734,7 @@ pub fn mark_silent_segments(result: TranscribeResult, samples: &[f32]) -> (Trans
                 return SilenceMark { silent: false, rms: None };
             }
             let measured = rms(&samples[from..to]);
-            SilenceMark { silent: measured < SILENCE_RMS, rms: Some(measured) }
+            SilenceMark { silent: measured < silence_rms, rms: Some(measured) }
         })
         .collect();
 
@@ -783,6 +796,7 @@ pub fn redecode_voiced_gaps(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     chunks: Vec<TranscribeChunk>,
     samples: &[f32],
+    silence_rms: f32,
 ) -> Result<Vec<TranscribeChunk>, String> {
     let sr = crate::wav::SAMPLE_RATE as f32;
     let mut inserted: Vec<TranscribeChunk> = Vec::new();
@@ -796,7 +810,7 @@ pub fn redecode_voiced_gaps(
 
         let padded_from = ((gap_start - GAP_REDECODE_MARGIN_SEC) * sr).max(0.0) as usize;
         let padded_to = (((gap_end + GAP_REDECODE_MARGIN_SEC) * sr) as usize).min(samples.len());
-        if padded_from >= padded_to || rms(&samples[padded_from..padded_to]) < SILENCE_RMS {
+        if padded_from >= padded_to || rms(&samples[padded_from..padded_to]) < silence_rms {
             continue;
         }
 
@@ -867,6 +881,8 @@ pub async fn transcribe_recording(
     prompt: Option<String>,
     vad: bool,
     vad_threshold: f32,
+    entropy_thold: f32,
+    silence_rms: f32,
 ) -> Result<TranscribeResult, String> {
     let language = language.filter(|l| !l.is_empty() && l != "auto");
     let translate = task.as_deref() == Some("translate");
@@ -915,6 +931,7 @@ pub async fn transcribe_recording(
             prompt,
             vad_model_path,
             vad_threshold,
+            entropy_thold,
             ..DecodeSettings::default()
         };
         // Whether VAD actually ran, not just whether it was requested -- a
@@ -959,10 +976,11 @@ pub async fn transcribe_recording(
         }
 
         let mut result = collect_segments(&whisper_state, vad_active)?;
-        result.chunks = redecode_voiced_gaps(ctx, &settings, vad_active, &cancel, result.chunks, &samples)?;
+        result.chunks =
+            redecode_voiced_gaps(ctx, &settings, vad_active, &cancel, result.chunks, &samples, silence_rms)?;
         result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
 
-        let (mut result, silence) = mark_silent_segments(result, &samples);
+        let (mut result, silence) = mark_silent_segments(result, &samples, silence_rms);
         result.vad_unavailable = vad_unavailable;
         result.silence = silence;
         let duration_sec = samples.len() as f32 / crate::wav::SAMPLE_RATE as f32;
@@ -1075,6 +1093,7 @@ mod silence_tests {
         let (out, marks) = mark_silent_segments(
             result(vec![chunk("ご視聴ありがとうございました", 3.0, 6.0)]),
             &audio,
+            SILENCE_RMS,
         );
         assert_eq!(out.chunks.len(), 1);
         assert_eq!(out.text, "ご視聴ありがとうございました");
@@ -1085,8 +1104,11 @@ mod silence_tests {
 
     #[test]
     fn does_not_flag_segments_backed_by_audible_audio() {
-        let (out, marks) =
-            mark_silent_segments(result(vec![chunk("おはようございます", 1.0, 4.0)]), &tone(10.0, 0.2));
+        let (out, marks) = mark_silent_segments(
+            result(vec![chunk("おはようございます", 1.0, 4.0)]),
+            &tone(10.0, 0.2),
+            SILENCE_RMS,
+        );
         assert_eq!(out.chunks.len(), 1);
         assert_eq!(out.text, "おはようございます");
         assert!(!marks[0].silent);
@@ -1106,6 +1128,7 @@ mod silence_tests {
                 chunk("後半です", 21.0, 28.0),
             ]),
             &audio,
+            SILENCE_RMS,
         );
         // Nothing is removed: all three chunks and their text survive.
         assert_eq!(
@@ -1124,7 +1147,7 @@ mod silence_tests {
         let mut audio = tone(5.0, 0.2);
         audio.extend(tone(10.0, 0.0));
         // Claims 5.3-6.0, which is silent; the speech ends at 5.0.
-        let (_, marks) = mark_silent_segments(result(vec![chunk("実際の発話", 5.3, 6.0)]), &audio);
+        let (_, marks) = mark_silent_segments(result(vec![chunk("実際の発話", 5.3, 6.0)]), &audio, SILENCE_RMS);
         assert!(!marks[0].silent);
     }
 
@@ -1133,6 +1156,7 @@ mod silence_tests {
         let (_, marks) = mark_silent_segments(
             result(vec![chunk("小さな声", 1.0, 4.0)]),
             &tone(10.0, SILENCE_RMS * 2.0),
+            SILENCE_RMS,
         );
         assert!(!marks[0].silent);
     }
@@ -1140,18 +1164,18 @@ mod silence_tests {
     #[test]
     fn segments_whose_timestamps_fall_outside_the_audio_are_not_flagged() {
         // Nothing to measure means no evidence to flag on.
-        let (_, marks) = mark_silent_segments(result(vec![chunk("末尾", 30.0, 32.0)]), &tone(5.0, 0.2));
+        let (_, marks) = mark_silent_segments(result(vec![chunk("末尾", 30.0, 32.0)]), &tone(5.0, 0.2), SILENCE_RMS);
         assert!(!marks[0].silent);
         assert_eq!(marks[0].rms, None);
     }
 
     #[test]
     fn handles_an_empty_result_and_empty_audio() {
-        let (out, marks) = mark_silent_segments(result(vec![]), &tone(5.0, 0.2));
+        let (out, marks) = mark_silent_segments(result(vec![]), &tone(5.0, 0.2), SILENCE_RMS);
         assert!(out.chunks.is_empty());
         assert!(marks.is_empty());
         // No audio at all: keep the text rather than silently erasing a transcript.
-        let (out, marks) = mark_silent_segments(result(vec![chunk("a", 0.0, 1.0)]), &[]);
+        let (out, marks) = mark_silent_segments(result(vec![chunk("a", 0.0, 1.0)]), &[], SILENCE_RMS);
         assert_eq!(out.chunks.len(), 1);
         assert!(!marks[0].silent);
     }

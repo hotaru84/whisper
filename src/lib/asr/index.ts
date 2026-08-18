@@ -3,6 +3,7 @@ export {
   DEFAULT_DIARIZE_SETTINGS,
   DEFAULT_VAD_SETTINGS,
   DEFAULT_AUDIO_EVENT_SETTINGS,
+  DEFAULT_HALLUCINATION_SETTINGS,
   DIARIZATION_MODEL_UNAVAILABLE,
 } from "./client";
 export type {
@@ -16,6 +17,7 @@ export type {
   AudioEventSettings,
   AudioEvent,
   AudioEventResult,
+  HallucinationSettings,
 } from "./client";
 export { ANALYSIS_CANCELLED, isCancelledError } from "./cancel";
 export { RecordingCapture } from "./capture";

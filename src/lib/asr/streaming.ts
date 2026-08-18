@@ -1,6 +1,6 @@
 import type { TranscriptChunk } from "./types";
 import type { TranscribeResult } from "./client";
-import { isNearSilent } from "./diagnostics";
+import { isNearSilent, SILENCE_RMS } from "./diagnostics";
 import { WHISPER_SAMPLE_RATE as SR } from "../audio/resample";
 
 // How much audio to accumulate before transcribing, which is also how long the
@@ -89,6 +89,10 @@ export class StreamingTranscriber {
       onWindowDropped?: (err: unknown) => void;
       /** Test seam; production uses RETRY_BACKOFF_MS. */
       retryBackoffMs?: number;
+      /** RMS floor below which a window is skipped as silence -- see
+       * `isNearSilent`. Defaults to `SILENCE_RMS`; overridable so this
+       * mirrors the user's `HallucinationSettings.silenceRms`. */
+      silenceRms?: number;
     } = {},
   ) {}
 
@@ -156,7 +160,7 @@ export class StreamingTranscriber {
     // cannot catch the short ones because it only evaluates sequences longer than
     // 32 tokens. This bites hardest on the final flush after the user stops, where
     // the leftover fragment is usually just the pause before they clicked.
-    if (isNearSilent(audio)) {
+    if (isNearSilent(audio, this.options.silenceRms ?? SILENCE_RMS)) {
       this.dropFromFront(windowLen);
       this.committedSamples += windowLen;
       return;
