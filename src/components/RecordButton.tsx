@@ -39,10 +39,13 @@ export function RecordButton({ placement = "hero" }: { placement?: keyof typeof 
   const pauseRecording = useAppStore((s) => s.pauseRecording);
   const resumeRecording = useAppStore((s) => s.resumeRecording);
   const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
-  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
+  const autoSaveSettings = useAppStore((s) => s.autoSaveSettings);
+  const directoryConfigured = autoSaveSettings.directory !== "";
+  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly, directoryConfigured });
 
   if (recordingPhase === "stopped") {
-    const label = processing !== null ? "処理中です" : "録音を開始";
+    const label =
+      processing !== null ? "処理中です" : !directoryConfigured ? "保存先フォルダを設定してください" : "録音を開始";
     return (
       <Button
         type="button"

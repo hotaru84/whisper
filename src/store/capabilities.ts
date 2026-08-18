@@ -123,6 +123,13 @@ export interface CapabilityInputs {
    * about the other four axes don't have to plumb it through; only the
    * `startRecording` action's own guard actually needs it. */
   startingRecording?: boolean;
+  /** Whether `AutoSaveSettings.directory` is set -- a recording cannot start
+   * without one (see `persistedSettings.ts`'s `AutoSaveSettings`). Optional,
+   * defaulting to `true` when absent, same reasoning as `startingRecording`:
+   * only `RecordButton` and `appStore.ts`'s `capabilitiesOf`, the two call
+   * sites that actually gate `startRecording`, need to plumb the real value
+   * through. */
+  directoryConfigured?: boolean;
 }
 
 export function selectCapabilities(s: CapabilityInputs): Capabilities {
@@ -135,7 +142,8 @@ export function selectCapabilities(s: CapabilityInputs): Capabilities {
     // `!startingRecording` closes the window where a second record press,
     // landing after the first's `set({startingRecording: true})` but before
     // `recordingPhase` itself flips, would otherwise still read as `idle`.
-    startRecording: idle && !s.startingRecording && (s.recordOnly || s.modelStatus === "ready"),
+    startRecording:
+      idle && !s.startingRecording && (s.directoryConfigured ?? true) && (s.recordOnly || s.modelStatus === "ready"),
     pause: s.recordingPhase === "recording",
     resume: s.recordingPhase === "paused",
     stop: !stopped,
