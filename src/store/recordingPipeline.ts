@@ -257,14 +257,9 @@ async function persistTake(
     // already filed in history.
     if (entry.transcribed && entry.segments.length > 0) {
       const { autoSaveSettings } = useAppStore.getState();
-      if (autoSaveSettings.enabled && autoSaveSettings.directory) {
+      if (autoSaveSettings.directory) {
         try {
-          await autoSaveTranscript(
-            entry.segments,
-            recordingId,
-            autoSaveSettings.directory,
-            autoSaveSettings.transcriptFormat,
-          );
+          await autoSaveTranscript(entry.segments, recordingId, autoSaveSettings.directory);
         } catch (err) {
           console.warn(`[autosave] failed to write transcript for ${recordingId}:`, err);
         }

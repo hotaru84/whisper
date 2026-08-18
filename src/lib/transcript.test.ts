@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   combinedText,
-  combinedChunks,
+  combinedTextWithTimestamps,
   collapseDegenerateSegments,
   nonBlankChunks,
   projectOntoNonBlankChunks,
@@ -41,29 +41,29 @@ describe("combinedText", () => {
   });
 });
 
-describe("combinedChunks", () => {
-  it("shifts each chunk onto the global timeline by its segment's startOffsetSec", () => {
-    expect(combinedChunks(segments)).toEqual([
-      { text: " first.", timestamp: [0, 2.5] },
-      { text: " second", timestamp: [3, 4] },
-      { text: " part.", timestamp: [4, 5] },
-    ]);
+describe("combinedTextWithTimestamps", () => {
+  const recordingStart = new Date(2026, 7, 18, 9, 0, 0); // 2026-08-18 09:00:00 local
+
+  it("prefixes each line with an absolute local timestamp derived from startOffsetSec", () => {
+    expect(combinedTextWithTimestamps(segments, recordingStart)).toBe(
+      "[2026-08-18 09:00:00] first.\n[2026-08-18 09:00:03] second part.",
+    );
   });
 
-  it("carries the segment's speaker onto every chunk it flattens", () => {
-    const withSpeaker: TranscriptSegment[] = [
-      {
-        id: 1,
-        startOffsetSec: 0,
-        text: "a b",
-        speaker: 2,
-        chunks: [
-          { text: "a", timestamp: [0, 1] },
-          { text: "b", timestamp: [1, 2] },
-        ],
-      },
+  it("drops empty segments", () => {
+    expect(
+      combinedTextWithTimestamps([{ id: 9, startOffsetSec: 0, text: "   ", chunks: [] }], recordingStart),
+    ).toBe("");
+  });
+
+  it("prefixes a 1-indexed speaker label after the timestamp when the segment has one", () => {
+    const withSpeakers: TranscriptSegment[] = [
+      { id: 1, startOffsetSec: 0, text: "First", chunks: [], speaker: 0 },
+      { id: 2, startOffsetSec: 61, text: "Second", chunks: [], speaker: 1 },
     ];
-    expect(combinedChunks(withSpeaker).map((c) => c.speaker)).toEqual([2, 2]);
+    expect(combinedTextWithTimestamps(withSpeakers, recordingStart)).toBe(
+      "[2026-08-18 09:00:00] 話者1: First\n[2026-08-18 09:01:01] 話者2: Second",
+    );
   });
 });
 
@@ -106,11 +106,6 @@ describe("segmentsFromResult", () => {
     // The invariant the exporters rely on: chunk time is relative to the segment.
     expect(out[0].chunks).toEqual([{ text: "おはようございます。", timestamp: [0, 2] }]);
     expect(out[1].chunks).toEqual([{ text: "議事録を始めます。", timestamp: [0, 3] }]);
-    // Round-tripping through combinedChunks must land back on absolute time.
-    expect(combinedChunks(out)).toEqual([
-      { text: "おはようございます。", timestamp: [100, 102] },
-      { text: "議事録を始めます。", timestamp: [102, 105] },
-    ]);
   });
 
   it("keeps the text when the result has no usable chunks", () => {
@@ -231,10 +226,9 @@ describe("segmentsFromResult", () => {
     expect(out[0].excludedReason).toBeUndefined();
   });
 
-  it("keeps combinedText/combinedChunks blind to placeholders, same as any other blank segment", () => {
+  it("keeps combinedText blind to placeholders, same as any other blank segment", () => {
     const out = segmentsFromResult(result, 0, 1, undefined, [true, false]);
     expect(combinedText(out)).toBe("議事録を始めます。");
-    expect(combinedChunks(out)).toEqual([{ text: "議事録を始めます。", timestamp: [2, 5] }]);
   });
 
   it("turns a silent-flagged chunk into a 無音 placeholder", () => {

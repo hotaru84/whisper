@@ -129,28 +129,20 @@ export function SettingsPanel() {
         <AccordionTrigger>保存設定</AccordionTrigger>
         <AccordionContent>
           <div className="flex flex-col gap-4">
-            <div className="flex items-center gap-2">
-              <Switch
-                id="autosave-enabled"
-                checked={autoSaveSettings.enabled}
-                onCheckedChange={(checked) => updateAutoSaveSettings({ enabled: checked })}
-              />
-              <Label htmlFor="autosave-enabled">録音・文字起こしを自動保存する</Label>
-              <InfoTooltip>
-                有効にすると、録音のWAVファイルはアプリ内部の代わりに下のフォルダへ直接保存され、
-                文字起こしも解析が終わるたびに同じフォルダへ自動で書き出されます。無効のときは
-                これまで通りアプリ内部にのみ保存されます。
-              </InfoTooltip>
-            </div>
-
-            <div className="flex flex-col gap-1.5 pl-6">
-              <Label htmlFor="autosave-directory">保存先フォルダ</Label>
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="autosave-directory">保存先フォルダ</Label>
+                <InfoTooltip>
+                  録音のWAVファイルと文字起こしのテキストファイルは、ここで指定したフォルダに保存されます。
+                  録音を開始する前に必ず設定してください。
+                </InfoTooltip>
+              </div>
               <div className="flex items-center gap-2">
                 <Input
                   id="autosave-directory"
                   readOnly
                   value={autoSaveSettings.directory}
-                  placeholder="未設定（アプリ内部に保存）"
+                  placeholder="未設定（録音を開始する前に選択してください）"
                   className="font-mono text-xs"
                 />
                 <Button
@@ -165,27 +157,9 @@ export function SettingsPanel() {
                   フォルダを選択
                 </Button>
               </div>
-              {autoSaveSettings.enabled && !autoSaveSettings.directory && (
-                <p className="text-xs text-muted-foreground">
-                  フォルダを選択すると有効になります。
-                </p>
+              {!autoSaveSettings.directory && (
+                <p className="text-xs text-destructive">録音を開始するには保存先フォルダの設定が必要です。</p>
               )}
-            </div>
-
-            <div className="flex items-center gap-2 pl-6">
-              <Label htmlFor="autosave-format">文字起こしの保存形式</Label>
-              <Select
-                value={autoSaveSettings.transcriptFormat}
-                onValueChange={(v) => updateAutoSaveSettings({ transcriptFormat: v === "txt" ? "txt" : "srt" })}
-              >
-                <SelectTrigger id="autosave-format" className="w-28">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="srt">SRT</SelectItem>
-                  <SelectItem value="txt">TXT</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
           </div>
         </AccordionContent>

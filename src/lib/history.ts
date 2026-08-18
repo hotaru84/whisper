@@ -125,8 +125,9 @@ export async function openRecordingFolder(id: string): Promise<void> {
 /** Inverse of `capture.ts`'s `defaultName`. Returns `null` for a filename
  * that doesn't match the expected stem shape, so a stray or future file
  * format in the recordings directory is skipped rather than crashing the
- * whole list. */
-function parseCreatedAt(id: string): Date | null {
+ * whole list. Exported for `autoSave.ts`, which needs the same wall-clock
+ * start to timestamp the auto-saved transcript's lines in absolute time. */
+export function parseCreatedAt(id: string): Date | null {
   const m = /^rec-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(id);
   if (!m) return null;
   const [, y, mo, d, h, mi, s] = m;

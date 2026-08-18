@@ -1,5 +1,6 @@
 import type { TranscriptChunk, AudioEvent } from "./asr";
 import { isNoiseOrMusicEvent } from "./audioEvents";
+import { formatAbsoluteDateTime } from "./format";
 
 /**
  * One contiguous piece of transcript. A recording produces one or more segments
@@ -165,10 +166,8 @@ export function segmentsFromResult(
 
 /** Cues whose normalized text matches and whose start does not sit past the
  * prior cue's end by more than this are treated as the same utterance
- * repeated by a stalled decode, not two separate ones. Shared by
- * `collapseDegenerateSegments` below and `prepareCues` in
- * `lib/export/srt.ts`, which does the same collapse for SRT export -- one
- * threshold, so the two never quietly disagree on what counts as "the same
+ * repeated by a stalled decode, not two separate ones. Used by
+ * `collapseDegenerateSegments` below to decide what counts as "the same
  * span". */
 export const COLLAPSE_TOLERANCE_SEC = 0.05;
 
@@ -186,12 +185,10 @@ export function normalizeForCollapse(text: string): string {
  * `COLLAPSE_TOLERANCE_SEC` -- the shape whisper.cpp's degenerate-loop
  * hallucinations actually take (many short adjacent cues, same text, same or
  * barely-advancing timestamps), not a real repeated utterance like "はい、
- * はい" (whose start genuinely advances). Mirrors `prepareCues` in
- * `lib/export/srt.ts`, which does the same thing for SRT export -- this is
- * the equivalent for everywhere else a transcript is shown or copied
- * (`TranscriptPanel`, which both the live view and history view render
- * through, `HistorySidebar`'s row-level copy, and `autoSave.ts`'s .txt
- * auto-save).
+ * はい" (whose start genuinely advances). Used everywhere a transcript is
+ * shown or copied (`TranscriptPanel`, which both the live view and history
+ * view render through, `HistorySidebar`'s row-level copy, and
+ * `autoSave.ts`'s .txt auto-save).
  *
  * Purely a rendering transform: never mutates its input and is never fed
  * back into the store's own `segments`. History persistence, the segment
@@ -249,7 +246,7 @@ function findExclusionReason(start: number, end: number, events: AudioEvent[]): 
  * none to show. 1-indexed ("話者1") because the cluster index is an internal
  * implementation detail nobody reading a transcript should have to see 0 of.
  */
-function speakerLabel(speaker: number | null | undefined): string {
+export function speakerLabel(speaker: number | null | undefined): string {
   return typeof speaker === "number" ? `話者${speaker + 1}: ` : "";
 }
 
@@ -261,22 +258,25 @@ export function combinedText(segments: TranscriptSegment[]): string {
     .join("\n");
 }
 
-/** Flattens all segments' chunks onto the global timeline (for SRT export).
- * Blank chunks (an excluded-gap placeholder's `text: ""`, see
- * `TranscriptSegment.excludedReason`) are skipped, the same way
- * `combinedText` drops blank segments -- an SRT cue with no text would just
- * be an empty subtitle flashing on screen. */
-export function combinedChunks(segments: TranscriptSegment[]): TranscriptChunk[] {
-  return segments.flatMap((seg) =>
-    seg.chunks
-      .filter((c) => c.text.trim() !== "")
-      .map((c) => ({
-        text: c.text,
-        timestamp: [
-          c.timestamp[0] + seg.startOffsetSec,
-          (c.timestamp[1] ?? c.timestamp[0]) + seg.startOffsetSec,
-        ] as [number, number],
-        speaker: seg.speaker,
-      })),
-  );
+/**
+ * Joins segment texts for the auto-saved transcript file, one segment per
+ * line, each prefixed with an absolute local wall-clock timestamp
+ * (`[YYYY-MM-DD HH:MM:SS]`) computed from `recordingStart` (the take's own
+ * wall-clock start, see `history.ts`'s `parseCreatedAt`) plus the segment's
+ * `startOffsetSec` into that recording.
+ *
+ * Deliberately a separate function from `combinedText` rather than an option
+ * on it: `combinedText` also drives on-screen/clipboard copies
+ * (`TranscriptPanel`, `HistorySidebar`), which stay relative-timeline-free by
+ * design -- the saved file's format should be free to carry a timestamp
+ * without changing what those views show.
+ */
+export function combinedTextWithTimestamps(segments: TranscriptSegment[], recordingStart: Date): string {
+  return segments
+    .filter((s) => s.text.trim() !== "")
+    .map((s) => {
+      const at = new Date(recordingStart.getTime() + s.startOffsetSec * 1000);
+      return `[${formatAbsoluteDateTime(at)}] ${speakerLabel(s.speaker)}${s.text.trim()}`;
+    })
+    .join("\n");
 }

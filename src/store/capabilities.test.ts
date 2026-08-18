@@ -90,6 +90,40 @@ describe("selectCapabilities", () => {
     expect(can.startRecording).toBe(false);
   });
 
+  it("does not let a take start when no auto-save folder is configured", () => {
+    const can = selectCapabilities({
+      recordingPhase: "stopped",
+      processing: null,
+      modelStatus: "ready",
+      recordOnly: false,
+      directoryConfigured: false,
+    });
+    expect(can.startRecording).toBe(false);
+  });
+
+  it("blocks a record-only take too when no folder is configured", () => {
+    // Record-only mode skips the model-ready check, but a save folder is
+    // still required -- it has nowhere else to write the WAV to.
+    const can = selectCapabilities({
+      recordingPhase: "stopped",
+      processing: null,
+      modelStatus: "idle",
+      recordOnly: true,
+      directoryConfigured: false,
+    });
+    expect(can.startRecording).toBe(false);
+  });
+
+  it("defaults directoryConfigured to true for call sites that don't pass it", () => {
+    const can = selectCapabilities({
+      recordingPhase: "stopped",
+      processing: null,
+      modelStatus: "ready",
+      recordOnly: false,
+    });
+    expect(can.startRecording).toBe(true);
+  });
+
   it("stops offering to cancel once a cancellation has already been requested", () => {
     // The whole reason "cancelling" is its own phase rather than a flag beside
     // "refining": pressing the button is what makes it stop offering itself.

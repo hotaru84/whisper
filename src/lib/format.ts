@@ -26,3 +26,12 @@ export function formatDateTime(date: Date): { day: string; time: string } {
     time: `${p(date.getHours())}:${p(date.getMinutes())}`,
   };
 }
+
+/** A full local-time timestamp (`YYYY-MM-DD HH:MM:SS`) for one line of the
+ * auto-saved transcript -- always the machine's local time, never UTC or a
+ * hardcoded timezone, so it reads the same as the wall clock the meeting
+ * itself happened against. See `transcript.ts`'s `combinedTextWithTimestamps`. */
+export function formatAbsoluteDateTime(date: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}

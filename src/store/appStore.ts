@@ -340,7 +340,13 @@ interface AppState {
 function capabilitiesOf(
   s: Pick<
     AppState,
-    "recordingPhase" | "processing" | "modelStatus" | "recordingMode" | "startingRecording" | "powerSource"
+    | "recordingPhase"
+    | "processing"
+    | "modelStatus"
+    | "recordingMode"
+    | "startingRecording"
+    | "powerSource"
+    | "autoSaveSettings"
   >,
 ) {
   return selectCapabilities({
@@ -349,6 +355,7 @@ function capabilitiesOf(
     modelStatus: s.modelStatus,
     recordOnly: effectiveRecordOnly(s.recordingMode, s.powerSource),
     startingRecording: s.startingRecording,
+    directoryConfigured: s.autoSaveSettings.directory !== "",
   });
 }
 
@@ -509,7 +516,7 @@ export function activeRecordedSec(): number | null {
 // otherwise a take started before any state update would land would silently
 // still go to the internal cache dir.
 const initialAutoSaveSettings = loadAutoSaveSettings();
-setRecordingDirectory(initialAutoSaveSettings.enabled ? initialAutoSaveSettings.directory : "");
+setRecordingDirectory(initialAutoSaveSettings.directory);
 
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
@@ -1151,7 +1158,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const autoSaveSettings = { ...s.autoSaveSettings, ...partial };
       saveAutoSaveSettings(autoSaveSettings);
-      setRecordingDirectory(autoSaveSettings.enabled ? autoSaveSettings.directory : "");
+      setRecordingDirectory(autoSaveSettings.directory);
       return { autoSaveSettings };
     }),
 
