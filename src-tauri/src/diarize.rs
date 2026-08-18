@@ -152,7 +152,7 @@ pub fn diarize(
 ///
 /// A pure function over plain tuples and [`SpeakerSegment`] -- no sherpa-onnx
 /// object, no I/O -- so it is unit-testable without a model or audio, and so a
-/// future audio-event or DTW pass could reuse the same overlap logic.
+/// future audio-event pass could reuse the same overlap logic.
 ///
 /// `chunks` are `(start, end)` in seconds on the same timeline as `speakers`
 /// (both must already be on the recording's absolute timeline, not a segment-

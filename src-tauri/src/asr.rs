@@ -4,10 +4,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager};
-use whisper_rs::{
-    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
-    WhisperContextParameters, WhisperVadParams,
-};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadParams};
 
 /// Holds the loaded whisper.cpp model for the lifetime of the app. `None` until
 /// `init_model` succeeds.
@@ -142,27 +139,23 @@ pub async fn init_model(app: AppHandle) -> Result<(), String> {
     // Loading a ~600MB GGUF file is blocking CPU/IO work; keep it off the async runtime.
     let result = tauri::async_runtime::spawn_blocking(move || {
         let model_path = resolve_model_path(&app_for_load)?;
-        let mut params = WhisperContextParameters::default();
-        // DTW gives per-token timestamps by tracking attention alignment through
-        // the decoder, rather than whisper's default of reading them off the
-        // single-timestamp tokens it happens to emit -- which is why segment
-        // boundaries can land hundreds of ms from the actual speech. This preset
-        // is model-specific (its attention heads were selected for
-        // large-v3-turbo) and only applies to the model we ship.
-        // `collect_segments` reads the resulting per-token `t_dtw` values to
-        // tighten segment boundaries, which matters because diarization
-        // assigns speakers by overlapping these timestamps against diarizer
-        // segments.
-        //
-        // Safe to enable unconditionally: flash_attn (the one thing DTW
-        // conflicts with) and new_segment_callback (whose calls DTW makes
-        // inconsistent) are both unused here.
-        params.dtw_parameters(DtwParameters {
-            mode: DtwMode::ModelPreset {
-                model_preset: DtwModelPreset::LargeV3Turbo,
-            },
-            ..DtwParameters::default()
-        });
+        // DTW (per-token timestamps via attention alignment, tighter than
+        // whisper's default single-timestamp-token segment boundaries) was
+        // tried and removed. whisper.cpp's DTW median filter calls
+        // `WHISPER_ASSERT(filter_width < a->ne[2])` (whisper.cpp:8772) --
+        // filter_width is hardcoded to 7, and `a->ne[2]` is the segment's own
+        // frame count, so any segment whisper times at under ~160ms fails
+        // this and calls `abort()`. That is not a catchable Rust error; it
+        // kills the whole process. Whisper.cpp's internal seek loop can
+        // produce a segment that short (the same seek irregularities
+        // `redecode_voiced_gaps` exists to work around), and there is no way
+        // to rule that out up front from this side of the FFI boundary.
+        // DTW also never changed transcribed text, only cue timing, so the
+        // only real loss from removing it is some sharpness in diarization's
+        // timestamp-overlap speaker assignment, which falls back to
+        // whisper's own (coarser, but crash-proof) segment-level timestamps.
+        // See README's "DTW" section for the fuller history.
+        let params = WhisperContextParameters::default();
         WhisperContext::new_with_params(&model_path, params).map_err(|e| e.to_string())
     })
     .await
@@ -432,122 +425,22 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
     params
 }
 
-/// Segment bounds derived from per-token DTW alignment, in centiseconds.
+/// Normalises a whisper segment's own envelope: clamps a negative start to
+/// zero and guarantees the end is never before the start.
 ///
-/// whisper.cpp only assigns `t_dtw` to text tokens (timestamp tokens are
-/// skipped and keep the uncomputed sentinel), so the min/max across a
-/// segment's tokens is the DTW-aligned span of the words actually spoken --
-/// tighter than the single timestamp token whisper's default reader reads
-/// off the segment boundary. Returns `None` when no token in the segment has
-/// a computed `t_dtw` (DTW disabled, or nothing but non-text tokens), so the
-/// caller can fall back to the segment-level timestamp.
-///
-/// **Only valid when VAD did not run on this decode.** `t_dtw` comes from
-/// `whisper_full_get_token_data_from_state`, which whisper.cpp never maps
-/// back off the VAD-compressed sample timeline (whisper.cpp:8041-8043) the
-/// way it does for the segment-level `t0`/`t1` (whisper.cpp:7953-7990). See
-/// `collect_segments`'s `vad` parameter, which is what actually gates this.
-fn dtw_segment_bounds(segment: &whisper_rs::WhisperSegment) -> Option<(i64, i64)> {
-    let mut bounds: Option<(i64, i64)> = None;
-    for i in 0..segment.n_tokens() {
-        let Some(token) = segment.get_token(i) else {
-            continue;
-        };
-        let t_dtw = token.token_data().t_dtw;
-        // -1 is whisper.cpp's uncomputed sentinel (whisper_sample_token's
-        // default init), not a valid timestamp -- see whisper.h's warning not
-        // to use t_dtw "if you haven't computed token-level timestamps with dtw".
-        if t_dtw < 0 {
-            continue;
-        }
-        bounds = Some(match bounds {
-            None => (t_dtw, t_dtw),
-            Some((min, max)) => (min.min(t_dtw), max.max(t_dtw)),
-        });
-    }
-    bounds
-}
-
-/// Cue length floor, in centiseconds (200ms).
-///
-/// A Japanese mora runs roughly 100-150ms, so a one-token cue like "はい" is
-/// physically 200-300ms -- this is the shortest span whisper's own timing
-/// granularity can be expected to resolve. Below it, treat the bound as an
-/// artefact of coarse timestamps rather than a genuine sub-200ms utterance.
-const MIN_CUE_SPAN_CS: i64 = 20;
-
-/// Reconciles a DTW-derived token span against whisper's own segment
-/// envelope, and enforces [`MIN_CUE_SPAN_CS`].
-///
-/// DTW's job is to refine *within* the segment whisper already committed to,
-/// not contradict it -- so `dtw`, when present, is clamped into `envelope`
-/// rather than trusted outright. If DTW disagrees badly with the envelope
-/// (a stray token, or the VAD timeline issue documented on
-/// `dtw_segment_bounds` resurfacing some other way), the clamp is where that
-/// becomes visible as a tightened span instead of silently producing a bound
-/// whisper itself never reported.
-///
-/// No outlier rejection beyond the envelope clamp: whisper.cpp's DTW
-/// backtrace is monotonic in both token index and time
-/// (whisper.cpp:8677-8760, 8925-8950), so the min/max across a segment's
-/// tokens is never a statistical outlier -- it is simply the first and last
-/// token whisper assigned to the segment.
-///
-/// The floor expands the span symmetrically around its midpoint, then slides
-/// (never truncates) to stay inside `envelope` if that expansion would
-/// spill past it. If `envelope` itself is shorter than `min_span_cs`, it is
-/// returned unchanged: this function invents timing precision, never speech
-/// whisper didn't claim.
-fn sanitize_bounds(dtw: Option<(i64, i64)>, envelope: (i64, i64), min_span_cs: i64) -> (i64, i64) {
+/// Used to reconcile a DTW-derived token span against this envelope before
+/// DTW was removed (see `init_model`'s doc comment); this trivial clamp is
+/// what remains of that job now that the envelope -- whisper's own
+/// single-timestamp-token segment boundary -- is all there is.
+fn sanitize_bounds(envelope: (i64, i64)) -> (i64, i64) {
     let e0 = envelope.0.max(0);
     let e1 = envelope.1.max(e0);
-
-    let (t0, t1) = match dtw {
-        None => (e0, e1),
-        Some((d0, d1)) => {
-            let (d0, d1) = if d0 <= d1 { (d0, d1) } else { (d1, d0) };
-            (d0.clamp(e0, e1), d1.clamp(e0, e1))
-        }
-    };
-
-    if e1 - e0 < min_span_cs || t1 - t0 >= min_span_cs {
-        return (t0, t1);
-    }
-
-    let mid = (t0 + t1) / 2;
-    let mut new_t0 = mid - min_span_cs / 2;
-    let mut new_t1 = new_t0 + min_span_cs;
-    if new_t0 < e0 {
-        new_t1 += e0 - new_t0;
-        new_t0 = e0;
-    }
-    if new_t1 > e1 {
-        new_t0 -= new_t1 - e1;
-        new_t1 = e1;
-    }
-    (new_t0, new_t1)
+    (e0, e1)
 }
 
 /// Collects whisper's segments into the shape the frontend consumes.
 /// Timestamps are converted from whisper's centiseconds to seconds.
-///
-/// `vad` must reflect whether VAD actually ran on this decode (i.e. whether
-/// `DecodeSettings::vad_model_path` was `Some` and resolved), not just
-/// whether the caller wanted it. When it did, DTW token bounds are **not**
-/// used, even though they were computed: whisper.cpp decodes VAD-enabled
-/// audio against a VAD-compressed sample buffer (whisper.cpp:7749-7762), and
-/// while `whisper_full_get_segment_t0/t1_from_state` map that back to the
-/// original timeline (whisper.cpp:7953-7990, with a 100ms floor),
-/// `whisper_full_get_token_data_from_state` -- what `dtw_segment_bounds`
-/// reads -- returns the raw, unconverted value (whisper.cpp:8041-8043). Using
-/// it under VAD would silently place every DTW-derived boundary on the wrong
-/// (compressed) timeline, which matters most for diarization: it assigns
-/// speakers by overlapping these timestamps against diarizer segments. With
-/// `vad == false`, DTW bounds are safe and preferred -- they track attention
-/// alignment through the decoder and land closer to the actual speech
-/// boundaries than the single timestamp token whisper's default segmentation
-/// emits.
-pub fn collect_segments(state: &whisper_rs::WhisperState, vad: bool) -> Result<TranscribeResult, String> {
+pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeResult, String> {
     let n_segments = state.full_n_segments();
     let mut chunks = Vec::with_capacity(n_segments.max(0) as usize);
     let mut text = String::new();
@@ -560,8 +453,7 @@ pub fn collect_segments(state: &whisper_rs::WhisperState, vad: bool) -> Result<T
         // accessor rejects outright.
         let seg_text = segment.to_str_lossy().map_err(|e| e.to_string())?.into_owned();
         let envelope = (segment.start_timestamp(), segment.end_timestamp());
-        let dtw = if vad { None } else { dtw_segment_bounds(&segment) };
-        let (t0_cs, t1_cs) = sanitize_bounds(dtw, envelope, MIN_CUE_SPAN_CS);
+        let (t0_cs, t1_cs) = sanitize_bounds(envelope);
         let t0 = t0_cs as f32 / 100.0;
         let t1 = t1_cs as f32 / 100.0;
         text.push_str(&seg_text);
@@ -649,8 +541,7 @@ pub async fn transcribe_window(
             .full(params, &samples)
             .map_err(|e| e.to_string())?;
 
-        // No VAD in the live path -- `settings` never sets `vad_model_path`.
-        collect_segments(&whisper_state, false)
+        collect_segments(&whisper_state)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -673,12 +564,9 @@ pub const SILENCE_RMS: f32 = 1e-3;
 /// whisper's segment timestamps are coarse enough to be off by a noticeable
 /// fraction of a second, so judging a segment by its declared interval alone
 /// risks measuring the pause *next* to real speech. Padding makes a false drop
-/// require a full second of silence on both sides.
-///
-/// `init_model` now enables DTW token-level timestamps, which should tighten
-/// this in practice -- but by how much is unmeasured (no fixtures with known
-/// ground-truth timestamps exist yet), so this stays at its original
-/// conservative value rather than guessing a smaller one down.
+/// require a full second of silence on both sides. Coarser still since DTW
+/// was removed (see `init_model`'s doc comment) -- no reason to shrink this,
+/// only more reason it needs to stay generous.
 const SILENCE_MARGIN_SEC: f32 = 1.0;
 
 /// Shared with `cues::analyze`, which needs the same RMS definition to decide
@@ -792,7 +680,6 @@ const MIN_GAP_REDECODE_SEC: f32 = 1.5;
 pub fn redecode_voiced_gaps(
     ctx: &WhisperContext,
     settings: &DecodeSettings,
-    vad: bool,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     chunks: Vec<TranscribeChunk>,
     samples: &[f32],
@@ -828,7 +715,7 @@ pub fn redecode_voiced_gaps(
         }
 
         let offset_sec = padded_from as f32 / sr;
-        for c in collect_segments(&state, vad)?.chunks {
+        for c in collect_segments(&state)?.chunks {
             // Clamp to the gap's own bounds: a decode given padded context can
             // legitimately place a token in the padding, but that padding
             // overlaps audio the main pass already transcribed, so anything
@@ -924,11 +811,19 @@ fn find_degenerate_runs(chunks: &[TranscribeChunk]) -> Vec<std::ops::Range<usize
 /// itself. A fresh `WhisperState` (as `redecode_voiced_gaps` already uses)
 /// removes that stale context once, but if a repaired span were long enough
 /// to itself span an internal 30s boundary, the same self-reinforcement could
-/// restart inside the repair decode. Capping the context budget low (64,
-/// versus whisper.cpp's default of `min(n_max_text_ctx, n_text_ctx / 2)` =
-/// 224 for large-v3-turbo, see `DecodeSettings::prompt`'s doc comment) keeps
+/// restart inside the repair decode. Capping the context budget low (64) keeps
 /// too little of any one internal chunk's output alive for it to dominate the
 /// next.
+///
+/// This overrides `n_max_text_ctx` only for this one isolated repair decode.
+/// whisper.cpp's own default for the field is `16384` (whisper.cpp:5911,
+/// effectively unbounded against a ~448-token text context) -- unrelated to
+/// the 224-token figure in `DecodeSettings::prompt`'s doc comment, which is a
+/// *different* budget (`min(n_max_text_ctx, n_text_ctx / 2)`, computed only
+/// when truncating the user's glossary prompt). `build_full_params` never
+/// calls `set_n_max_text_ctx`, so every other decode -- the main pass, the
+/// live pass, `redecode_voiced_gaps` -- keeps whisper.cpp's own default
+/// unchanged.
 const DEGENERATE_LOOP_MAX_CTX: i32 = 64;
 
 /// Padding added on each side of a degenerate-loop span before re-decoding
@@ -937,6 +832,77 @@ const DEGENERATE_LOOP_MAX_CTX: i32 = 64;
 /// mid-word, with the result always clamped back to the span's own bounds
 /// before merging (see `redecode_degenerate_loops`).
 const LOOP_REDECODE_MARGIN_SEC: f32 = 0.5;
+
+/// Whether a degenerate-loop repair should replace the run it was decoded
+/// for.
+///
+/// There is no reference transcript to check the replacement's text against,
+/// so correctness can never be confirmed here -- only that the replacement is
+/// not a continuation of the same failure. Two things fail that minimal bar:
+/// an empty replacement is indistinguishable from a redecode that produced
+/// nothing at all, and a replacement whose own worst degenerate run
+/// ([`find_degenerate_runs`] run again on it) is no shorter than
+/// `original_run_len` is no improvement -- possibly the identical loop
+/// reproduced by the repair decode itself. Rejecting either keeps the
+/// original (looped, but recoverable in the UI via
+/// `collapseDegenerateSegments`) chunks instead.
+fn accepts_loop_repair(original_run_len: usize, replacement: &[TranscribeChunk]) -> bool {
+    if replacement.is_empty() {
+        return false;
+    }
+    let worst_new_run = find_degenerate_runs(replacement).iter().map(|r| r.len()).max().unwrap_or(0);
+    worst_new_run < original_run_len
+}
+
+/// Splices accepted repairs back into the original chunk sequence.
+///
+/// `runs` and `repairs` are parallel and must be the same length: `repairs[i]`
+/// is `Some(replacement)` when a repair was accepted for `runs[i]`
+/// ([`accepts_loop_repair`]), or `None` to keep that run's original chunks
+/// unchanged (no repair attempted, or one rejected). `runs` must be sorted,
+/// non-overlapping, and each within `chunks`' bounds -- exactly what
+/// [`find_degenerate_runs`] returns.
+///
+/// Kept separate from the decode/repair logic (which needs a `WhisperState`
+/// and so cannot be unit-tested directly): this index bookkeeping is what
+/// would silently drop or duplicate a chunk on an off-by-one, with nothing
+/// downstream positioned to notice, so it gets its own tests instead of only
+/// being exercised end-to-end against a real model.
+fn splice_repairs(
+    chunks: Vec<TranscribeChunk>,
+    runs: &[std::ops::Range<usize>],
+    repairs: Vec<Option<Vec<TranscribeChunk>>>,
+) -> Vec<TranscribeChunk> {
+    debug_assert_eq!(runs.len(), repairs.len());
+
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut chunks = chunks.into_iter();
+    let mut pos = 0usize;
+
+    for (run, repair) in runs.iter().zip(repairs) {
+        // Copy through untouched chunks before this run.
+        while pos < run.start {
+            out.push(chunks.next().expect("pos stays within the original chunk count"));
+            pos += 1;
+        }
+        // Consume the run's own original chunks; kept as the fallback if
+        // `repair` is `None`.
+        let mut originals = Vec::with_capacity(run.len());
+        while pos < run.end {
+            originals.push(chunks.next().expect("pos stays within the original chunk count"));
+            pos += 1;
+        }
+
+        match repair {
+            Some(replacement) => out.extend(replacement),
+            None => out.extend(originals),
+        }
+    }
+
+    // Copy through anything after the last run.
+    out.extend(chunks);
+    out
+}
 
 /// Repairs whisper.cpp's context-conditioning failure mode: a chunk that
 /// decodes into a short stock phrase or a looped fragment feeds that same
@@ -951,17 +917,12 @@ const LOOP_REDECODE_MARGIN_SEC: f32 = 0.5;
 ///
 /// Each detected run is re-decoded from a fresh `WhisperState` (no carried
 /// context, exactly as `redecode_voiced_gaps` does for gaps) with the
-/// text-context budget capped at [`DEGENERATE_LOOP_MAX_CTX`] tokens. The new
-/// chunks are clamped to the run's own bounds before replacing it, so a
-/// repair can only change what is inside the run's span, never touch or
-/// duplicate audio on either side of it. If a repair decode produces nothing
-/// usable, the original (looped) chunks are kept rather than erasing the span
-/// from the transcript entirely -- a stalled loop is recoverable in the UI
-/// (`collapseDegenerateSegments`), a silently vanished span is not.
+/// text-context budget capped at [`DEGENERATE_LOOP_MAX_CTX`] tokens, clamped
+/// to the run's own bounds, and kept only if [`accepts_loop_repair`] judges
+/// it an improvement; [`splice_repairs`] does the actual replacement.
 pub fn redecode_degenerate_loops(
     ctx: &WhisperContext,
     settings: &DecodeSettings,
-    vad: bool,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     chunks: Vec<TranscribeChunk>,
     samples: &[f32],
@@ -972,35 +933,16 @@ pub fn redecode_degenerate_loops(
     }
 
     let sr = crate::wav::SAMPLE_RATE as f32;
-    // Spans are read off the original chunks up front, before `chunks` is
-    // consumed by the splice below.
-    let spans: Vec<(f32, f32)> = runs
-        .iter()
-        .map(|run| (chunks[run.start].timestamp.0, chunks[run.end - 1].timestamp.1))
-        .collect();
+    let mut repairs: Vec<Option<Vec<TranscribeChunk>>> = Vec::with_capacity(runs.len());
 
-    let mut out: Vec<TranscribeChunk> = Vec::with_capacity(chunks.len());
-    let mut chunks = chunks.into_iter();
-    let mut pos = 0usize;
-
-    for (run, (span_start, span_end)) in runs.into_iter().zip(spans) {
-        // Copy through untouched chunks before this run.
-        while pos < run.start {
-            out.push(chunks.next().expect("pos stays within the original chunk count"));
-            pos += 1;
-        }
-        // Consume the run's own original chunks; kept as the fallback if the
-        // repair below cannot run or produces nothing.
-        let mut originals = Vec::with_capacity(run.len());
-        while pos < run.end {
-            originals.push(chunks.next().expect("pos stays within the original chunk count"));
-            pos += 1;
-        }
+    for run in &runs {
+        let span_start = chunks[run.start].timestamp.0;
+        let span_end = chunks[run.end - 1].timestamp.1;
 
         let padded_from = ((span_start - LOOP_REDECODE_MARGIN_SEC) * sr).max(0.0) as usize;
         let padded_to = (((span_end + LOOP_REDECODE_MARGIN_SEC) * sr) as usize).min(samples.len());
         if padded_from >= padded_to {
-            out.extend(originals);
+            repairs.push(None);
             continue;
         }
 
@@ -1020,7 +962,7 @@ pub fn redecode_degenerate_loops(
 
         let offset_sec = padded_from as f32 / sr;
         let mut replacement = Vec::new();
-        for c in collect_segments(&state, vad)?.chunks {
+        for c in collect_segments(&state)?.chunks {
             // Clamp to the run's own bounds, exactly as `redecode_voiced_gaps`
             // does for gaps: padding can legitimately place a token in audio
             // already covered by a neighboring cue, and only what falls
@@ -1032,16 +974,14 @@ pub fn redecode_degenerate_loops(
             }
         }
 
-        if replacement.is_empty() {
-            out.extend(originals);
+        if accepts_loop_repair(run.len(), &replacement) {
+            repairs.push(Some(replacement));
         } else {
-            out.extend(replacement);
+            repairs.push(None);
         }
     }
 
-    // Copy through anything after the last run.
-    out.extend(chunks);
-    Ok(out)
+    Ok(splice_repairs(chunks, &runs, repairs))
 }
 
 /// Re-transcribes a finished recording in one pass over the whole file.
@@ -1122,10 +1062,6 @@ pub async fn transcribe_recording(
             entropy_thold,
             ..DecodeSettings::default()
         };
-        // Whether VAD actually ran, not just whether it was requested -- a
-        // missing model file above falls back to `None` and still has to
-        // decode (and collect segments) as if VAD were off.
-        let vad_active = settings.vad_model_path.is_some();
         let mut params = build_full_params(&settings);
 
         // whisper calls this far more often than once per percent; emitting only
@@ -1163,10 +1099,16 @@ pub async fn transcribe_recording(
             return Err(e.to_string());
         }
 
-        let mut result = collect_segments(&whisper_state, vad_active)?;
-        result.chunks =
-            redecode_voiced_gaps(ctx, &settings, vad_active, &cancel, result.chunks, &samples, silence_rms)?;
-        result.chunks = redecode_degenerate_loops(ctx, &settings, vad_active, &cancel, result.chunks, &samples)?;
+        let mut result = collect_segments(&whisper_state)?;
+        // Loop repair runs before gap fill, not after: gap fill's own inserted
+        // cues can split what would have been one longer degenerate run into
+        // shorter ones that no longer clear find_degenerate_runs' two-chunk
+        // minimum, hiding a loop from repair. Running loop repair first means
+        // any gap a *replacement* span leaves behind (its content is genuine
+        // speech now, not a stalled loop packed with no real pauses) still
+        // gets a chance to be filled by the gap-fill pass that follows.
+        result.chunks = redecode_degenerate_loops(ctx, &settings, &cancel, result.chunks, &samples)?;
+        result.chunks = redecode_voiced_gaps(ctx, &settings, &cancel, result.chunks, &samples, silence_rms)?;
         result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
 
         let (mut result, silence) = mark_silent_segments(result, &samples, silence_rms);
@@ -1185,61 +1127,28 @@ mod sanitize_bounds_tests {
     use super::sanitize_bounds;
 
     #[test]
-    fn no_dtw_returns_the_envelope_unchanged_when_it_already_meets_the_floor() {
-        assert_eq!(sanitize_bounds(None, (100, 300), 20), (100, 300));
+    fn a_normal_envelope_is_returned_unchanged() {
+        assert_eq!(sanitize_bounds((100, 300)), (100, 300));
     }
 
     #[test]
-    fn dtw_within_the_envelope_is_kept_as_is() {
-        assert_eq!(sanitize_bounds(Some((110, 290)), (100, 300), 20), (110, 290));
-    }
-
-    #[test]
-    fn dtw_spilling_past_the_envelope_is_clamped_into_it() {
-        // A stray token (or the VAD timeline issue) pushing DTW outside what
-        // whisper itself reported must never widen the cue past the envelope.
-        assert_eq!(sanitize_bounds(Some((50, 400)), (100, 300), 20), (100, 300));
-    }
-
-    #[test]
-    fn a_swapped_dtw_pair_is_normalised_before_clamping() {
-        assert_eq!(sanitize_bounds(Some((290, 110)), (100, 300), 20), (110, 290));
-    }
-
-    #[test]
-    fn a_short_span_is_expanded_symmetrically_around_its_midpoint() {
-        // dtw=(145,155): midpoint 150, floored to a 20cs span -> (140, 160).
-        assert_eq!(sanitize_bounds(Some((145, 155)), (0, 1000), 20), (140, 160));
-    }
-
-    #[test]
-    fn expansion_slides_rather_than_truncates_at_the_envelope_start() {
-        // Midpoint 5 wants (-5, 15), but the envelope starts at 0: slide the
-        // whole window right instead of clipping it to (0, 15) (a 15cs span).
-        assert_eq!(sanitize_bounds(Some((0, 10)), (0, 1000), 20), (0, 20));
-    }
-
-    #[test]
-    fn expansion_slides_rather_than_truncates_at_the_envelope_end() {
-        assert_eq!(sanitize_bounds(Some((990, 1000)), (0, 1000), 20), (980, 1000));
-    }
-
-    #[test]
-    fn an_envelope_shorter_than_the_floor_is_returned_unchanged() {
-        // Nothing to expand into: whisper only claimed 100-110, and 10cs of
-        // silence-filling time must not be invented on either side of it.
-        assert_eq!(sanitize_bounds(None, (100, 110), 20), (100, 110));
-        assert_eq!(sanitize_bounds(Some((102, 108)), (100, 110), 20), (102, 108));
+    fn a_negative_envelope_start_is_normalised_to_zero() {
+        assert_eq!(sanitize_bounds((-50, 30)), (0, 30));
     }
 
     #[test]
     fn a_zero_length_envelope_is_returned_unchanged() {
-        assert_eq!(sanitize_bounds(None, (150, 150), 20), (150, 150));
+        assert_eq!(sanitize_bounds((150, 150)), (150, 150));
     }
 
     #[test]
-    fn a_negative_envelope_is_normalised_to_zero() {
-        assert_eq!(sanitize_bounds(None, (-50, 30), 20), (0, 30));
+    fn an_end_before_the_start_is_clamped_to_the_start() {
+        assert_eq!(sanitize_bounds((150, 100)), (150, 150));
+    }
+
+    #[test]
+    fn a_negative_end_is_clamped_to_the_normalised_start() {
+        assert_eq!(sanitize_bounds((-50, -10)), (0, 0));
     }
 }
 
@@ -1476,6 +1385,155 @@ mod degenerate_loop_tests {
         // another punctuation-only chunk.
         let chunks = vec![chunk("。", 1.0, 2.0), chunk("、", 2.0, 3.0)];
         assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loop_repair_tests {
+    use super::{accepts_loop_repair, splice_repairs, TranscribeChunk};
+
+    fn chunk(text: &str, t0: f32, t1: f32) -> TranscribeChunk {
+        TranscribeChunk {
+            text: text.to_string(),
+            timestamp: (t0, t1),
+        }
+    }
+
+    mod accepts_loop_repair_tests {
+        use super::*;
+
+        #[test]
+        fn rejects_an_empty_replacement() {
+            assert!(!accepts_loop_repair(3, &[]));
+        }
+
+        #[test]
+        fn accepts_a_replacement_with_no_degenerate_run_of_its_own() {
+            let replacement = vec![chunk("こんにちは", 1.0, 2.0), chunk("元気ですか", 2.0, 3.0)];
+            assert!(accepts_loop_repair(3, &replacement));
+        }
+
+        #[test]
+        fn accepts_a_replacement_whose_worst_run_is_shorter_than_the_original() {
+            // Original run was 4 chunks long; the repair still loops, but only
+            // 2 -- a real improvement even if not a full fix.
+            let replacement = vec![
+                chunk("えー", 1.0, 1.5),
+                chunk("えー", 1.5, 2.0),
+                chunk("本題ですが", 2.0, 3.0),
+            ];
+            assert!(accepts_loop_repair(4, &replacement));
+        }
+
+        #[test]
+        fn rejects_a_replacement_whose_worst_run_matches_the_original_length() {
+            // Same-length loop reproduced by the repair decode itself: no
+            // improvement, so the original (also recoverable in the UI) wins.
+            let replacement = vec![chunk("えー", 1.0, 1.5), chunk("えー", 1.5, 2.0)];
+            assert!(!accepts_loop_repair(2, &replacement));
+        }
+
+        #[test]
+        fn rejects_a_replacement_whose_worst_run_is_longer_than_the_original() {
+            let replacement =
+                vec![chunk("えー", 1.0, 1.5), chunk("えー", 1.5, 2.0), chunk("えー", 2.0, 2.5)];
+            assert!(!accepts_loop_repair(2, &replacement));
+        }
+    }
+
+    mod splice_repairs_tests {
+        use super::*;
+
+        #[test]
+        fn no_repairs_leaves_chunks_unchanged() {
+            let chunks = vec![chunk("a", 0.0, 1.0), chunk("b", 1.0, 2.0), chunk("b", 2.0, 3.0)];
+            let runs = vec![1..3];
+            let out = splice_repairs(chunks, &runs, vec![None]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["a", "b", "b"]);
+        }
+
+        #[test]
+        fn a_repair_replaces_exactly_its_run_and_preserves_neighbours() {
+            let chunks = vec![
+                chunk("前", 0.0, 1.0),
+                chunk("えー", 1.0, 1.5),
+                chunk("えー", 1.5, 2.0),
+                chunk("後", 2.0, 3.0),
+            ];
+            let runs = vec![1..3];
+            let replacement = vec![chunk("本題ですが", 1.0, 2.0)];
+            let out = splice_repairs(chunks, &runs, vec![Some(replacement)]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["前", "本題ですが", "後"]);
+        }
+
+        #[test]
+        fn a_run_at_the_very_start_is_spliced_correctly() {
+            let chunks = vec![chunk("えー", 0.0, 0.5), chunk("えー", 0.5, 1.0), chunk("後", 1.0, 2.0)];
+            let runs = vec![0..2];
+            let replacement = vec![chunk("さて", 0.0, 1.0)];
+            let out = splice_repairs(chunks, &runs, vec![Some(replacement)]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["さて", "後"]);
+        }
+
+        #[test]
+        fn a_run_at_the_very_end_is_spliced_correctly() {
+            let chunks = vec![chunk("前", 0.0, 1.0), chunk("えー", 1.0, 1.5), chunk("えー", 1.5, 2.0)];
+            let runs = vec![1..3];
+            let replacement = vec![chunk("以上です", 1.0, 2.0)];
+            let out = splice_repairs(chunks, &runs, vec![Some(replacement)]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["前", "以上です"]);
+        }
+
+        #[test]
+        fn a_replacement_shorter_than_its_run_still_preserves_surrounding_chunks() {
+            let chunks = vec![
+                chunk("前", 0.0, 1.0),
+                chunk("えー", 1.0, 1.3),
+                chunk("えー", 1.3, 1.6),
+                chunk("えー", 1.6, 2.0),
+                chunk("後", 2.0, 3.0),
+            ];
+            let runs = vec![1..4];
+            let replacement = vec![chunk("一言だけ", 1.0, 2.0)];
+            let out = splice_repairs(chunks, &runs, vec![Some(replacement)]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["前", "一言だけ", "後"]);
+        }
+
+        #[test]
+        fn a_replacement_longer_than_its_run_still_preserves_surrounding_chunks() {
+            let chunks = vec![chunk("前", 0.0, 1.0), chunk("えー", 1.0, 1.5), chunk("えー", 1.5, 2.0), chunk("後", 2.0, 3.0)];
+            let runs = vec![1..3];
+            let replacement = vec![chunk("これは", 1.0, 1.5), chunk("長い返答です", 1.5, 2.0)];
+            let out = splice_repairs(chunks, &runs, vec![Some(replacement)]);
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, vec!["前", "これは", "長い返答です", "後"]);
+        }
+
+        #[test]
+        fn multiple_runs_are_each_spliced_independently() {
+            let chunks = vec![
+                chunk("えー", 0.0, 0.5),
+                chunk("えー", 0.5, 1.0),
+                chunk("中間", 1.0, 2.0),
+                chunk("あの", 2.0, 2.5),
+                chunk("あの", 2.5, 3.0),
+                chunk("末尾", 3.0, 4.0),
+            ];
+            let runs = vec![0..2, 3..5];
+            let out = splice_repairs(
+                chunks,
+                &runs,
+                vec![Some(vec![chunk("さて", 0.0, 1.0)]), None],
+            );
+            let texts: Vec<_> = out.iter().map(|c| c.text.as_str()).collect();
+            // First run repaired, second (rejected -> None) kept as-is.
+            assert_eq!(texts, vec!["さて", "中間", "あの", "あの", "末尾"]);
+        }
     }
 }
 

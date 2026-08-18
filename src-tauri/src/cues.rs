@@ -26,9 +26,11 @@ const ZERO_LENGTH_THRESHOLD_SEC: f32 = 0.01;
 #[serde(rename_all = "camelCase")]
 pub struct QualityReport {
     /// Cues whose span is under [`ZERO_LENGTH_THRESHOLD_SEC`]. Whisper never
-    /// legitimately produces one; a nonzero count means bounds have collapsed
-    /// -- the direct symptom of DTW token timestamps sitting on the wrong
-    /// timeline (see `asr::dtw_segment_bounds`'s doc comment).
+    /// legitimately produces one; a nonzero count means whisper itself
+    /// reported a collapsed segment envelope (`start_timestamp() ==
+    /// end_timestamp()`, or close to it) -- `asr::sanitize_bounds` only
+    /// normalises a negative start, it does not invent a span whisper never
+    /// claimed.
     pub zero_length_cues: usize,
     /// Adjacent cues where the later one's end time is earlier than the
     /// former's. Cue order should track audio order monotonically; this
