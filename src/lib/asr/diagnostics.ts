@@ -32,9 +32,13 @@ export function rms(audio: Float32Array): number {
  * (whisper.cpp:7527), so the short loops that silence produces are never
  * checked. Gating on the input side avoids the problem entirely, and unlike
  * filtering the output afterwards it cannot delete real speech.
+ *
+ * `threshold` defaults to `SILENCE_RMS` but is overridable so the live pass
+ * can honor the user's `HallucinationSettings.silenceRms` (see
+ * `SettingsPanel`) instead of the fixed constant.
  */
-export function isNearSilent(audio: Float32Array): boolean {
-  return rms(audio) < SILENCE_RMS;
+export function isNearSilent(audio: Float32Array, threshold: number = SILENCE_RMS): boolean {
+  return rms(audio) < threshold;
 }
 
 export function logPcmStats(audio: Float32Array, language: string | undefined, task: string | undefined): void {

@@ -10,8 +10,15 @@ import {
   DEFAULT_DIARIZE_SETTINGS,
   DEFAULT_VAD_SETTINGS,
   DEFAULT_AUDIO_EVENT_SETTINGS,
+  DEFAULT_HALLUCINATION_SETTINGS,
 } from "../lib/asr";
-import type { DiarizeSettings, VadSettings, AudioEventSettings, TranscriptionTask } from "../lib/asr";
+import type {
+  DiarizeSettings,
+  VadSettings,
+  AudioEventSettings,
+  HallucinationSettings,
+  TranscriptionTask,
+} from "../lib/asr";
 
 export interface AsrSettings {
   language: string;
@@ -167,6 +174,27 @@ const vadSettings = definePersistedSettings<VadSettings>("vad-settings", DEFAULT
 }));
 export const loadVadSettings = vadSettings.load;
 export const saveVadSettings = vadSettings.save;
+
+/** Same persistence shape as the settings above. Ranges are sanity-clamped
+ * rather than type-checked alone: a stray negative or zero value read back
+ * from a hand-edited localStorage entry would otherwise flow straight into
+ * `asr::DecodeSettings`/the RMS silence gate and misbehave silently. */
+const hallucinationSettings = definePersistedSettings<HallucinationSettings>(
+  "hallucination-settings",
+  DEFAULT_HALLUCINATION_SETTINGS,
+  (parsed, d) => ({
+    silenceRms:
+      typeof parsed.silenceRms === "number" && Number.isFinite(parsed.silenceRms) && parsed.silenceRms >= 0
+        ? parsed.silenceRms
+        : d.silenceRms,
+    entropyThold:
+      typeof parsed.entropyThold === "number" && Number.isFinite(parsed.entropyThold) && parsed.entropyThold > 0
+        ? parsed.entropyThold
+        : d.entropyThold,
+  }),
+);
+export const loadHallucinationSettings = hallucinationSettings.load;
+export const saveHallucinationSettings = hallucinationSettings.save;
 
 const audioEventSettings = definePersistedSettings<AudioEventSettings>(
   "audio-event-settings",

@@ -8,6 +8,7 @@ import type {
   DiarizeSettings,
   VadSettings,
   AudioEventSettings,
+  HallucinationSettings,
   AudioEvent,
   TranscribeResult,
   StreamingSegment,
@@ -49,6 +50,8 @@ import {
   saveDiarizeSettings,
   loadVadSettings,
   saveVadSettings,
+  loadHallucinationSettings,
+  saveHallucinationSettings,
   loadAudioEventSettings,
   saveAudioEventSettings,
   loadRecordingMode,
@@ -185,6 +188,7 @@ interface AppState {
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
+  hallucinationSettings: HallucinationSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
   /** Where recordings/transcripts get auto-saved -- see its own doc comment
@@ -238,6 +242,7 @@ interface AppState {
   updateSettings: (partial: Partial<AsrSettings>) => void;
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
   updateVadSettings: (partial: Partial<VadSettings>) => void;
+  updateHallucinationSettings: (partial: Partial<HallucinationSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
   updateAutoSaveSettings: (partial: Partial<AutoSaveSettings>) => void;
   /** Switching to a mode that would need the model (`"analyze"`, or `"auto"`
@@ -525,6 +530,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: loadSettings(),
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
+  hallucinationSettings: loadHallucinationSettings(),
   audioEventSettings: loadAudioEventSettings(),
   recordingMode: loadRecordingMode(),
   autoSaveSettings: initialAutoSaveSettings,
@@ -684,13 +690,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     set({ processing: "refining", refineProgress: 0, refineNotice: null, processingRecordingId: id });
     try {
-      const { settings, vadSettings, diarizeSettings, audioEventSettings } = get();
+      const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } = get();
       const outcome = await runAccuracyPipeline(
         path,
         settings,
         vadSettings,
         diarizeSettings,
         audioEventSettings,
+        hallucinationSettings,
       );
       // Bailing out before `saveRecordingHistory` is the whole cancellation
       // story here: the existing sidecar and the segments on screen are both
@@ -831,7 +838,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const streamer = recordOnly
         ? null
         : new StreamingTranscriber(
-            (audio) => asrClient.transcribe(audio, get().settings),
+            (audio) => {
+              const options = { ...get().settings, entropyThold: get().hallucinationSettings.entropyThold };
+              return asrClient.transcribe(audio, options);
+            },
             appendStreamingSegment,
             {
               // The live pass gave up on a window -- the realistic cause being
@@ -845,6 +855,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                     "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の精度向上パスで文字起こしされます）。",
                 });
               },
+              silenceRms: get().hallucinationSettings.silenceRms,
             },
           );
 
@@ -1120,6 +1131,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       const vadSettings = { ...s.vadSettings, ...partial };
       saveVadSettings(vadSettings);
       return { vadSettings };
+    }),
+
+  updateHallucinationSettings: (partial) =>
+    set((s) => {
+      const hallucinationSettings = { ...s.hallucinationSettings, ...partial };
+      saveHallucinationSettings(hallucinationSettings);
+      return { hallucinationSettings };
     }),
 
   updateAudioEventSettings: (partial) =>

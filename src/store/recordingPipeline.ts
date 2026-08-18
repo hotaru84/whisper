@@ -17,11 +17,11 @@ import type {
   TranscribeResult,
   DiarizeSettings,
   VadSettings,
+  HallucinationSettings,
   AudioEventSettings,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
 import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE } from "../lib/asr";
-import { SILENCE_RMS } from "../lib/asr/diagnostics";
 import { nonBlankChunks, projectOntoNonBlankChunks, segmentsFromResult } from "../lib/transcript";
 import { saveRecordingHistory } from "../lib/history";
 import { autoSaveTranscript } from "../lib/export/autoSave";
@@ -123,13 +123,14 @@ export async function runAccuracyPipeline(
   vadSettings: VadSettings,
   diarizeSettings: DiarizeSettings,
   audioEventSettings: AudioEventSettings,
+  hallucinationSettings: HallucinationSettings,
 ): Promise<AccuracyPipelineOutcome> {
   await asrClient.beginAnalysis();
 
   const notices: string[] = [];
   let result: TranscribeResult;
   try {
-    result = await asrClient.transcribeRecording(path, settings, vadSettings);
+    result = await asrClient.transcribeRecording(path, settings, vadSettings, hallucinationSettings);
   } catch (err) {
     // Only a cancellation is caught here -- a real failure still propagates,
     // so the caller keeps its "the second pass broke, hold on to the live
@@ -163,7 +164,7 @@ export async function runAccuracyPipeline(
     const silentCount = result.silence.filter((m) => m.silent).length;
     if (silentCount > 0) {
       notices.push(
-        `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${SILENCE_RMS}）。`,
+        `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${hallucinationSettings.silenceRms}）。`,
       );
     }
   }
@@ -453,7 +454,7 @@ export async function refineRecording(
 ): Promise<void> {
   const { recordingId, path, recordingDurationSec } = filing;
   try {
-    const { settings, vadSettings, diarizeSettings, audioEventSettings } =
+    const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
       useAppStore.getState();
     const outcome = await runAccuracyPipeline(
       path,
@@ -461,6 +462,7 @@ export async function refineRecording(
       vadSettings,
       diarizeSettings,
       audioEventSettings,
+      hallucinationSettings,
     );
 
     // The store is consulted as well as the outcome so that a cancel which

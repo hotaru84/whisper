@@ -32,6 +32,9 @@ export interface TranscribeOptions {
    * repetition loop.
    */
   glossary?: string;
+  /** Overrides `DecodeSettings::entropy_thold` for this call. Defaults to the
+   * backend's own 2.8 when omitted -- see `HallucinationSettings`. */
+  entropyThold?: number;
 }
 
 /**
@@ -123,6 +126,37 @@ export interface VadSettings {
 export const DEFAULT_VAD_SETTINGS: VadSettings = {
   enabled: true,
   threshold: 0.5,
+};
+
+/**
+ * User-adjustable knobs for the two anti-hallucination gates documented in
+ * the README ("反復ループ対策", "無音のウィンドウはモデルに渡さない"): raising
+ * either trades some accuracy for fewer degenerate-loop/stock-phrase outputs
+ * on quiet or noisy audio.
+ */
+export interface HallucinationSettings {
+  /**
+   * RMS amplitude below which audio is treated as silence. Mirrors
+   * `asr::SILENCE_RMS` in Rust and gates three places at once: the live pass
+   * skips a window outright (`diagnostics.isNearSilent`), the whole-file pass
+   * flags a segment as silent after decoding (`asr::mark_silent_segments`),
+   * and it decides whether a gap between cues is worth re-decoding
+   * (`asr::redecode_voiced_gaps`). Kept as one value rather than three so the
+   * passes cannot disagree about what counts as silence.
+   */
+  silenceRms: number;
+  /**
+   * Mirrors `asr::DecodeSettings::entropy_thold`: whisper retries a decode at
+   * a higher temperature when `result_len > 32 && entropy < entropyThold`.
+   * Raising it catches more repetition loops, but only ones long enough to
+   * clear the 32-token floor -- short loops still need the silence gate above.
+   */
+  entropyThold: number;
+}
+
+export const DEFAULT_HALLUCINATION_SETTINGS: HallucinationSettings = {
+  silenceRms: 1e-3,
+  entropyThold: 2.8,
 };
 
 /**
@@ -270,6 +304,7 @@ export class AsrClient {
     if (options.task) headers["X-Asr-Task"] = options.task;
     // Header values must be visible ASCII, so percent-encode the (Japanese) glossary.
     if (options.glossary?.trim()) headers["X-Asr-Prompt"] = encodeURIComponent(options.glossary);
+    if (options.entropyThold !== undefined) headers["X-Entropy-Thold"] = String(options.entropyThold);
 
     const result = await invoke<TranscribeResult>("transcribe_window", bytes, { headers });
     logResultHealth(result.text);
@@ -288,6 +323,7 @@ export class AsrClient {
     path: string,
     options: TranscribeOptions = {},
     vad: VadSettings = DEFAULT_VAD_SETTINGS,
+    hallucination: HallucinationSettings = DEFAULT_HALLUCINATION_SETTINGS,
   ): Promise<TranscribeResult> {
     if (useMockBackend) {
       // A few ticks with a delay between each, so `refineProgress` (and the
@@ -311,6 +347,8 @@ export class AsrClient {
       prompt: options.glossary?.trim() ? options.glossary : null,
       vad: vad.enabled,
       vadThreshold: vad.threshold,
+      entropyThold: options.entropyThold ?? hallucination.entropyThold,
+      silenceRms: hallucination.silenceRms,
     });
     logResultHealth(result.text);
     return result;
