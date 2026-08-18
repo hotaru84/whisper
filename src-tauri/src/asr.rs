@@ -856,6 +856,194 @@ pub fn redecode_voiced_gaps(
     Ok(merged)
 }
 
+/// Adjacent cues within this of each other are treated as the same stalled
+/// utterance repeating, not two separate ones.
+///
+/// Mirrors `COLLAPSE_TOLERANCE_SEC` in `src/lib/transcript.ts`, which applies
+/// the identical check to decide whether to fold two *display* segments into
+/// one -- kept in sync (same value, same comment cross-reference as
+/// `SILENCE_RMS`'s) so a run this function repairs is exactly a run the
+/// frontend would otherwise have had to silently collapse for display.
+const LOOP_COLLAPSE_TOLERANCE_SEC: f32 = 0.05;
+
+/// Finds maximal runs of two or more adjacent chunks that look like a
+/// stalled decode repeating itself: matching text under `cer::normalize`
+/// (whitespace dropped, full-width ASCII folded, punctuation stripped) and a
+/// start that has not advanced past the previous chunk's end by more than
+/// [`LOOP_COLLAPSE_TOLERANCE_SEC`] -- the shape whisper.cpp's
+/// context-conditioning failure actually takes (see
+/// [`redecode_degenerate_loops`]'s doc comment), not a genuine repeated
+/// utterance like "はい、はい" (whose start genuinely advances).
+///
+/// Uses `cer::normalize(text, false)` rather than the plain `trim` that
+/// `normalizeForCollapse` (`src/lib/transcript.ts`) uses for the equivalent
+/// *display* collapse: a stalled loop's repeats often drift in exactly what
+/// that normalisation is built to ignore (a trailing 「。」 on one repeat and
+/// not the next, full- vs half-width digits), and here a miss costs a real
+/// GPU redecode's worth of accuracy, not just a slightly-less-tidy render.
+///
+/// Blank-text chunks never participate on either side of a match: an empty
+/// decode is a different situation (silence or an excluded audio event,
+/// decided elsewhere) and must not be folded into a repetition run just
+/// because two empty normalisations are trivially equal.
+///
+/// Returns half-open `[start, end)` index ranges into `chunks`, each
+/// spanning at least two elements, in ascending non-overlapping order.
+fn find_degenerate_runs(chunks: &[TranscribeChunk]) -> Vec<std::ops::Range<usize>> {
+    let normalized: Vec<Vec<char>> = chunks.iter().map(|c| crate::cer::normalize(&c.text, false)).collect();
+
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+
+    for i in 1..chunks.len() {
+        let matches = !normalized[i - 1].is_empty()
+            && normalized[i - 1] == normalized[i]
+            && chunks[i].timestamp.0 <= chunks[i - 1].timestamp.1 + LOOP_COLLAPSE_TOLERANCE_SEC;
+
+        if matches {
+            run_start.get_or_insert(i - 1);
+        } else if let Some(start) = run_start.take() {
+            runs.push(start..i);
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push(start..chunks.len());
+    }
+    runs
+}
+
+/// Text-context budget for a degenerate-loop repair decode, in tokens
+/// (`whisper_full_params.n_max_text_ctx`).
+///
+/// whisper.cpp's whole-file pass conditions each ~30s chunk on the previous
+/// chunk's decoded tokens (see `transcribe_recording`'s doc comment) --
+/// ordinarily the pass's whole advantage over the live pass, but its failure
+/// mode too: once a chunk decodes into a short repeated phrase, that phrase
+/// becomes the next chunk's own context, and self-similar context makes the
+/// decoder reproduce it again, filling the rolling context with copies of
+/// itself. A fresh `WhisperState` (as `redecode_voiced_gaps` already uses)
+/// removes that stale context once, but if a repaired span were long enough
+/// to itself span an internal 30s boundary, the same self-reinforcement could
+/// restart inside the repair decode. Capping the context budget low (64,
+/// versus whisper.cpp's default of `min(n_max_text_ctx, n_text_ctx / 2)` =
+/// 224 for large-v3-turbo, see `DecodeSettings::prompt`'s doc comment) keeps
+/// too little of any one internal chunk's output alive for it to dominate the
+/// next.
+const DEGENERATE_LOOP_MAX_CTX: i32 = 64;
+
+/// Padding added on each side of a degenerate-loop span before re-decoding
+/// it, in seconds. Mirrors `GAP_REDECODE_MARGIN_SEC`'s rationale: a little
+/// context on either side so the repair decode does not start or stop
+/// mid-word, with the result always clamped back to the span's own bounds
+/// before merging (see `redecode_degenerate_loops`).
+const LOOP_REDECODE_MARGIN_SEC: f32 = 0.5;
+
+/// Repairs whisper.cpp's context-conditioning failure mode: a chunk that
+/// decodes into a short stock phrase or a looped fragment feeds that same
+/// text back into the next chunk's rolling context, which makes the decoder
+/// reproduce it again -- and again, since each repeat re-poisons the next
+/// chunk's context in turn. [`find_degenerate_runs`] recognizes the resulting
+/// shape (many adjacent cues, identical text, barely-advancing timestamps --
+/// the same criteria `collapseDegenerateSegments` in `src/lib/transcript.ts`
+/// uses to fold these for *display*); this function instead repairs the
+/// decode itself, so the loop does not have to be hidden on every future
+/// render.
+///
+/// Each detected run is re-decoded from a fresh `WhisperState` (no carried
+/// context, exactly as `redecode_voiced_gaps` does for gaps) with the
+/// text-context budget capped at [`DEGENERATE_LOOP_MAX_CTX`] tokens. The new
+/// chunks are clamped to the run's own bounds before replacing it, so a
+/// repair can only change what is inside the run's span, never touch or
+/// duplicate audio on either side of it. If a repair decode produces nothing
+/// usable, the original (looped) chunks are kept rather than erasing the span
+/// from the transcript entirely -- a stalled loop is recoverable in the UI
+/// (`collapseDegenerateSegments`), a silently vanished span is not.
+pub fn redecode_degenerate_loops(
+    ctx: &WhisperContext,
+    settings: &DecodeSettings,
+    vad: bool,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    chunks: Vec<TranscribeChunk>,
+    samples: &[f32],
+) -> Result<Vec<TranscribeChunk>, String> {
+    let runs = find_degenerate_runs(&chunks);
+    if runs.is_empty() {
+        return Ok(chunks);
+    }
+
+    let sr = crate::wav::SAMPLE_RATE as f32;
+    // Spans are read off the original chunks up front, before `chunks` is
+    // consumed by the splice below.
+    let spans: Vec<(f32, f32)> = runs
+        .iter()
+        .map(|run| (chunks[run.start].timestamp.0, chunks[run.end - 1].timestamp.1))
+        .collect();
+
+    let mut out: Vec<TranscribeChunk> = Vec::with_capacity(chunks.len());
+    let mut chunks = chunks.into_iter();
+    let mut pos = 0usize;
+
+    for (run, (span_start, span_end)) in runs.into_iter().zip(spans) {
+        // Copy through untouched chunks before this run.
+        while pos < run.start {
+            out.push(chunks.next().expect("pos stays within the original chunk count"));
+            pos += 1;
+        }
+        // Consume the run's own original chunks; kept as the fallback if the
+        // repair below cannot run or produces nothing.
+        let mut originals = Vec::with_capacity(run.len());
+        while pos < run.end {
+            originals.push(chunks.next().expect("pos stays within the original chunk count"));
+            pos += 1;
+        }
+
+        let padded_from = ((span_start - LOOP_REDECODE_MARGIN_SEC) * sr).max(0.0) as usize;
+        let padded_to = (((span_end + LOOP_REDECODE_MARGIN_SEC) * sr) as usize).min(samples.len());
+        if padded_from >= padded_to {
+            out.extend(originals);
+            continue;
+        }
+
+        crate::cancel::check(cancel)?;
+
+        let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+        let mut params = build_full_params(settings);
+        params.set_n_max_text_ctx(DEGENERATE_LOOP_MAX_CTX);
+        let abort_flag = std::sync::Arc::clone(cancel);
+        let abort: Box<dyn FnMut() -> bool> =
+            Box::new(move || abort_flag.load(std::sync::atomic::Ordering::Relaxed));
+        params.set_abort_callback_safe(abort);
+        if let Err(e) = state.full(params, &samples[padded_from..padded_to]) {
+            crate::cancel::check(cancel)?;
+            return Err(e.to_string());
+        }
+
+        let offset_sec = padded_from as f32 / sr;
+        let mut replacement = Vec::new();
+        for c in collect_segments(&state, vad)?.chunks {
+            // Clamp to the run's own bounds, exactly as `redecode_voiced_gaps`
+            // does for gaps: padding can legitimately place a token in audio
+            // already covered by a neighboring cue, and only what falls
+            // inside the run's own span is a genuine replacement for it.
+            let t0 = (c.timestamp.0 + offset_sec).max(span_start);
+            let t1 = (c.timestamp.1 + offset_sec).min(span_end);
+            if t1 > t0 {
+                replacement.push(TranscribeChunk { text: c.text, timestamp: (t0, t1) });
+            }
+        }
+
+        if replacement.is_empty() {
+            out.extend(originals);
+        } else {
+            out.extend(replacement);
+        }
+    }
+
+    // Copy through anything after the last run.
+    out.extend(chunks);
+    Ok(out)
+}
+
 /// Re-transcribes a finished recording in one pass over the whole file.
 ///
 /// This is the accuracy pass. The live pass has to show text while the user is
@@ -978,6 +1166,7 @@ pub async fn transcribe_recording(
         let mut result = collect_segments(&whisper_state, vad_active)?;
         result.chunks =
             redecode_voiced_gaps(ctx, &settings, vad_active, &cancel, result.chunks, &samples, silence_rms)?;
+        result.chunks = redecode_degenerate_loops(ctx, &settings, vad_active, &cancel, result.chunks, &samples)?;
         result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
 
         let (mut result, silence) = mark_silent_segments(result, &samples, silence_rms);
@@ -1185,6 +1374,108 @@ mod silence_tests {
         assert_eq!(rms(&[]), 0.0);
         assert_eq!(rms(&[1.0, -1.0]), 1.0);
         assert!((rms(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod degenerate_loop_tests {
+    use super::{find_degenerate_runs, TranscribeChunk};
+
+    fn chunk(text: &str, t0: f32, t1: f32) -> TranscribeChunk {
+        TranscribeChunk {
+            text: text.to_string(),
+            timestamp: (t0, t1),
+        }
+    }
+
+    #[test]
+    fn finds_a_run_of_identical_text_with_barely_advancing_timestamps() {
+        let chunks = vec![
+            chunk("いい感じですね", 1.0, 2.0),
+            chunk("いい感じですね", 2.02, 3.02),
+            chunk("いい感じですね", 3.03, 4.03),
+        ];
+        let runs = find_degenerate_runs(&chunks);
+        assert_eq!(runs, vec![0..3]);
+    }
+
+    #[test]
+    fn does_not_flag_a_repeated_utterance_whose_start_genuinely_advances() {
+        // "はい、はい" said twice with a real pause between: the second
+        // chunk's start sits well past the first's end plus the tolerance.
+        let chunks = vec![chunk("はい", 1.0, 1.5), chunk("はい", 4.0, 4.5)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+
+    #[test]
+    fn a_single_chunk_is_never_a_run() {
+        let chunks = vec![chunk("こんにちは", 1.0, 2.0)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_chunk_breaks_a_run_rather_than_extending_it() {
+        // Two blank (excluded/silent) chunks are not "the same text repeating"
+        // -- they must never be folded into a repetition run.
+        let chunks = vec![chunk("", 1.0, 2.0), chunk("", 2.0, 3.0)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+
+    #[test]
+    fn a_placeholder_between_two_matching_runs_splits_them() {
+        let chunks = vec![
+            chunk("ご視聴ありがとうございました", 1.0, 2.0),
+            chunk("ご視聴ありがとうございました", 2.0, 3.0),
+            chunk("", 3.0, 4.0),
+            chunk("ご視聴ありがとうございました", 4.0, 5.0),
+            chunk("ご視聴ありがとうございました", 5.0, 6.0),
+        ];
+        assert_eq!(find_degenerate_runs(&chunks), vec![0..2, 3..5]);
+    }
+
+    #[test]
+    fn distinct_adjacent_text_is_never_a_run() {
+        let chunks = vec![chunk("前半です", 1.0, 2.0), chunk("後半です", 2.0, 3.0)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+
+    #[test]
+    fn a_start_just_inside_the_tolerance_still_counts() {
+        // prev ends at 2.0; cur starts at 2.05, exactly LOOP_COLLAPSE_TOLERANCE_SEC.
+        let chunks = vec![chunk("えー", 1.0, 2.0), chunk("えー", 2.05, 3.0)];
+        assert_eq!(find_degenerate_runs(&chunks), vec![0..2]);
+    }
+
+    #[test]
+    fn a_start_just_outside_the_tolerance_does_not_count() {
+        let chunks = vec![chunk("えー", 1.0, 2.0), chunk("えー", 2.06, 3.0)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
+    }
+
+    #[test]
+    fn repeats_differing_only_in_trailing_punctuation_still_match() {
+        // A stalled loop's repeats commonly drift in exactly what
+        // cer::normalize ignores -- here, a trailing 「。」 present on one
+        // repeat and not the next.
+        let chunks = vec![
+            chunk("ご視聴ありがとうございました。", 1.0, 2.0),
+            chunk("ご視聴ありがとうございました", 2.02, 3.02),
+        ];
+        assert_eq!(find_degenerate_runs(&chunks), vec![0..2]);
+    }
+
+    #[test]
+    fn repeats_differing_only_in_full_width_digits_still_match() {
+        let chunks = vec![chunk("１２３", 1.0, 2.0), chunk("123", 2.02, 3.02)];
+        assert_eq!(find_degenerate_runs(&chunks), vec![0..2]);
+    }
+
+    #[test]
+    fn punctuation_only_text_never_matches_as_a_run() {
+        // Normalizes to empty, same as a placeholder -- must not match even
+        // another punctuation-only chunk.
+        let chunks = vec![chunk("。", 1.0, 2.0), chunk("、", 2.0, 3.0)];
+        assert!(find_degenerate_runs(&chunks).is_empty());
     }
 }
 
