@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_fs::FsExt;
 
 use crate::wav;
 
@@ -65,6 +66,34 @@ fn recording_path(app: &AppHandle, name: &str, directory: Option<&str>) -> Resul
             .join("recordings"),
     };
     Ok(dir.join(format!("{}.wav", sanitize_stem(name))))
+}
+
+/// Extends the fs plugin's runtime scope to cover a user-configured
+/// auto-save folder (`AutoSaveSettings.directory` on the frontend), so the
+/// `@tauri-apps/plugin-fs` calls made from there -- `history.ts`'s listing,
+/// reading and deleting of past recordings, `playback.ts`'s `readFile` for
+/// the WAV -- can actually reach it.
+///
+/// The directory can't be declared ahead of time in `capabilities/default.json`:
+/// it's picked by the user at runtime and can be anywhere on disk, and a
+/// wildcard `"**"` scope there would grant the webview read/write/delete
+/// access to the *entire* filesystem just to support this one folder. Calling
+/// this instead -- once at startup with whatever directory was last
+/// persisted, and again whenever the user picks a new one (see
+/// `updateAutoSaveSettings` in `appStore.ts`) -- keeps the grant limited to
+/// the folder actually in use.
+///
+/// A no-op for an empty string: `AutoSaveSettings.directory` unset means "use
+/// the app's own cache dir", which `fs:allow-appcache-*-recursive` in
+/// `capabilities/default.json` already covers.
+#[tauri::command]
+pub fn allow_recording_directory(app: AppHandle, directory: String) -> Result<(), String> {
+    if directory.is_empty() {
+        return Ok(());
+    }
+    app.fs_scope()
+        .allow_directory(&directory, true)
+        .map_err(|e| e.to_string())
 }
 
 /// Opens a WAV file for the recording that is about to start, returning its path.

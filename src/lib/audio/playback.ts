@@ -10,10 +10,11 @@ import { mockDurationSec, mockIdFromPath, silentWavBytes } from "../mock/fixture
  * is `default-src 'self'` with no `media-src` (and no asset-protocol scope
  * configured), so a `file://`/`asset://` source is rejected outright. Rather
  * than carve out and audit a new asset-protocol permission just for this,
- * this reads the file through the already-granted `@tauri-apps/plugin-fs`
- * scope (`fs:allow-appcache-read-recursive`, see `capabilities/default.json`)
- * and hands the bytes to the webview as a `blob:` URL, which the CSP's
- * `media-src 'self' blob:` entry does allow.
+ * this reads the file through `@tauri-apps/plugin-fs` (`fs:allow-read-file`,
+ * scoped to `**` in `capabilities/default.json` -- the recording can live in
+ * either the app's own cache dir or a user-configured auto-save folder, see
+ * `recordingLocation.ts`) and hands the bytes to the webview as a `blob:`
+ * URL, which the CSP's `media-src 'self' blob:` entry does allow.
  *
  * The returned URL is only valid until `URL.revokeObjectURL` is called on it
  * -- callers own that lifecycle (see `createPlaybackController`'s `dispose`).
