@@ -27,3 +27,4 @@ export type { StreamingSegment } from "./streaming";
 export { AudioEventStreamer } from "./eventStreaming";
 export type { AsrDevice, TranscriptChunk, TranscriptionTask } from "./types";
 export { SUPPORTED_LANGUAGES } from "./languages";
+export { runWhisperTask, WHISPER_PRIORITY_LIVE, WHISPER_PRIORITY_BACKGROUND } from "./whisperQueue";

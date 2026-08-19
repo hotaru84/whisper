@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { FileAudio } from "lucide-react";
-import { useAppStore, activeRecordedSec, effectiveRecordOnly, type RecordingPhase } from "../store/appStore";
+import {
+  useAppStore,
+  activeRecordedSec,
+  effectiveRecordOnly,
+  useAnalysisQueueStore,
+  type RecordingPhase,
+} from "../store/appStore";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 
 /**
@@ -60,31 +66,37 @@ function useElapsedRecordingSec(recordingPhase: RecordingPhase): number {
  */
 export function TitleBarStatus() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
-  const processing = useAppStore((s) => s.processing);
-  const refineProgress = useAppStore((s) => s.refineProgress);
-  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
+  const recordingCloseOutPhase = useAppStore((s) => s.recordingCloseOutPhase);
+  const jobs = useAnalysisQueueStore((s) => s.jobs);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
   const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const elapsed = useElapsedRecordingSec(recordingPhase);
 
-  // Only resolves once the recording being refined already has a history
-  // entry (`processingRecordingId` can briefly point at one that doesn't
-  // yet, e.g. a live take between `capture.finish()` and its own save
-  // completing -- see `refineRecording`) -- falls back to a generic label
-  // for that window rather than showing nothing.
-  const processingTarget = recordingHistory.find(
-    (r) => r.id === processingRecordingId,
-  );
-  const processingTargetTime =
-    processingTarget && formatDateTime(processingTarget.createdAt);
+  // More than one recording can have analysis in flight at once now (see
+  // `src/store/analysisQueue.ts`), so this slot headlines whichever job is
+  // actually running the whisper-touching stage -- there is at most one of
+  // those app-wide, by construction (see `whisperQueue.ts`) -- falling back
+  // to any other job (queued/post-processing/cancelling) so something still
+  // shows even when nothing is transcribing right now. The rest, if any, are
+  // summarized rather than each getting their own slot.
+  const jobList = Object.values(jobs);
+  const headlineJob = jobList.find((j) => j.status === "transcribing") ?? jobList[0];
+  const otherJobCount = headlineJob ? jobList.length - 1 : 0;
 
-  // One slot, five mutually exclusive occupants: the take's own state wins
-  // while one exists, then the post-stop pipeline (including the wind-down
-  // after a cancel), then the record-only idle chip. There used to be a sixth
-  // (a CPU/Vulkan device chip) but which backend loaded the model is an
-  // implementation detail with no bearing on anything the user can act on, so
-  // it was dropped rather than moved here.
-  const idleChip = recordingPhase === "stopped" && processing === null;
+  // Only resolves once the recording being analyzed already has a history
+  // entry -- always true by the time a job exists to headline (see
+  // `enqueueRefine`'s own doc comment), kept as a fallback rather than an
+  // assumption regardless.
+  const headlineTarget = headlineJob && recordingHistory.find((r) => r.id === headlineJob.id);
+  const headlineTargetTime = headlineTarget && formatDateTime(headlineTarget.createdAt);
+
+  // One slot, several mutually exclusive occupants: the take's own state wins
+  // while one exists, then the closeout window right after stop, then
+  // whichever job headlines, then the record-only idle chip. There used to be
+  // a sixth (a CPU/Vulkan device chip) but which backend loaded the model is
+  // an implementation detail with no bearing on anything the user can act on,
+  // so it was dropped rather than moved here.
+  const idleChip = recordingPhase === "stopped" && recordingCloseOutPhase === null && !headlineJob;
 
   return (
     <div className="pointer-events-none flex min-w-0 items-center justify-center gap-3 text-xs">
@@ -111,38 +123,55 @@ export function TitleBarStatus() {
           </span>
         </span>
       )}
-      {processing === "transcribing" && (
+      {recordingCloseOutPhase === "transcribing" && (
         <span className="truncate text-muted-foreground">
           文字起こし処理中…
         </span>
       )}
-      {processing === "saving" && (
+      {recordingCloseOutPhase === "saving" && (
         <span className="truncate text-muted-foreground">録音を保存中…</span>
       )}
-      {processing === "refining" && (
+      {headlineJob?.status === "cancelling" && (
+        // No progress and no button: the pass has been told to stop and is
+        // winding down, which is not instant -- diarization cannot be
+        // interrupted mid-call, so this can sit here for a while.
+        <span className="truncate text-muted-foreground">
+          解析をキャンセル中…
+        </span>
+      )}
+      {headlineJob && headlineJob.status !== "cancelling" && (
         <span className="flex items-center gap-1.5 truncate text-muted-foreground">
-          {processingTargetTime ? (
+          {headlineJob.status === "queued" ? (
+            headlineTargetTime ? (
+              <>
+                履歴（
+                <span className="font-mono tabular-nums">
+                  {headlineTargetTime.day} {headlineTargetTime.time}
+                </span>
+                ）の解析待ち…
+              </>
+            ) : (
+              "解析待ち…"
+            )
+          ) : headlineTargetTime ? (
             <>
               履歴（
               <span className="font-mono tabular-nums">
-                {processingTargetTime.day} {processingTargetTime.time}
+                {headlineTargetTime.day} {headlineTargetTime.time}
               </span>
               ）を精度向上パス実行中…
             </>
           ) : (
             "精度向上パス実行中…"
           )}
-          <span className="font-mono tabular-nums">
-            {Math.round(refineProgress ?? 0)}%
-          </span>
-        </span>
-      )}
-      {processing === "cancelling" && (
-        // No progress and no button: the pass has been told to stop and is
-        // winding down, which is not instant -- diarization cannot be
-        // interrupted mid-call, so this can sit here for a while.
-        <span className="truncate text-muted-foreground">
-          解析をキャンセル中…
+          {headlineJob.status === "transcribing" && (
+            <span className="font-mono tabular-nums">
+              {Math.round(headlineJob.progress ?? 0)}%
+            </span>
+          )}
+          {otherJobCount > 0 && (
+            <span className="text-muted-foreground/70">（ほか{otherJobCount}件 待機中）</span>
+          )}
         </span>
       )}
       {idleChip && recordOnly && (

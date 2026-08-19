@@ -328,11 +328,12 @@ pub struct AudioEventResult {
 pub async fn detect_audio_events(
     app: AppHandle,
     path: String,
+    job_id: String,
     chunks: Vec<(f32, f32)>,
     threshold: f32,
     top_k: i32,
 ) -> Result<AudioEventResult, String> {
-    let cancel = crate::cancel::flag(&app);
+    let cancel = crate::cancel::flag(&app, &job_id);
 
     tauri::async_runtime::spawn_blocking(move || {
         crate::cancel::check(&cancel)?;

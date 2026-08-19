@@ -1,21 +1,13 @@
 import { describe, it, expect } from "vitest";
-import {
-  selectCapabilities,
-  effectiveRecordOnly,
-  type RecordingPhase,
-  type ProcessingPhase,
-  type ModelStatus,
-} from "./capabilities";
+import { selectCapabilities, effectiveRecordOnly, type RecordingPhase, type ModelStatus } from "./capabilities";
 
 const RECORDING_PHASES: RecordingPhase[] = ["stopped", "recording", "paused"];
-const PROCESSING_PHASES: ProcessingPhase[] = ["transcribing", "refining", "saving", "cancelling", null];
 const MODEL_STATUSES: ModelStatus[] = ["idle", "loading", "ready", "error"];
 
 describe("selectCapabilities", () => {
   it("allows starting a record-only take without a loaded model", () => {
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "idle",
       recordOnly: true,
     });
@@ -25,22 +17,8 @@ describe("selectCapabilities", () => {
   it("still requires a ready model outside record-only mode", () => {
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "idle",
       recordOnly: false,
-    });
-    expect(can.startRecording).toBe(false);
-  });
-
-  it("does not let a new take start while the previous one is still saving", () => {
-    // This is the entire reason ProcessingPhase has a "saving" value: without
-    // it, the gap between a record-only take stopping and its sidecar being
-    // written would briefly re-enable the record button.
-    const can = selectCapabilities({
-      recordingPhase: "stopped",
-      processing: "saving",
-      modelStatus: "idle",
-      recordOnly: true,
     });
     expect(can.startRecording).toBe(false);
   });
@@ -48,18 +26,16 @@ describe("selectCapabilities", () => {
   it("does not let a record-only take start while a take is already live", () => {
     const can = selectCapabilities({
       recordingPhase: "recording",
-      processing: null,
       modelStatus: "idle",
       recordOnly: true,
     });
     expect(can.startRecording).toBe(false);
   });
 
-  it("keeps reanalyze available whenever idle, regardless of model status", () => {
+  it("keeps reanalyze available whenever stopped, regardless of model status", () => {
     for (const modelStatus of MODEL_STATUSES) {
       const can = selectCapabilities({
         recordingPhase: "stopped",
-        processing: null,
         modelStatus,
         recordOnly: false,
       });
@@ -70,7 +46,7 @@ describe("selectCapabilities", () => {
   it("never returns startRecording=true while a take is open, regardless of mode", () => {
     for (const recordingPhase of ["recording", "paused"] as const) {
       for (const recordOnly of [true, false]) {
-        const can = selectCapabilities({ recordingPhase, processing: null, modelStatus: "ready", recordOnly });
+        const can = selectCapabilities({ recordingPhase, modelStatus: "ready", recordOnly });
         expect(can.startRecording).toBe(false);
       }
     }
@@ -82,7 +58,6 @@ describe("selectCapabilities", () => {
     // doesn't flip to "recording" until the first call's setup finishes.
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "ready",
       recordOnly: false,
       startingRecording: true,
@@ -93,7 +68,6 @@ describe("selectCapabilities", () => {
   it("does not let a take start when no auto-save folder is configured", () => {
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "ready",
       recordOnly: false,
       directoryConfigured: false,
@@ -106,7 +80,6 @@ describe("selectCapabilities", () => {
     // still required -- it has nowhere else to write the WAV to.
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "idle",
       recordOnly: true,
       directoryConfigured: false,
@@ -117,46 +90,43 @@ describe("selectCapabilities", () => {
   it("defaults directoryConfigured to true for call sites that don't pass it", () => {
     const can = selectCapabilities({
       recordingPhase: "stopped",
-      processing: null,
       modelStatus: "ready",
       recordOnly: false,
     });
     expect(can.startRecording).toBe(true);
   });
 
-  it("stops offering to cancel once a cancellation has already been requested", () => {
-    // The whole reason "cancelling" is its own phase rather than a flag beside
-    // "refining": pressing the button is what makes it stop offering itself.
-    const inputs = { recordingPhase: "stopped", modelStatus: "ready", recordOnly: false } as const;
-    expect(selectCapabilities({ ...inputs, processing: "refining" }).cancelAnalysis).toBe(true);
-    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).cancelAnalysis).toBe(false);
-    // ...and a take must not be able to start into a pass that is still
-    // winding down (diarization cannot be interrupted mid-call).
-    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).startRecording).toBe(false);
-    expect(selectCapabilities({ ...inputs, processing: "cancelling" }).reanalyze).toBe(false);
+  it("makes startRecording/reanalyze available immediately whenever stopped, independent of any recording's analysis state", () => {
+    // Deliberate behavior change: this used to also require a global
+    // `processing === null` (see the removed `ProcessingPhase` axis), which
+    // meant one recording's background analysis blocked starting or
+    // requesting another entirely. Recording/analysis concurrency
+    // (`src/lib/asr/whisperQueue.ts`, `src/store/analysisQueue.ts`) replaced
+    // that gate, so `selectCapabilities` no longer has -- or needs -- any
+    // input describing analysis state at all.
+    for (const modelStatus of MODEL_STATUSES) {
+      for (const recordOnly of [true, false]) {
+        if (!recordOnly && modelStatus !== "ready") continue;
+        const can = selectCapabilities({ recordingPhase: "stopped", modelStatus, recordOnly });
+        expect(can.startRecording).toBe(true);
+        expect(can.reanalyze).toBe(true);
+      }
+    }
   });
 
-  it("covers every state combination without throwing and keeps stop/browseHistory/playback/editSettings mutually consistent with recordingPhase", () => {
+  it("covers every state combination without throwing and keeps stop/browseHistory/playback/editSettings/reanalyze mutually consistent with recordingPhase", () => {
     for (const recordingPhase of RECORDING_PHASES) {
-      for (const processing of PROCESSING_PHASES) {
-        for (const modelStatus of MODEL_STATUSES) {
-          for (const recordOnly of [true, false]) {
-            const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly });
-            const stopped = recordingPhase === "stopped";
-            expect(can.stop).toBe(!stopped);
-            expect(can.browseHistory).toBe(stopped);
-            expect(can.playback).toBe(stopped);
-            expect(can.editSettings).toBe(stopped);
-            expect(can.pause).toBe(recordingPhase === "recording");
-            expect(can.resume).toBe(recordingPhase === "paused");
-            expect(can.cancelAnalysis).toBe(processing === "refining");
-            // startRecording/reanalyze can only ever be true while idle.
-            const idle = stopped && processing === null;
-            if (!idle) {
-              expect(can.startRecording).toBe(false);
-              expect(can.reanalyze).toBe(false);
-            }
-          }
+      for (const modelStatus of MODEL_STATUSES) {
+        for (const recordOnly of [true, false]) {
+          const can = selectCapabilities({ recordingPhase, modelStatus, recordOnly });
+          const stopped = recordingPhase === "stopped";
+          expect(can.stop).toBe(!stopped);
+          expect(can.browseHistory).toBe(stopped);
+          expect(can.playback).toBe(stopped);
+          expect(can.editSettings).toBe(stopped);
+          expect(can.reanalyze).toBe(stopped);
+          expect(can.pause).toBe(recordingPhase === "recording");
+          expect(can.resume).toBe(recordingPhase === "paused");
         }
       }
     }

@@ -121,9 +121,11 @@ describe("StreamingTranscriber", () => {
     const segments: StreamingSegment[] = [];
     const t = new StreamingTranscriber(endsEarly, (s) => segments.push(s));
 
-    await feed(t, 30);
+    // Two windows' worth: the floor is WINDOW_SEC - MAX_CARRY_SEC = 25s, so
+    // feeding just one window (30s) would only ever trigger the first call.
+    await feed(t, 60);
 
-    // The floor is WINDOW_SEC - MAX_CARRY_SEC = 10s, so the 5s beyond the
+    // The floor is WINDOW_SEC - MAX_CARRY_SEC = 25s, so the 17s beyond the
     // transcribed 8s is carried and the next window is longer than a bare window.
     expect(windows.length).toBeGreaterThan(1);
     expect(windows[1]).toBeGreaterThan(windows[0] - 1e-6);
@@ -147,7 +149,7 @@ describe("StreamingTranscriber", () => {
     await feed(t, 60);
     await t.finish();
 
-    // 60s of audio advancing >= 10s per window is a handful of calls, not dozens.
+    // 60s of audio advancing >= 25s per window is a handful of calls, not dozens.
     expect(calls).toBeLessThanOrEqual(10);
   });
 
@@ -245,8 +247,9 @@ describe("StreamingTranscriber", () => {
         { onWindowDropped: (err) => dropped.push(err), retryBackoffMs: 0 },
       );
 
-      // Three windows' worth: without the give-up path this audio would all
-      // still be held, and every frame would trigger another attempt.
+      // A window and a half's worth: without the give-up path this audio
+      // would all still be held, and every frame would trigger another
+      // attempt.
       await feed(t, 45);
       await t.finish();
 

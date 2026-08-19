@@ -32,7 +32,11 @@ const CIRCLE = {
 export function RecordButton({ placement = "hero" }: { placement?: keyof typeof CIRCLE }) {
   const circle = CIRCLE[placement];
   const recordingPhase = useAppStore((s) => s.recordingPhase);
-  const processing = useAppStore((s) => s.processing);
+  // Only the brief WAV-close/provisional-filing window after stop, not
+  // whatever background analysis follows -- that runs independently now (see
+  // `recordingCloseOutPhase`'s own doc comment in appStore.ts), so it must
+  // never make this button look busy or disabled.
+  const recordingCloseOutPhase = useAppStore((s) => s.recordingCloseOutPhase);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const startRecording = useAppStore((s) => s.startRecording);
   const stopRecording = useAppStore((s) => s.stopRecording);
@@ -41,22 +45,27 @@ export function RecordButton({ placement = "hero" }: { placement?: keyof typeof 
   const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const autoSaveSettings = useAppStore((s) => s.autoSaveSettings);
   const directoryConfigured = autoSaveSettings.directory !== "";
-  const can = selectCapabilities({ recordingPhase, processing, modelStatus, recordOnly, directoryConfigured });
+  const can = selectCapabilities({ recordingPhase, modelStatus, recordOnly, directoryConfigured });
 
   if (recordingPhase === "stopped") {
-    const label =
-      processing !== null ? "処理中です" : !directoryConfigured ? "保存先フォルダを設定してください" : "録音を開始";
+    const busy = recordingCloseOutPhase !== null;
+    const label = busy ? "処理中です" : !directoryConfigured ? "保存先フォルダを設定してください" : "録音を開始";
     return (
       <Button
         type="button"
         size="lg"
-        disabled={!can.startRecording}
+        // `busy` isn't part of `can.startRecording` (see
+        // `recordingCloseOutPhase`'s doc comment in appStore.ts -- background
+        // analysis must never disable this button), but the brief closeout
+        // window it also covers is a real, if short-lived, block on the
+        // `startRecording` action itself, so the button must say so too.
+        disabled={!can.startRecording || busy}
         onClick={() => void startRecording()}
         className={circle}
         aria-label={label}
         title={label}
       >
-        {processing !== null ? <Loader2 className="h-6 w-6 animate-spin" /> : <Mic className="h-6 w-6" />}
+        {busy ? <Loader2 className="h-6 w-6 animate-spin" /> : <Mic className="h-6 w-6" />}
       </Button>
     );
   }

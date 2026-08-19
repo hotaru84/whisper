@@ -51,6 +51,7 @@ pub fn run() {
             appaudio::stop_app_audio_capture,
             cancel::begin_analysis,
             cancel::cancel_analysis,
+            cancel::end_analysis,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -548,7 +548,9 @@ pub async fn transcribe_window(
 }
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RefineProgressPayload {
+    job_id: String,
     percent: i32,
 }
 
@@ -1004,6 +1006,7 @@ pub fn redecode_degenerate_loops(
 pub async fn transcribe_recording(
     app: AppHandle,
     path: String,
+    job_id: String,
     language: Option<String>,
     task: Option<String>,
     prompt: Option<String>,
@@ -1016,7 +1019,8 @@ pub async fn transcribe_recording(
     let translate = task.as_deref() == Some("translate");
     let prompt = prompt.filter(|p| !p.trim().is_empty());
     let app_for_progress = app.clone();
-    let cancel = crate::cancel::flag(&app);
+    let job_id_for_progress = job_id.clone();
+    let cancel = crate::cancel::flag(&app, &job_id);
 
     tauri::async_runtime::spawn_blocking(move || {
         crate::cancel::check(&cancel)?;
@@ -1070,7 +1074,13 @@ pub async fn transcribe_recording(
         params.set_progress_callback_safe(move |percent: i32| {
             if percent != last_percent {
                 last_percent = percent;
-                let _ = app_for_progress.emit("asr:refine-progress", RefineProgressPayload { percent });
+                let _ = app_for_progress.emit(
+                    "asr:refine-progress",
+                    RefineProgressPayload {
+                        job_id: job_id_for_progress.clone(),
+                        percent,
+                    },
+                );
             }
         });
 

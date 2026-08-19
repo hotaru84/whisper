@@ -3,6 +3,8 @@ import {
   RecordingCapture,
   StreamingTranscriber,
   AudioEventStreamer,
+  runWhisperTask,
+  WHISPER_PRIORITY_LIVE,
 } from "../lib/asr";
 import type {
   DiarizeSettings,
@@ -14,9 +16,7 @@ import type {
   StreamingSegment,
 } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
-import { segmentsFromResult, projectOntoNonBlankChunks } from "../lib/transcript";
 import {
-  saveRecordingHistory,
   listRecordings,
   loadRecording,
   deleteRecording,
@@ -40,7 +40,7 @@ import type { PlaybackState } from "./playback";
 // so they can be unit-tested without dragging in the Tauri client and the
 // audio stack -- see capabilities.ts.
 import { selectCapabilities, effectiveRecordOnly } from "./capabilities";
-import type { RecordingPhase, ProcessingPhase, ModelStatus } from "./capabilities";
+import type { RecordingPhase, ModelStatus } from "./capabilities";
 import type { PowerSource } from "../lib/power";
 import { toErrorMessage } from "../lib/errors";
 import {
@@ -81,26 +81,32 @@ import {
   resetTimeline,
 } from "./timeline";
 import {
-  runAccuracyPipeline,
   fileTakeProvisionally,
-  refineRecording,
   finishRecordOnly,
   ensureModelReady,
   appendStreamingSegment,
   appendLiveAudioEvents,
 } from "./recordingPipeline";
 import type { TakeFiling } from "./recordingPipeline";
+import { enqueueRefine, enqueueReanalyze, cancelJob } from "./analysisQueue";
 
 // Re-exported because this is where every consumer already imports them from.
 export {
   selectCapabilities,
   effectiveRecordOnly,
   type RecordingPhase,
-  type ProcessingPhase,
   type ModelStatus,
   type Capabilities,
   type CapabilityInputs,
 } from "./capabilities";
+export {
+  useAnalysisQueueStore,
+  hasActiveJob,
+  canCancelJob,
+  type AnalysisJob,
+  type AnalysisJobKind,
+  type AnalysisJobStatus,
+} from "./analysisQueue";
 export type { PowerSource } from "../lib/power";
 export {
   type AsrSettings,
@@ -126,8 +132,20 @@ interface AppState {
    * own comments and `capabilities.ts`'s `startRecording` derivation.
    */
   startingRecording: boolean;
-  /** The post-stop pipeline, orthogonal to `recordingPhase`. */
-  processing: ProcessingPhase;
+  /**
+   * Purely cosmetic, and orthogonal to `recordingPhase`: covers only the
+   * brief window between pressing stop and the WAV being closed/provisionally
+   * filed (or, in record-only mode, saved outright), driving the brief
+   * "文字起こし処理中…"/"録音を保存中…" title bar text for that window. Unlike
+   * the old `processing` field this replaces, it never gates `startRecording`
+   * -- once a take is handed off to the background analysis queue
+   * (`src/store/analysisQueue.ts`), this goes back to `null` immediately, and
+   * that job's own status (queued/transcribing/post-processing) is what the
+   * UI reads from then on, per-recording rather than app-wide. See
+   * `capabilities.ts`'s doc comment for why `CapabilityInputs` has no
+   * equivalent field at all anymore.
+   */
+  recordingCloseOutPhase: "transcribing" | "saving" | null;
   modelStatus: ModelStatus;
   /** Accumulated transcript. Grows across start/stop cycles. */
   segments: TranscriptSegment[];
@@ -169,22 +187,6 @@ interface AppState {
    * transcript, it just did not get the accuracy pass.
    */
   refineNotice: string | null;
-  /** 0-100 while `processing` is "refining", otherwise null. */
-  refineProgress: number | null;
-  /**
-   * The id of whichever recording `processing` is currently running the
-   * accuracy pass against, when known. Set by `rerunHistoryEntry` (the id is
-   * its own parameter) and by `refineRecording` (once `capture.finish()`
-   * resolves and the id is known -- so this stays `null` for the brief
-   * moment `processing` first becomes `"refining"` but the WAV isn't closed
-   * yet). Deliberately independent of `viewedRecordingId`: unlike that
-   * field, this one must stay correct even if the user browses to a
-   * *different* entry while a reanalysis keeps running in the background
-   * (`rerunHistoryEntry`'s `browseHistory`/`loadHistoryEntry` gate is
-   * `recordingPhase` alone, not `processing`, so that's reachable) -- see
-   * `TitleBarStatus`/`HistorySidebar` for where this is shown.
-   */
-  processingRecordingId: string | null;
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
   vadSettings: VadSettings;
@@ -276,19 +278,21 @@ interface AppState {
    * session starts in -- no-op if nothing is being viewed. */
   deselectHistoryEntry: () => void;
   deleteHistoryEntry: (id: string) => Promise<void>;
-  /** Re-runs the accuracy pass (transcribe + diarize + audio-tag, per
+  /** Queues the accuracy pass (transcribe + diarize + audio-tag, per
    * whatever is currently enabled in settings) against a past recording's
-   * WAV and overwrites its history entry -- e.g. after turning on
-   * diarization or changing its threshold and wanting this recording
-   * relabeled with it. Reuses `processing: "refining"` and `refineProgress`,
-   * so the same progress UI `refineRecording` drives applies here too. */
+   * WAV and, once it completes, overwrites its history entry -- e.g. after
+   * turning on diarization or changing its threshold and wanting this
+   * recording relabeled with it. Runs through the same background queue as a
+   * just-finished take's own accuracy pass (`src/store/analysisQueue.ts`), so
+   * it never blocks -- or is blocked by -- starting a new recording, or any
+   * other recording's analysis. See `AnalysisJob` for the resulting
+   * per-recording status the UI reads instead of a single global field. */
   rerunHistoryEntry: (id: string) => Promise<void>;
-  /** Asks the running accuracy pass to stop (whichever of `refineRecording`
-   * or `rerunHistoryEntry` started it). Returns as soon as the backend has
-   * been told; the pass itself finishes unwinding on its own, and its own
-   * `finally` is what clears `processing`. Nothing partial is kept -- see
-   * `finishCancelledTake`. */
-  cancelAnalysis: () => Promise<void>;
+  /** Asks `recordingId`'s running (or queued) accuracy pass to stop. Returns
+   * as soon as the backend has been told; the pass itself finishes unwinding
+   * on its own. Nothing partial is kept -- see `finishCancelledTake`. Other
+   * recordings' jobs are unaffected. */
+  cancelAnalysis: (recordingId: string) => Promise<void>;
   /** Loads `path`'s audio for playback, tagged with `recordingId` so the UI
    * can tell it apart from whatever was loaded before. Replaces (and
    * disposes) any previously loaded audio; a no-op if `recordingId` is
@@ -314,20 +318,19 @@ interface AppState {
  *   through `resetToBlankSession` (leaving), `viewLoadedRecording` (opening
  *   a past entry), or `markRecordingViewed` (a just-finished take claiming
  *   the entry it was just filed under) -- never a bespoke `set()`.
- * - `recordingPhase` / `processing` / `modelStatus` -- deliberately
- *   orthogonal axes (see each field's own doc comment and `capabilities.ts`),
- *   not a cluster in the same sense, but any transition that changes more
- *   than one of them must do so in a single `set()` call so a reader never
- *   observes a combination that shouldn't exist.
- * - `refineProgress` -- only meaningful while `processing === "refining"`;
- *   every writer (both in this file, plus `clients.ts`'s `onRefineProgress`
- *   handler for the one write site outside it) must check that before
- *   applying an update, since the backend event feeding it isn't guaranteed
- *   to stop arriving the instant the frontend moves on.
- * - `processingRecordingId` -- only meaningful while `processing !== null`;
- *   set alongside it in `rerunHistoryEntry` and (once the id is known)
- *   `refineRecording`, cleared alongside it in every `finally`. Deliberately
- *   *not* required to equal `viewedRecordingId` -- see its own doc comment.
+ * - `recordingPhase` / `modelStatus` -- deliberately orthogonal axes (see
+ *   each field's own doc comment and `capabilities.ts`), not a cluster in the
+ *   same sense, but any transition that changes more than one of them must do
+ *   so in a single `set()` call so a reader never observes a combination that
+ *   shouldn't exist.
+ *
+ * Per-recording analysis state (status, progress) is no longer here at all --
+ * it lives in `src/store/analysisQueue.ts`'s own store (`AnalysisJob`, keyed
+ * by recording id), which is what lets more than one recording have analysis
+ * in flight at once without this store needing a cluster of fields per
+ * recording. `recordingCloseOutPhase` above is the one remaining piece of
+ * analysis-adjacent state left in `AppState`, and it is deliberately *not* in
+ * this list: it is cosmetic only and nothing else has to change alongside it.
  */
 
 /**
@@ -341,7 +344,6 @@ function capabilitiesOf(
   s: Pick<
     AppState,
     | "recordingPhase"
-    | "processing"
     | "modelStatus"
     | "recordingMode"
     | "startingRecording"
@@ -351,7 +353,6 @@ function capabilitiesOf(
 ) {
   return selectCapabilities({
     recordingPhase: s.recordingPhase,
-    processing: s.processing,
     modelStatus: s.modelStatus,
     recordOnly: effectiveRecordOnly(s.recordingMode, s.powerSource),
     startingRecording: s.startingRecording,
@@ -422,11 +423,11 @@ function viewLoadedRecording(set: Parameters<StateCreator<AppState>>[0], entry: 
  * recordingId` has caught up (`loadPlayback` runs after, fire-and-forget),
  * so the guard below would reject it. The guard exists for the other two
  * callers specifically because they call this *after* an `await` (saving to
- * disk) -- `browseHistory` is gated on `recordingPhase` alone, not
- * `processing`, so picking a *different* entry from the sidebar while a save
- * is still in flight is reachable. Without the guard, the stale call
- * resolving afterwards would stomp that new selection back to the take that
- * just finished.
+ * disk) -- `browseHistory` is gated on `recordingPhase` alone and has no
+ * dependency on any recording's analysis state, so picking a *different*
+ * entry from the sidebar while a save is still in flight is reachable.
+ * Without the guard, the stale call resolving afterwards would stomp that
+ * new selection back to the take that just finished.
  */
 export function markRecordingViewed(id: string): void {
   if (useAppStore.getState().playback.recordingId !== id) return;
@@ -521,7 +522,7 @@ setRecordingDirectory(initialAutoSaveSettings.directory);
 export const useAppStore = create<AppState>((set, get) => ({
   recordingPhase: "stopped",
   startingRecording: false,
-  processing: null,
+  recordingCloseOutPhase: null,
   // Not "loading": nothing is loading until something asks for it. Record-only
   // mode never does, and starting in "loading" would put the blocking overlay
   // on screen for a load that is never going to happen.
@@ -532,8 +533,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   viewedRecordingId: null,
   errorMessage: null,
   refineNotice: null,
-  refineProgress: null,
-  processingRecordingId: null,
   settings: loadSettings(),
   diarizeSettings: loadDiarizeSettings(),
   vadSettings: loadVadSettings(),
@@ -659,8 +658,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await deleteRecording(id);
       // `viewedRecordingId` alone would almost always be enough, but this is
-      // reachable (`browseHistory` is gated on `recordingPhase`, not
-      // `processing`) during the narrow async window inside
+      // reachable (`browseHistory` has no dependency on any recording's
+      // analysis state) during the narrow async window inside
       // `refineRecording`/`finishRecordOnly` between `loadPlayback` setting
       // `playback.recordingId` and `markRecordingViewed` catching up to it --
       // keeping both checks means a delete landing in that window still
@@ -677,117 +676,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  // The job body (model-ready check, `runAccuracyPipeline` call, segment/
+  // history persistence) lives in `recordingPipeline.ts`'s
+  // `reanalyzeHistoryEntry` -- this action is only the capability check and
+  // the hand-off to the background queue, same split as `stopRecording`'s
+  // use of `enqueueRefine` below. `enqueueReanalyze` itself is a no-op if
+  // this recording already has a job in flight.
   rerunHistoryEntry: async (id) => {
     if (!capabilitiesOf(get()).reanalyze) return;
-
-    // The one place the model gets loaded on demand: in record-only mode this
-    // is the first time it is needed at all. A no-op once it is loaded, so the
-    // normal path is unaffected.
-    if (!(await ensureModelReady())) {
-      set({
-        refineNotice: `音声認識モデルを読み込めなかったため、解析できませんでした（録音はそのまま残っています）: ${
-          get().errorMessage ?? "原因不明"
-        }`,
-      });
-      return;
-    }
-
-    const durationSec = get().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
-    const path = await wavPath(id);
-
-    set({ processing: "refining", refineProgress: 0, refineNotice: null, processingRecordingId: id });
-    try {
-      const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } = get();
-      const outcome = await runAccuracyPipeline(
-        path,
-        settings,
-        vadSettings,
-        diarizeSettings,
-        audioEventSettings,
-        hallucinationSettings,
-      );
-      // Bailing out before `saveRecordingHistory` is the whole cancellation
-      // story here: the existing sidecar and the segments on screen are both
-      // left exactly as they were, so a cancelled re-analysis costs the user
-      // nothing but the time it ran. See `refineRecording` for why the store
-      // is consulted alongside the outcome.
-      if (outcome.cancelled || get().processing === "cancelling") {
-        set({ refineNotice: "解析をキャンセルしました（既存の履歴はそのまま残っています）。" });
-        return;
-      }
-      const { result, speakers, excluded, newEvents, notices } = outcome;
-
-      // Always the recording's own 0-based timeline with fresh sequential
-      // ids -- this entry has no "session" of its own to rebase onto, and
-      // saveRecordingHistory always stores under that same convention (see
-      // refineRecording's persistence step).
-      const silent = result.silence
-        ? projectOntoNonBlankChunks(result, result.silence.map((m) => m.silent))
-        : undefined;
-      const refined = segmentsFromResult(result, 0, 1, speakers, excluded, newEvents, silent);
-      if (!refined.some((s) => s.text.trim() !== "")) {
-        // Mirrors refineRecording's own guard: an empty (or all-excluded-
-        // placeholder) result is far more likely a setting change gone wrong
-        // (wrong language, an overly strict threshold) than "this recording
-        // legitimately has nothing in it now" -- the existing history entry
-        // is worth more than a result this suspicious.
-        set({
-          refineNotice:
-            "この設定では文字起こし結果が0件になったため、履歴は上書きしていません。設定を確認してから再度お試しください。",
-        });
-        return;
-      }
-      const localSegments = refined.map((s, i) => ({ ...s, id: i + 1 }));
-
-      await saveRecordingHistory(id, {
-        durationSec,
-        language: settings.language,
-        transcribed: true,
-        usedDiarize: diarizeSettings.enabled,
-        usedVad: vadSettings.enabled,
-        usedAudioEvents: audioEventSettings.enabled,
-        segments: localSegments,
-        audioEvents: newEvents,
-      });
-      await get().refreshRecordingHistory();
-
-      // Refresh what's on screen too, if this is the recording currently
-      // shown. Safe to gate on `viewedRecordingId` alone here (unlike
-      // `deleteHistoryEntry`'s equivalent check): `reanalyze` requires
-      // `idle` (`processing === null`), which only becomes true again after
-      // `markRecordingViewed` has already run for a just-finished take, so
-      // there's no async window where the two fields could disagree.
-      if (get().viewedRecordingId === id) {
-        set({ segments: localSegments, audioEvents: newEvents });
-      }
-      if (notices.length > 0) {
-        set({ refineNotice: notices.join(" ") });
-      }
-    } catch (err) {
-      set({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
-    } finally {
-      set({ processing: null, refineProgress: null, processingRecordingId: null });
-    }
+    enqueueReanalyze(id);
   },
 
-  cancelAnalysis: async () => {
-    if (!capabilitiesOf(get()).cancelAnalysis) return;
-
-    // Moves off "refining" (the status readout would otherwise keep claiming
-    // the pass is running) but deliberately not to `null`: that is the running
-    // pipeline's own `finally`, and clearing it here as well would re-enable
-    // the record button for however long the pass takes to notice -- which,
-    // while diarization is mid-`process()`, is not short.
-    set({ processing: "cancelling", refineProgress: null });
-    try {
-      await asrClient.cancelAnalysis();
-    } catch (err) {
-      // The pass just runs to completion, and its own `finally` still clears
-      // `processing`, so this costs the user time rather than data.
-      set({
-        refineNotice: `キャンセルを要求できませんでした（解析はそのまま続行します）: ${toErrorMessage(err)}`,
-      });
-    }
+  cancelAnalysis: async (recordingId) => {
+    await cancelJob(recordingId);
   },
 
   // Implementations live in playback.ts, which is self-contained enough
@@ -806,6 +707,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     // one -- its frames would keep arriving forever, and `capture.start()`
     // would drop the old WAV writer out from under it.
     if (!capabilitiesOf(get()).startRecording) return;
+    // Deliberately not part of `capabilitiesOf`/`selectCapabilities`: unlike
+    // the old `processing`, this must never block a new recording for as
+    // long as *background analysis* runs -- only for the previous take's own
+    // brief stop sequence (closing the WAV, filing the provisional history
+    // entry), which this action's own setup below would otherwise race.
+    // `timeline.ts`'s module state (`recordingBaseSec`, `timelineBaseSec`) is
+    // exactly that shared, unsynchronized state: `stopRecording`'s tail calls
+    // `setTimelineBaseSec` after its own awaits, and starting a second take
+    // before that lands could have this take's `setRecordingBaseSec` read a
+    // stale value, or have the previous take's later write silently roll this
+    // one's base back. The window is milliseconds, not the minutes an
+    // accuracy pass can take, so this costs nothing like what `processing`
+    // used to.
+    if (get().recordingCloseOutPhase !== null) return;
     // Set synchronously, before anything else -- this is what lets the Active
     // screen render on the very next tick instead of waiting on the async
     // setup below, and (via `capabilities.ts`'s `startRecording` derivation)
@@ -847,7 +762,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         : new StreamingTranscriber(
             (audio) => {
               const options = { ...get().settings, entropyThold: get().hallucinationSettings.entropyThold };
-              return asrClient.transcribe(audio, options);
+              // Submitted at live priority rather than called directly: real-
+              // time turnaround is no longer required (see WINDOW_SEC's own
+              // doc comment in streaming.ts), so it's fine for a window to
+              // wait behind whichever single background job
+              // (src/store/analysisQueue.ts) happens to be using the model
+              // right now -- it will still always jump ahead of any other
+              // *queued* background work. See runWhisperTask's own doc.
+              return runWhisperTask(WHISPER_PRIORITY_LIVE, () => asrClient.transcribe(audio, options)).promise;
             },
             appendStreamingSegment,
             {
@@ -1050,10 +972,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     // "saving" rather than "transcribing" for a record-only take: there is no
     // live window to flush, only the WAV to close and its sidecar to write.
-    // Still non-null, so the guard below on starting a new take still holds.
+    // Purely cosmetic -- unlike the old `processing` this replaces, nothing
+    // reads this to decide whether a new recording may start; see
+    // `recordingCloseOutPhase`'s own doc comment.
     set({
       recordingPhase: "stopped",
-      processing: recordOnly ? "saving" : "transcribing",
+      recordingCloseOutPhase: recordOnly ? "saving" : "transcribing",
       levelMeter: null,
     });
 
@@ -1093,30 +1017,38 @@ export const useAppStore = create<AppState>((set, get) => ({
         console.warn("[audio-events] failed to flush the final live window:", err);
       });
       setTimelineBaseSec(getRecordingBaseSec() + totalSamples / WHISPER_SAMPLE_RATE);
-      // Stay in a processing phase if the accuracy pass is about to run:
-      // clearing it here first would briefly re-enable "start a new recording"
-      // in the gap before `refineRecording` sets "refining", and a take
-      // started in that gap would fight the pass for the model.
-      if (!capture) set({ processing: null });
     } catch (err) {
       // The capture file is left open here on purpose: it is valid on disk at
       // every moment (see wav::Writer), and the backend closes it when the next
       // recording starts. Nothing is lost by not finishing it.
-      set({ processing: null, errorMessage: toErrorMessage(err) });
+      set({ recordingCloseOutPhase: null, errorMessage: toErrorMessage(err) });
       return;
     }
 
     // Then re-read the whole recording for accuracy, replacing what the live
-    // windows produced. Runs after the live result is already on screen, so the
-    // user has a transcript throughout. A record-only take has nothing to
-    // replace and no model loaded to do it with, so it only gets filed away.
-    // `filing` is only null if `fileTakeProvisionally` itself failed (already
-    // reported as a `refineNotice` there) or was skipped for a record-only
-    // take, in which case `finishRecordOnly` below does its own filing.
+    // windows produced. A record-only take has nothing to replace and no
+    // model loaded to do it with, so it only gets filed away. `filing` is
+    // only null if `fileTakeProvisionally` itself failed (already reported as
+    // a `refineNotice` there) or was skipped for a record-only take, in which
+    // case `finishRecordOnly` below does its own filing.
+    //
+    // Record-only's `finishRecordOnly` is still awaited here -- it is not a
+    // model pass (nothing to queue against), and it is fast enough that
+    // keeping `recordingCloseOutPhase` set through it costs nothing. The
+    // analyzed path is different: `enqueueRefine` hands the accuracy pass off
+    // to the background queue (`src/store/analysisQueue.ts`) and returns
+    // immediately, which is the entire point -- a new recording must be able
+    // to start the instant this take is closed out, not once its (possibly
+    // minutes-long) accuracy pass finishes. That job's own status, keyed by
+    // this recording's id, is what the UI reads from here on.
     if (capture) {
-      if (recordOnly) await finishRecordOnly(capture);
-      else if (filing) await refineRecording(filing, baseSec, keptSegments);
+      if (recordOnly) {
+        await finishRecordOnly(capture);
+      } else if (filing) {
+        enqueueRefine(filing, baseSec, keptSegments);
+      }
     }
+    set({ recordingCloseOutPhase: null });
   },
 
   updateSettings: (partial) =>

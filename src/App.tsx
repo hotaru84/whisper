@@ -56,7 +56,7 @@ function App() {
   const sidebar = useAppStore((s) => s.sidebar);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
   const startingRecording = useAppStore((s) => s.startingRecording);
-  const processing = useAppStore((s) => s.processing);
+  const recordingCloseOutPhase = useAppStore((s) => s.recordingCloseOutPhase);
   const segmentCount = useAppStore((s) => s.segments.length);
   const playbackRecordingId = useAppStore((s) => s.playback.recordingId);
   const onDragHandleDown = useSidebarDrag();
@@ -74,8 +74,13 @@ function App() {
   // just-finished take once its post-stop pipeline resolves (see
   // `markRecordingViewed`), so checking it here instead would flash the CTA
   // back in for the gap while `segments`/`playback.recordingId` are already
-  // populated but the entry isn't "viewed" yet.
-  const showRecordStart = !isActive && processing === null && segmentCount === 0 && playbackRecordingId == null;
+  // populated but the entry isn't "viewed" yet. `recordingCloseOutPhase`
+  // (not background analysis, which runs independently -- see its own doc
+  // comment in appStore.ts) covers the same brief closeout gap for a
+  // record-only take that ends up with nothing transcribed and no playback
+  // loaded yet.
+  const showRecordStart =
+    !isActive && recordingCloseOutPhase === null && segmentCount === 0 && playbackRecordingId == null;
 
   useEffect(() => {
     // Skipped entirely in (effective) record-only mode -- loading the model is

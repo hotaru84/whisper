@@ -2,9 +2,17 @@
  * The re-transcribe/diarize/audio-tag accuracy pass that runs after a
  * recording stops (`refineRecording`, `finishRecordOnly`'s record-only
  * counterpart, and the shared `runAccuracyPipeline` core also reused by
- * `appStore.ts`'s `rerunHistoryEntry`), plus the live-streaming append
- * helpers that feed the same session timeline (`timeline.ts`) this pipeline
- * rebases onto.
+ * `reanalyzeHistoryEntry`), plus the live-streaming append helpers that feed
+ * the same session timeline (`timeline.ts`) this pipeline rebases onto.
+ *
+ * Ownership split with `src/store/analysisQueue.ts`: this module owns *what*
+ * a job's steps are (model calls, timeline rebasing, history persistence);
+ * `analysisQueue.ts` owns *when* a job runs (queueing, per-recording status,
+ * cancellation requests) and is the only one of the two that imports the
+ * other, so this module never needs to know a queue exists above it --
+ * status updates go out through the `onStatus` callback parameters below,
+ * and a job that was asked to stop is discovered through `wasCancelled`,
+ * both supplied by the caller rather than read from any shared store here.
  *
  * `useAppStore` is only ever read via `.getState()`/`.setState()` inside
  * function bodies here, never at module top level -- same as `clients.ts`,
@@ -20,10 +28,10 @@ import type {
   HallucinationSettings,
   AudioEventSettings,
 } from "../lib/asr";
+import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE, runWhisperTask, WHISPER_PRIORITY_BACKGROUND } from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
-import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE } from "../lib/asr";
 import { nonBlankChunks, projectOntoNonBlankChunks, segmentsFromResult } from "../lib/transcript";
-import { saveRecordingHistory } from "../lib/history";
+import { saveRecordingHistory, wavPath } from "../lib/history";
 import { autoSaveTranscript } from "../lib/export/autoSave";
 import { toErrorMessage } from "../lib/errors";
 import type { AsrSettings } from "./persistedSettings";
@@ -95,13 +103,31 @@ type AccuracyPipelineOutcome =
   | ({ cancelled: false } & AccuracyPipelineResult)
   | { cancelled: true };
 
+/** The two stages of `runAccuracyPipeline` worth reporting live: while the
+ * whisper-touching transcription call is (queued, then) actually running,
+ * and everything after it (diarization/audio-tagging, which run concurrently
+ * with each other and don't touch the whisper model at all). Queued/done/
+ * cancelled/error are the caller's (`analysisQueue.ts`'s) own bookkeeping,
+ * not something this pipeline reports -- it only knows about its own two
+ * internal stages. */
+export type AnalysisPipelineStatus = "transcribing" | "post-processing";
+
 /**
  * The re-transcribe/diarize/audio-tag sequence shared by `refineRecording`
- * (a just-finished live recording) and `rerunHistoryEntry` (any past one,
+ * (a just-finished live recording) and `reanalyzeHistoryEntry` (any past one,
  * typically after the user changed a setting). Everything here operates on
  * `path`'s own 0-based timeline; rebasing onto a session's global timeline
- * (if the caller even has one -- `rerunHistoryEntry` does not) is the
+ * (if the caller even has one -- `reanalyzeHistoryEntry` does not) is the
  * caller's job, same as `nonBlankChunks`' doc comment already describes.
+ *
+ * `jobId` (the recording id) identifies this pass to the backend's per-job
+ * cancel flag (`cancel.rs`) and whisper progress events, and to
+ * `src/lib/asr/whisperQueue.ts`'s priority queue -- the actual
+ * `transcribeRecording` call is submitted there at
+ * `WHISPER_PRIORITY_BACKGROUND` rather than invoked directly, so it queues
+ * behind (or, per the queue's priority rule, is jumped by) whatever else is
+ * using the model rather than racing it. `onStatus` fires as this pass moves
+ * between its two stages -- see `AnalysisPipelineStatus`.
  *
  * Diarization/audio-tagging failures are collected as notices rather than
  * thrown: a transcript without speaker labels or event filtering is still
@@ -114,116 +140,136 @@ type AccuracyPipelineOutcome =
  * した" and a "音響イベント検出に失敗しました" on the way out.
  *
  * Being the one entry point both callers share also makes this the right
- * place to clear the backend's cancel flag, so a cancel that arrived too late
- * to stop the previous pass cannot kill this one on sight.
+ * place to clear the backend's cancel flag for this job at the start
+ * (`beginAnalysis`) and release it once this pass is fully done
+ * (`endAnalysis`, in `finally`) -- see `cancel.rs`'s per-job map.
  */
 export async function runAccuracyPipeline(
+  jobId: string,
   path: string,
   settings: AsrSettings,
   vadSettings: VadSettings,
   diarizeSettings: DiarizeSettings,
   audioEventSettings: AudioEventSettings,
   hallucinationSettings: HallucinationSettings,
+  onStatus?: (status: AnalysisPipelineStatus) => void,
 ): Promise<AccuracyPipelineOutcome> {
-  await asrClient.beginAnalysis();
+  await asrClient.beginAnalysis(jobId);
 
-  const notices: string[] = [];
-  let result: TranscribeResult;
   try {
-    result = await asrClient.transcribeRecording(path, settings, vadSettings, hallucinationSettings);
-  } catch (err) {
-    // Only a cancellation is caught here -- a real failure still propagates,
-    // so the caller keeps its "the second pass broke, hold on to the live
-    // transcript" path exactly as before.
-    if (isCancelledError(err)) return { cancelled: true };
-    throw err;
-  }
-  if (result.vadUnavailable) {
-    notices.push(
-      "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
-    );
-  }
-  // A regression signal, not an accuracy score (see QualityReport's doc
-  // comment): voicedGapSec is audio the RMS gate says holds speech but no
-  // cue covers, so a few seconds of it is worth surfacing even though the
-  // pipeline gave no error.
-  if ((result.quality?.voicedGapSec ?? 0) >= 1) {
-    notices.push(
-      `音声があるのに文字起こしされなかった区間が約${result.quality!.voicedGapSec.toFixed(1)}秒あります（無音以外の理由でスキップされた可能性があります）。`,
-    );
-  }
-  // mark_silent_segments flags rather than drops (see its doc comment), so
-  // this is purely informational -- the flagged chunks already render as a
-  // "無音" placeholder via segmentsFromResult's `silent` parameter.
-  if (result.silence && result.silence.length === result.chunks.length) {
-    const silentDurationSec = result.chunks.reduce((sum, c, i) => {
-      if (!result.silence![i].silent) return sum;
-      const end = c.timestamp[1] ?? c.timestamp[0];
-      return sum + Math.max(0, end - c.timestamp[0]);
-    }, 0);
-    const silentCount = result.silence.filter((m) => m.silent).length;
-    if (silentCount > 0) {
-      notices.push(
-        `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${hallucinationSettings.silenceRms}）。`,
-      );
-    }
-  }
-
-  // Diarization and audio tagging both read the same WAV on its own 0-based
-  // timeline, so they have to run on result.chunks *before* segmentsFromResult
-  // rebases anything -- see nonBlankChunks' doc comment.
-  const targets = nonBlankChunks(result).map((c) => c.timestamp);
-
-  // Independent Rust-side commands -- diarization is sherpa-onnx, audio
-  // tagging loads its own model per call (see events.rs's module doc), and
-  // neither touches the whisper model's mutex the way transcribeRecording
-  // above does -- so they're started together rather than one `await`ed
-  // before the other even begins. Both invoke() calls fire before either is
-  // awaited, so the two spawn_blocking passes actually overlap instead of
-  // stacking their multi-minute runtimes back to back.
-  const diarizePromise =
-    diarizeSettings.enabled && targets.length > 0
-      ? asrClient.diarizeRecording(path, targets, diarizeSettings)
-      : undefined;
-  const audioEventsPromise =
-    audioEventSettings.enabled && targets.length > 0
-      ? asrClient.detectAudioEvents(path, targets, audioEventSettings)
-      : undefined;
-
-  let speakers: Array<number | null> | undefined;
-  if (diarizePromise) {
+    const notices: string[] = [];
+    let result: TranscribeResult;
     try {
-      speakers = await diarizePromise;
+      result = await runWhisperTask(
+        WHISPER_PRIORITY_BACKGROUND,
+        () => asrClient.transcribeRecording(path, jobId, settings, vadSettings, hallucinationSettings),
+        () => onStatus?.("transcribing"),
+      ).promise;
     } catch (err) {
+      // Only a cancellation is caught here -- a real failure still propagates,
+      // so the caller keeps its "the second pass broke, hold on to the live
+      // transcript" path exactly as before.
       if (isCancelledError(err)) return { cancelled: true };
-      // Distinguished from a genuine failure so the common case -- diarization
-      // defaults on, but its model files are an opt-in download most installs
-      // never make -- reads the same as vadUnavailable's calm guidance rather
-      // than an alarming "failed" notice on every single recording.
+      throw err;
+    }
+    onStatus?.("post-processing");
+    if (result.vadUnavailable) {
       notices.push(
-        String(err).includes(DIARIZATION_MODEL_UNAVAILABLE)
-          ? "話者分離用のモデルファイルが見つからないため、話者ラベルなしで実行しました。README の手順でモデルを配置すると有効になります。"
-          : `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
       );
     }
-  }
+    // A regression signal, not an accuracy score (see QualityReport's doc
+    // comment): voicedGapSec is audio the RMS gate says holds speech but no
+    // cue covers, so a few seconds of it is worth surfacing even though the
+    // pipeline gave no error.
+    if ((result.quality?.voicedGapSec ?? 0) >= 1) {
+      notices.push(
+        `音声があるのに文字起こしされなかった区間が約${result.quality!.voicedGapSec.toFixed(1)}秒あります（無音以外の理由でスキップされた可能性があります）。`,
+      );
+    }
+    // mark_silent_segments flags rather than drops (see its doc comment), so
+    // this is purely informational -- the flagged chunks already render as a
+    // "無音" placeholder via segmentsFromResult's `silent` parameter.
+    if (result.silence && result.silence.length === result.chunks.length) {
+      const silentDurationSec = result.chunks.reduce((sum, c, i) => {
+        if (!result.silence![i].silent) return sum;
+        const end = c.timestamp[1] ?? c.timestamp[0];
+        return sum + Math.max(0, end - c.timestamp[0]);
+      }, 0);
+      const silentCount = result.silence.filter((m) => m.silent).length;
+      if (silentCount > 0) {
+        notices.push(
+          `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${hallucinationSettings.silenceRms}）。`,
+        );
+      }
+    }
 
-  let excluded: boolean[] | undefined;
-  let newEvents: AudioEvent[] = [];
-  if (audioEventsPromise) {
+    // Diarization and audio tagging both read the same WAV on its own 0-based
+    // timeline, so they have to run on result.chunks *before* segmentsFromResult
+    // rebases anything -- see nonBlankChunks' doc comment.
+    const targets = nonBlankChunks(result).map((c) => c.timestamp);
+
+    // Independent Rust-side commands -- diarization is sherpa-onnx, audio
+    // tagging loads its own model per call (see events.rs's module doc), and
+    // neither touches the whisper model's mutex (or this queue) the way
+    // transcribeRecording above does -- so they're started together rather
+    // than one `await`ed before the other even begins, and can run alongside
+    // a *different* job's transcription too. Both invoke() calls fire before
+    // either is awaited, so the two spawn_blocking passes actually overlap
+    // instead of stacking their multi-minute runtimes back to back.
+    const diarizePromise =
+      diarizeSettings.enabled && targets.length > 0
+        ? asrClient.diarizeRecording(path, jobId, targets, diarizeSettings)
+        : undefined;
+    const audioEventsPromise =
+      audioEventSettings.enabled && targets.length > 0
+        ? asrClient.detectAudioEvents(path, jobId, targets, audioEventSettings)
+        : undefined;
+
+    let speakers: Array<number | null> | undefined;
+    if (diarizePromise) {
+      try {
+        speakers = await diarizePromise;
+      } catch (err) {
+        if (isCancelledError(err)) return { cancelled: true };
+        // Distinguished from a genuine failure so the common case -- diarization
+        // defaults on, but its model files are an opt-in download most installs
+        // never make -- reads the same as vadUnavailable's calm guidance rather
+        // than an alarming "failed" notice on every single recording.
+        notices.push(
+          String(err).includes(DIARIZATION_MODEL_UNAVAILABLE)
+            ? "話者分離用のモデルファイルが見つからないため、話者ラベルなしで実行しました。README の手順でモデルを配置すると有効になります。"
+            : `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        );
+      }
+    }
+
+    let excluded: boolean[] | undefined;
+    let newEvents: AudioEvent[] = [];
+    if (audioEventsPromise) {
+      try {
+        const eventResult = await audioEventsPromise;
+        excluded = eventResult.exclude;
+        newEvents = eventResult.events;
+      } catch (err) {
+        if (isCancelledError(err)) return { cancelled: true };
+        notices.push(
+          `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+        );
+      }
+    }
+
+    return { cancelled: false, result, speakers, excluded, newEvents, notices };
+  } finally {
+    // Best-effort hygiene: freeing this job's entry in the backend's cancel
+    // map costs nothing to skip on failure, and must never mask whatever
+    // outcome the `try` above already produced.
     try {
-      const eventResult = await audioEventsPromise;
-      excluded = eventResult.exclude;
-      newEvents = eventResult.events;
+      await asrClient.endAnalysis(jobId);
     } catch (err) {
-      if (isCancelledError(err)) return { cancelled: true };
-      notices.push(
-        `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-      );
+      console.warn(`[asr] failed to clear cancel state for job ${jobId}:`, err);
     }
   }
-
-  return { cancelled: false, result, speakers, excluded, newEvents, notices };
 }
 
 /**
@@ -280,9 +326,17 @@ async function persistTake(
  * write uses. Shared by every place that has to file *something* in history
  * before (or instead of) the accuracy pass has a result of its own: the
  * pass being cancelled, the pass never getting a chance to run at all, and
- * (below) the provisional entry `refineRecording` writes immediately on
+ * (below) the provisional entry `fileTakeProvisionally` writes immediately on
  * stop so the take is not invisible to the sidebar for however long the
  * pass takes.
+ *
+ * Reads the *current* global `segments`/`audioEvents` -- safe only while this
+ * recording is still the one those represent on screen. Every caller must
+ * check that first (see `refineRecording`/`finishCancelledTake`'s own
+ * `viewedRecordingId` guards): once a later recording has taken over --
+ * another take started in the same session, or the user browsed elsewhere --
+ * these arrays no longer describe *this* recording alone, and slicing them
+ * here would mix the two takes' segments together.
  */
 function liveTakeSnapshot(
   baseSec: number,
@@ -303,33 +357,39 @@ function liveTakeSnapshot(
 
 /**
  * Winds up a take whose accuracy pass the user cancelled: keep what the live
- * pass already put on screen, and file exactly that in history.
+ * pass already put on screen, and (usually) file exactly that in history.
  *
  * Nothing partial is kept from the cancelled pass. What it would be weighed
  * against is a transcript the user is already reading, and half a second pass
  * spliced onto the front of the live one would be worse than either.
  *
- * The history write is *not* optional. Skipping it would leave the WAV on disk
- * with no sidecar, and `listRecordings` enumerates sidecars -- the take would
- * become a file the user can neither find nor ask to be transcribed later,
- * which `finishRecordOnly`'s doc comment calls out as the one thing this
- * feature must never do.
+ * `fileTakeProvisionally` already filed a live snapshot in history *before*
+ * this pass even started, so persisting again here only matters for catching
+ * the trailing window `streamer.finish()` flushes just after that (see its
+ * own doc comment) -- and only while `recordingId` is still the recording
+ * `segments`/`audioEvents` represent on screen. If a later recording has
+ * since taken over (another take started in the same session, or the user
+ * browsed elsewhere), re-reading those arrays here would mix that other
+ * recording's segments into this one's history entry -- so in that case the
+ * already-filed provisional entry (missing only that one trailing window) is
+ * left as-is rather than risk overwriting it with mixed data.
  */
 async function finishCancelledTake(
-  path: string,
+  recordingId: string,
   baseSec: number,
   keptSegments: number,
   recordingDurationSec: number,
   language: string,
 ): Promise<void> {
-  const snapshot = liveTakeSnapshot(baseSec, keptSegments);
-
   useAppStore.setState({
     refineNotice:
       "解析をキャンセルしました（表示中の文字起こしはそのまま使えます）。あとから履歴の「再解析」でやり直せます。",
   });
 
-  await persistTake(idFromWavPath(path), {
+  if (useAppStore.getState().viewedRecordingId !== recordingId) return;
+
+  const snapshot = liveTakeSnapshot(baseSec, keptSegments);
+  await persistTake(recordingId, {
     durationSec: recordingDurationSec,
     language,
     // A cancelled take with nothing on screen is not transcribed, and saying
@@ -388,11 +448,7 @@ export async function fileTakeProvisionally(
     path = info.path;
     recordingDurationSec = info.durationSec;
   } catch (err) {
-    // `stopRecording` handed over still in a processing phase (so the gap
-    // before "refining" could not be mistaken for idle), so this bail-out has
-    // to be the one to clear it.
     useAppStore.setState({
-      processing: null,
       refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
     return null;
@@ -406,16 +462,6 @@ export async function fileTakeProvisionally(
   // `PlaybackState.timelineOffsetSec`'s doc comment) -- the WAV itself is
   // always 0-based, only the segments referring to it are shifted.
   void useAppStore.getState().loadPlayback(recordingId, path, baseSec);
-
-  // `processingRecordingId` lets the UI say *which* recording "精度向上パス
-  // 実行中" refers to (see its own doc comment in appStore.ts) -- unlike
-  // `rerunHistoryEntry`, the id here only exists once `capture.finish()`
-  // above has already resolved, so it can't be set any earlier than this.
-  useAppStore.setState({
-    processing: "refining",
-    refineProgress: 0,
-    processingRecordingId: recordingId,
-  });
 
   const liveSnapshot = liveTakeSnapshot(baseSec, keptSegments);
   await persistTake(recordingId, {
@@ -441,40 +487,49 @@ export async function fileTakeProvisionally(
  * Every failure path here keeps the live transcript. The second pass is an
  * improvement on something the user already has; losing it costs accuracy, while
  * discarding the live result would cost them the meeting.
+ *
+ * `onStatus`/`wasCancelled` are supplied by the caller (`analysisQueue.ts`) --
+ * see this module's own doc comment for why this stays free of any direct
+ * dependency on the job queue.
+ *
+ * On-screen `segments`/`audioEvents` are only ever touched here while
+ * `filing.recordingId` is still the recording those represent
+ * (`viewedRecordingId` match) -- this pass can now finish well after a *later*
+ * recording has started in the same session (recording and analysis run in
+ * parallel, see `src/store/analysisQueue.ts`), and blindly splicing into
+ * `segments` at that point would corrupt whichever recording is now live
+ * instead. The history file write (keyed by `filing.recordingId`) is always
+ * safe and stays unconditional either way.
  */
 export async function refineRecording(
   filing: TakeFiling,
   baseSec: number,
   keptSegments: number,
+  onStatus?: (status: AnalysisPipelineStatus) => void,
+  wasCancelled?: () => boolean,
 ): Promise<void> {
   const { recordingId, path, recordingDurationSec } = filing;
+  const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
+    useAppStore.getState();
   try {
-    const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
-      useAppStore.getState();
     const outcome = await runAccuracyPipeline(
+      recordingId,
       path,
       settings,
       vadSettings,
       diarizeSettings,
       audioEventSettings,
       hallucinationSettings,
+      onStatus,
     );
 
-    // The store is consulted as well as the outcome so that a cancel which
-    // lost a race with the last stage's completion still gets the answer the
-    // user asked for. Pressing cancel and then watching the transcript get
-    // swapped anyway would be the one outcome the button must never produce.
-    if (
-      outcome.cancelled ||
-      useAppStore.getState().processing === "cancelling"
-    ) {
-      await finishCancelledTake(
-        path,
-        baseSec,
-        keptSegments,
-        recordingDurationSec,
-        settings.language,
-      );
+    // The job's own status is consulted as well as the outcome so that a
+    // cancel which lost a race with the last stage's completion still gets
+    // the answer the user asked for. Pressing cancel and then watching the
+    // transcript get swapped anyway would be the one outcome the button must
+    // never produce.
+    if (outcome.cancelled || wasCancelled?.()) {
+      await finishCancelledTake(recordingId, baseSec, keptSegments, recordingDurationSec, settings.language);
       return;
     }
 
@@ -484,30 +539,7 @@ export async function refineRecording(
     }
 
     const targets = nonBlankChunks(result).map((c) => c.timestamp);
-    // Audio-tagging is a separate call from transcription (detectAudioEvents,
-    // run against `targets` from this same result -- see runAccuracyPipeline)
-    // that can fail or get skipped on its own: disabled in settings, nothing
-    // to tag because `targets` came back empty, or the call itself threw.
-    // `excluded` only comes back defined when it actually completed; when
-    // it's undefined, `newEvents` is just its unset initial value, not "no
-    // events found". Overwriting the live pass's own preview with that would
-    // silently discard real data over a failure that says nothing about
-    // whether the preview was wrong -- so, mirroring the segments fallback
-    // below, keep the live preview instead.
     const audioEventsUsable = excluded !== undefined;
-    if (audioEventsUsable) {
-      const rebasedEvents = newEvents.map((e) => ({
-        ...e,
-        start: e.start + baseSec,
-        end: e.end + baseSec,
-      }));
-      useAppStore.setState((s) => ({
-        audioEvents: [
-          ...s.audioEvents.filter((e) => e.start < baseSec),
-          ...rebasedEvents,
-        ],
-      }));
-    }
 
     const silent = result.silence
       ? projectOntoNonBlankChunks(result, result.silence.map((m) => m.silent))
@@ -538,21 +570,43 @@ export async function refineRecording(
     // from now produces only placeholders, not an empty array.
     const secondPassUsable = refined.some((s) => s.text.trim() !== "");
 
-    if (secondPassUsable) {
-      useAppStore.setState((s) => ({
-        segments: [...s.segments.slice(0, keptSegments), ...refined],
-      }));
+    // Still this take's own recording on screen -- safe to touch `segments`/
+    // `audioEvents` and to read the live pass's own segments back out of them
+    // (see this function's own doc comment, and `liveTakeSnapshot`'s).
+    const stillOnScreen = useAppStore.getState().viewedRecordingId === recordingId;
+
+    if (stillOnScreen) {
+      // Audio-tagging is a separate call from transcription (detectAudioEvents,
+      // run against `targets` from this same result -- see runAccuracyPipeline)
+      // that can fail or get skipped on its own: disabled in settings, nothing
+      // to tag because `targets` came back empty, or the call itself threw.
+      // `excluded` only comes back defined when it actually completed; when
+      // it's undefined, `newEvents` is just its unset initial value, not "no
+      // events found". Overwriting the live pass's own preview with that would
+      // silently discard real data over a failure that says nothing about
+      // whether the preview was wrong -- so, mirroring the segments fallback
+      // below, keep the live preview instead.
+      if (audioEventsUsable) {
+        const rebasedEvents = newEvents.map((e) => ({
+          ...e,
+          start: e.start + baseSec,
+          end: e.end + baseSec,
+        }));
+        useAppStore.setState((s) => ({
+          audioEvents: [
+            ...s.audioEvents.filter((e) => e.start < baseSec),
+            ...rebasedEvents,
+          ],
+        }));
+      }
+
+      if (secondPassUsable) {
+        useAppStore.setState((s) => ({
+          segments: [...s.segments.slice(0, keptSegments), ...refined],
+        }));
+      }
     }
-    // The live pass's own segments for this take -- already on screen, and
-    // (unlike `refined`) never replaced when the second pass comes back
-    // suspicious. Sliced out here regardless of `secondPassUsable`, since
-    // whether it has anything in it also distinguishes two very different
-    // reasons `refined` might be empty: something went wrong upstream (this
-    // has text -- fall back to it below), versus the recording was
-    // genuinely silent throughout (this is empty too -- nothing went wrong,
-    // there's just nothing to transcribe).
-    const liveSegments = useAppStore.getState().segments.slice(keptSegments);
-    const liveHasText = liveSegments.some((s) => s.text.trim() !== "");
+
     // Whichever segments are now this take's authoritative record -- the
     // second pass's, if it produced anything usable, otherwise the live
     // pass's -- always get saved. This used to be conditional on
@@ -560,27 +614,41 @@ export async function refineRecording(
     // vanish from history for good: the WAV stayed valid on disk, but with
     // no sidecar `listRecordings` could never find it again -- exactly the
     // one thing `finishRecordOnly`'s own doc comment says this feature must
-    // never do to a take. Persisted on the recording's own 0-based timeline
-    // (not the session's global one) and with freshly sequential ids, so a
-    // history entry looks identical whether it was the first or the fifth
-    // recording of its original session -- see history.ts's module doc.
-    const localSegments = (secondPassUsable ? refined : liveSegments).map(
-      (s, i) => ({
-        ...s,
-        id: i + 1,
-        startOffsetSec: s.startOffsetSec - baseSec,
-      }),
-    );
+        // never do to a take.
+    //
+    // The live-pass fallback (`liveSegments`/`liveHasText`) needs
+    // `stillOnScreen` too: it's read back out of the *global* `segments`, and
+    // once a later recording has taken over that array no longer describes
+    // this take alone (see this function's own doc comment). When the second
+    // pass isn't usable and this take is no longer on screen, the safest
+    // thing is to leave `fileTakeProvisionally`'s already-filed provisional
+    // entry alone rather than risk persisting a mixed snapshot.
+    if (!stillOnScreen && !secondPassUsable) return;
+
+    const liveSegments = stillOnScreen ? useAppStore.getState().segments.slice(keptSegments) : [];
+    const liveHasText = liveSegments.some((s) => s.text.trim() !== "");
+
+    // Persisted on the recording's own 0-based timeline (not the session's
+    // global one) and with freshly sequential ids, so a history entry looks
+    // identical whether it was the first or the fifth recording of its
+    // original session -- see history.ts's module doc.
+    const localSegments = (secondPassUsable ? refined : liveSegments).map((s, i) => ({
+      ...s,
+      id: i + 1,
+      startOffsetSec: s.startOffsetSec - baseSec,
+    }));
     // Same idea as `localSegments`, for audio events: whichever pass's
     // results are now live in the store for this take -- the post-hoc pass's,
     // if `audioEventsUsable`, otherwise whatever the live preview already had
     // -- read back out and rebased onto the recording's own 0-based timeline
     // for persistence, rather than re-reading `newEvents` (which, unlike the
     // state, doesn't reflect the fallback when the pass wasn't usable).
-    const localAudioEvents = useAppStore
-      .getState()
-      .audioEvents.filter((e) => e.start >= baseSec)
-      .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }));
+    const localAudioEvents = stillOnScreen
+      ? useAppStore
+          .getState()
+          .audioEvents.filter((e) => e.start >= baseSec)
+          .map((e) => ({ ...e, start: e.start - baseSec, end: e.end - baseSec }))
+      : [];
     const saved = await persistTake(recordingId, {
       durationSec: recordingDurationSec,
       language: settings.language,
@@ -607,12 +675,6 @@ export async function refineRecording(
   } catch (err) {
     useAppStore.setState({
       refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
-    });
-  } finally {
-    useAppStore.setState({
-      processing: null,
-      refineProgress: null,
-      processingRecordingId: null,
     });
   }
 }
@@ -646,7 +708,7 @@ export async function finishRecordOnly(
       transcribed: false,
       // All three passes are part of the analysis this mode defers, so none of
       // them describe this recording yet. They get their real values when the
-      // user runs `rerunHistoryEntry` on it.
+      // user runs `reanalyzeHistoryEntry` on it.
       usedDiarize: false,
       usedVad: false,
       usedAudioEvents: false,
@@ -667,8 +729,112 @@ export async function finishRecordOnly(
     useAppStore.setState({
       refineNotice: `録音の保存に失敗したため、履歴に残せませんでした: ${toErrorMessage(err)}`,
     });
-  } finally {
-    useAppStore.setState({ processing: null });
+  }
+}
+
+/**
+ * Re-runs the accuracy pass (transcribe + diarize + audio-tag, per whatever
+ * is currently enabled in settings) against a past recording's WAV and
+ * overwrites its history entry -- e.g. after turning on diarization or
+ * changing its threshold and wanting this recording relabeled with it.
+ *
+ * Moved out of `appStore.ts`'s `rerunHistoryEntry` action so the job body
+ * lives next to `refineRecording`'s, both driven by `analysisQueue.ts`'s
+ * `enqueueReanalyze`/`enqueueRefine` -- `appStore.ts` keeps only the thin
+ * capability check and hand-off to the queue.
+ */
+export async function reanalyzeHistoryEntry(
+  id: string,
+  onStatus?: (status: AnalysisPipelineStatus) => void,
+  wasCancelled?: () => boolean,
+): Promise<void> {
+  // The one place the model gets loaded on demand: in record-only mode this
+  // is the first time it is needed at all. A no-op once it is loaded, so the
+  // normal path is unaffected.
+  if (!(await ensureModelReady())) {
+    useAppStore.setState({
+      refineNotice: `音声認識モデルを読み込めなかったため、解析できませんでした（録音はそのまま残っています）: ${
+        useAppStore.getState().errorMessage ?? "原因不明"
+      }`,
+    });
+    return;
+  }
+
+  const durationSec = useAppStore.getState().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
+  const path = await wavPath(id);
+
+  try {
+    const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
+      useAppStore.getState();
+    const outcome = await runAccuracyPipeline(
+      id,
+      path,
+      settings,
+      vadSettings,
+      diarizeSettings,
+      audioEventSettings,
+      hallucinationSettings,
+      onStatus,
+    );
+    // Bailing out before `saveRecordingHistory` is the whole cancellation
+    // story here: the existing sidecar and the segments on screen are both
+    // left exactly as they were, so a cancelled re-analysis costs the user
+    // nothing but the time it ran. See `refineRecording` for why the job's
+    // own status is consulted alongside the outcome.
+    if (outcome.cancelled || wasCancelled?.()) {
+      useAppStore.setState({ refineNotice: "解析をキャンセルしました（既存の履歴はそのまま残っています）。" });
+      return;
+    }
+    const { result, speakers, excluded, newEvents, notices } = outcome;
+
+    // Always the recording's own 0-based timeline with fresh sequential
+    // ids -- this entry has no "session" of its own to rebase onto, and
+    // saveRecordingHistory always stores under that same convention (see
+    // refineRecording's persistence step).
+    const silent = result.silence
+      ? projectOntoNonBlankChunks(result, result.silence.map((m) => m.silent))
+      : undefined;
+    const refined = segmentsFromResult(result, 0, 1, speakers, excluded, newEvents, silent);
+    if (!refined.some((s) => s.text.trim() !== "")) {
+      // Mirrors refineRecording's own guard: an empty (or all-excluded-
+      // placeholder) result is far more likely a setting change gone wrong
+      // (wrong language, an overly strict threshold) than "this recording
+      // legitimately has nothing in it now" -- the existing history entry
+      // is worth more than a result this suspicious.
+      useAppStore.setState({
+        refineNotice:
+          "この設定では文字起こし結果が0件になったため、履歴は上書きしていません。設定を確認してから再度お試しください。",
+      });
+      return;
+    }
+    const localSegments = refined.map((s, i) => ({ ...s, id: i + 1 }));
+
+    await saveRecordingHistory(id, {
+      durationSec,
+      language: settings.language,
+      transcribed: true,
+      usedDiarize: diarizeSettings.enabled,
+      usedVad: vadSettings.enabled,
+      usedAudioEvents: audioEventSettings.enabled,
+      segments: localSegments,
+      audioEvents: newEvents,
+    });
+    await useAppStore.getState().refreshRecordingHistory();
+
+    // Refresh what's on screen too, if this is the recording currently
+    // shown. Unlike before recording/analysis ran in parallel, `reanalyze`
+    // no longer implies nothing else can be live in the meantime -- another
+    // recording (or a browse to a different entry) may have taken over
+    // `segments` while this pass was running, so this check is load-bearing,
+    // not defensive.
+    if (useAppStore.getState().viewedRecordingId === id) {
+      useAppStore.setState({ segments: localSegments, audioEvents: newEvents });
+    }
+    if (notices.length > 0) {
+      useAppStore.setState({ refineNotice: notices.join(" ") });
+    }
+  } catch (err) {
+    useAppStore.setState({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
   }
 }
 
@@ -680,8 +846,8 @@ export async function finishRecordOnly(
  * waits on the state that event drives instead.
  *
  * Resolves `false` rather than throwing when the model cannot be loaded: the
- * one caller (`rerunHistoryEntry`) reports that as a notice next to a history
- * entry that is still perfectly intact, not as a failure of the app.
+ * one caller (`reanalyzeHistoryEntry`) reports that as a notice next to a
+ * history entry that is still perfectly intact, not as a failure of the app.
  */
 export async function ensureModelReady(): Promise<boolean> {
   const { modelStatus, initModel } = useAppStore.getState();
