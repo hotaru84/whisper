@@ -4,10 +4,11 @@ pub mod appaudio;
 // Public so the accuracy harness (`examples/cer.rs`) can decode with exactly the
 // same settings the app uses.
 pub mod asr;
-// Cooperative cancellation shared by the three post-stop analysis commands.
+// Cooperative cancellation shared by the post-stop analysis commands
+// (finalize_transcript, read_wav_pcm, diarize_recording, detect_audio_events).
 pub mod cancel;
-// Retains the whole recording so a second pass (and diarization) can see
-// more than one streaming window at a time.
+// Retains the whole recording so post-hoc transcription (and diarization) can
+// see more than one streaming window at a time.
 pub mod capture;
 // The CER metric lives here rather than in the example so `cargo test` covers it.
 pub mod cer;
@@ -20,8 +21,8 @@ pub mod diarize;
 // Audio event detection (sherpa-onnx audio tagging): a standalone timeline,
 // and a non-speech exclusion filter over whisper's transcript chunks.
 pub mod events;
-// Shared by the capture writer, the second pass, and the harness, so a fixture
-// is read by exactly the code that reads a real recording.
+// Shared by the capture writer, the post-hoc transcription driver, and the
+// harness, so a fixture is read by exactly the code that reads a real recording.
 pub mod wav;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -38,12 +39,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             asr::init_model,
             asr::transcribe_window,
-            asr::transcribe_recording,
+            asr::finalize_transcript,
             capture::start_capture,
             capture::append_capture,
             capture::finish_capture,
             capture::recording_duration_sec,
             capture::allow_recording_directory,
+            wav::read_wav_pcm,
             diarize::diarize_recording,
             events::detect_audio_events,
             events::detect_events_window,

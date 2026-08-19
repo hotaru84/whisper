@@ -128,7 +128,7 @@ export function TranscriptToolbar({
             size="sm"
             onClick={reanalyze.onClick}
             disabled={reanalyze.disabled}
-            title="現在の設定（話者分離・VAD・音響イベント）でこの録音を詳しく解析し直し、履歴を上書きします"
+            title="現在の設定（話者分離・音響イベント）でこの録音を解析し直し、履歴を上書きします"
           >
             <RotateCw className="h-4 w-4" />
             再解析

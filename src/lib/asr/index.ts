@@ -1,7 +1,6 @@
 export {
   AsrClient,
   DEFAULT_DIARIZE_SETTINGS,
-  DEFAULT_VAD_SETTINGS,
   DEFAULT_AUDIO_EVENT_SETTINGS,
   DEFAULT_HALLUCINATION_SETTINGS,
   DIARIZATION_MODEL_UNAVAILABLE,
@@ -13,7 +12,6 @@ export type {
   QualityReport,
   SilenceMark,
   DiarizeSettings,
-  VadSettings,
   AudioEventSettings,
   AudioEvent,
   AudioEventResult,
@@ -24,6 +22,8 @@ export { RecordingCapture } from "./capture";
 export type { CaptureInfo } from "./capture";
 export { StreamingTranscriber } from "./streaming";
 export type { StreamingSegment } from "./streaming";
+export { transcribeWavPostHoc } from "./postHocTranscriber";
+export type { PostHocOutcome } from "./postHocTranscriber";
 export { AudioEventStreamer } from "./eventStreaming";
 export type { AsrDevice, TranscriptChunk, TranscriptionTask } from "./types";
 export { SUPPORTED_LANGUAGES } from "./languages";

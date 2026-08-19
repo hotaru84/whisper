@@ -16,8 +16,8 @@ export const runningInTauri = isTauri();
  * Vulkan, no Windows. Everything the UI can reach is faked, and every fake
  * lives in a `useMockBackend` branch next to the real call it stands in for:
  *
- * - `asr/client.ts` -- model load, live windows, the second pass (spread over
- *   the recording's real length), diarization, audio events
+ * - `asr/client.ts` -- model load, live windows, post-hoc PCM streaming and
+ *   the finalize/repair pass, diarization, audio events
  * - `asr/capture.ts` -- the WAV writer; there is no file, only a duration
  * - `history.ts` -- an in-memory store, seeded with two sample recordings so
  *   the sidebar is not empty on first load; `openRecordingFolder` also

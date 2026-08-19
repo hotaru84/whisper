@@ -24,7 +24,7 @@ import { useAppStore } from "./appStore";
 import { toErrorMessage } from "../lib/errors";
 import {
   refineRecording,
-  reanalyzeHistoryEntry,
+  runPostHocAnalysis,
   type TakeFiling,
   type AnalysisPipelineStatus,
 } from "./recordingPipeline";
@@ -105,18 +105,26 @@ export function canCancelJob(job: AnalysisJob | undefined): boolean {
 /**
  * A job that was `"queued"` when `cancelJob` marked it `"cancelling"` can
  * still be sitting in `whisperQueue.ts`'s own queue at that moment -- when it
- * eventually gets dequeued and actually starts, `runAccuracyPipeline`'s
+ * eventually gets dequeued and actually starts, `finalizeAndEnrich`'s
  * `onStart` fires this with `"transcribing"` regardless, since the pipeline
  * itself has no idea a cancel was already requested (that's `wasCancelled`'s
  * job, checked only after the pass finishes). Guarded here so that a status
  * update arriving after cancellation cannot resurrect "still running" over
  * "winding down" -- once `"cancelling"`, a job's status only ever changes by
  * being removed (`runJob`'s `finally`), never overwritten.
+ *
+ * Does *not* touch `progress` on a transition into `"transcribing"`.
+ * `runPostHocAnalysis` re-enters `"transcribing"` twice per run (once for its
+ * own windowed decode, again for `finalizeAndEnrich`'s repair call once
+ * decoding finishes) -- resetting to 0 here would snap a resumed job's bar
+ * back to 0% the instant it starts, and again once decoding reaches 100% and
+ * finalize begins. `progress` is written only by `setProgress`/`onProgress`
+ * above, keyed on `analyzedThroughSec`, never on `status` transitions.
  */
 function onStatus(recordingId: string): (status: AnalysisPipelineStatus) => void {
   return (status) => {
     if (useAnalysisQueueStore.getState().jobs[recordingId]?.status === "cancelling") return;
-    updateJob(recordingId, { status, progress: status === "transcribing" ? 0 : null });
+    updateJob(recordingId, { status });
   };
 }
 
@@ -125,7 +133,7 @@ function wasCancelled(recordingId: string): () => boolean {
 }
 
 /** Runs `run` to completion (however it ends) and always removes `recordingId`'s
- * job entry afterward -- `refineRecording`/`reanalyzeHistoryEntry` already
+ * job entry afterward -- `refineRecording`/`runPostHocAnalysis` already
  * report their own outcome as a `refineNotice`, so there is nothing left for
  * this wrapper to do but clean up the queue's own bookkeeping. */
 async function runJob(recordingId: string, run: () => Promise<void>): Promise<void> {
@@ -160,7 +168,9 @@ export function enqueueRefine(filing: TakeFiling, baseSec: number, keptSegments:
 export function enqueueReanalyze(recordingId: string): void {
   if (hasActiveJob(recordingId)) return;
   upsertJob({ id: recordingId, kind: "reanalyze", status: "queued", progress: null });
-  void runJob(recordingId, () => reanalyzeHistoryEntry(recordingId, onStatus(recordingId), wasCancelled(recordingId)));
+  void runJob(recordingId, () =>
+    runPostHocAnalysis(recordingId, onStatus(recordingId), onProgress(recordingId), wasCancelled(recordingId)),
+  );
 }
 
 /**
@@ -190,14 +200,29 @@ export async function cancelJob(recordingId: string): Promise<void> {
 }
 
 /**
- * Applies a whisper progress update from `clients.ts`'s `onRefineProgress`
- * handler. Ignored unless `recordingId` currently has a job in the
- * `"transcribing"` state -- the backend event isn't guaranteed to stop
- * arriving the instant a job moves on (or is removed entirely), so a late or
- * stray one must not resurrect progress on a job it no longer describes.
+ * Applies a windowed-decode progress update from `transcribeWavPostHoc`
+ * (`postHocTranscriber.ts`), routed through `runPostHocAnalysis`'s own
+ * `onProgress` callback. Ignored unless `recordingId` currently has a job in
+ * the `"transcribing"` state -- a late or stray update must not resurrect
+ * progress on a job that has since moved on (or been removed).
  */
 export function setProgress(recordingId: string, percent: number): void {
   const job = useAnalysisQueueStore.getState().jobs[recordingId];
   if (!job || job.status !== "transcribing") return;
   updateJob(recordingId, { progress: percent });
+}
+
+/**
+ * Converts `transcribeWavPostHoc`'s `(analyzedThroughSec, totalSec)` shape
+ * into the percentage `setProgress` stores. Passed as `runPostHocAnalysis`'s
+ * `onProgress` argument -- the one place `AnalysisJob.progress` is ever
+ * written for the resumable post-hoc path, so a job resumed partway through
+ * reports its starting percentage immediately rather than snapping to 0%
+ * (see `postHocTranscriber.ts`'s own doc comment on why this matters).
+ */
+function onProgress(recordingId: string): (analyzedThroughSec: number, totalSec: number) => void {
+  return (analyzedThroughSec, totalSec) => {
+    const percent = totalSec > 0 ? Math.round((analyzedThroughSec / totalSec) * 100) : 0;
+    setProgress(recordingId, percent);
+  };
 }

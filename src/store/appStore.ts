@@ -8,7 +8,6 @@ import {
 } from "../lib/asr";
 import type {
   DiarizeSettings,
-  VadSettings,
   AudioEventSettings,
   HallucinationSettings,
   AudioEvent,
@@ -48,8 +47,6 @@ import {
   saveSettings,
   loadDiarizeSettings,
   saveDiarizeSettings,
-  loadVadSettings,
-  saveVadSettings,
   loadHallucinationSettings,
   saveHallucinationSettings,
   loadAudioEventSettings,
@@ -189,7 +186,6 @@ interface AppState {
   refineNotice: string | null;
   settings: AsrSettings;
   diarizeSettings: DiarizeSettings;
-  vadSettings: VadSettings;
   hallucinationSettings: HallucinationSettings;
   audioEventSettings: AudioEventSettings;
   recordingMode: RecordingModeSettings;
@@ -243,7 +239,6 @@ interface AppState {
   resumeRecording: () => void;
   updateSettings: (partial: Partial<AsrSettings>) => void;
   updateDiarizeSettings: (partial: Partial<DiarizeSettings>) => void;
-  updateVadSettings: (partial: Partial<VadSettings>) => void;
   updateHallucinationSettings: (partial: Partial<HallucinationSettings>) => void;
   updateAudioEventSettings: (partial: Partial<AudioEventSettings>) => void;
   updateAutoSaveSettings: (partial: Partial<AutoSaveSettings>) => void;
@@ -290,8 +285,12 @@ interface AppState {
   rerunHistoryEntry: (id: string) => Promise<void>;
   /** Asks `recordingId`'s running (or queued) accuracy pass to stop. Returns
    * as soon as the backend has been told; the pass itself finishes unwinding
-   * on its own. Nothing partial is kept -- see `finishCancelledTake`. Other
-   * recordings' jobs are unaffected. */
+   * on its own. For a just-finished live take, nothing partial is kept from
+   * the cancelled pass itself -- see `finishCancelledTake` -- though the
+   * live transcript it was refining stays. For record-only/re-analyze's
+   * windowed post-hoc pass, cancelling instead *keeps* whatever windows were
+   * already decoded and lets a later "解析" resume from there -- see
+   * `runPostHocAnalysis`. Other recordings' jobs are unaffected. */
   cancelAnalysis: (recordingId: string) => Promise<void>;
   /** Loads `path`'s audio for playback, tagged with `recordingId` so the UI
    * can tell it apart from whatever was loaded before. Replaces (and
@@ -535,7 +534,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   refineNotice: null,
   settings: loadSettings(),
   diarizeSettings: loadDiarizeSettings(),
-  vadSettings: loadVadSettings(),
   hallucinationSettings: loadHallucinationSettings(),
   audioEventSettings: loadAudioEventSettings(),
   recordingMode: loadRecordingMode(),
@@ -676,9 +674,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  // The job body (model-ready check, `runAccuracyPipeline` call, segment/
+  // The job body (model-ready check, windowed post-hoc decode, segment/
   // history persistence) lives in `recordingPipeline.ts`'s
-  // `reanalyzeHistoryEntry` -- this action is only the capability check and
+  // `runPostHocAnalysis` -- this action is only the capability check and
   // the hand-off to the background queue, same split as `stopRecording`'s
   // use of `enqueueRefine` below. `enqueueReanalyze` itself is a no-op if
   // this recording already has a job in flight.
@@ -1063,13 +1061,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       const diarizeSettings = { ...s.diarizeSettings, ...partial };
       saveDiarizeSettings(diarizeSettings);
       return { diarizeSettings };
-    }),
-
-  updateVadSettings: (partial) =>
-    set((s) => {
-      const vadSettings = { ...s.vadSettings, ...partial };
-      saveVadSettings(vadSettings);
-      return { vadSettings };
     }),
 
   updateHallucinationSettings: (partial) =>

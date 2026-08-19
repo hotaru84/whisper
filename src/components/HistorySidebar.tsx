@@ -30,6 +30,32 @@ import { MOCK_NATIVE_FEATURE_UNAVAILABLE } from "../lib/mock/fixtures";
 import { formatTimestamp, formatDateTime } from "../lib/format";
 import { cn } from "../lib/utils";
 
+/**
+ * How close `analyzedThroughSec` must sit to `durationSec` to count as
+ * "fully analyzed" for the row's quick-action button. Without this, a take
+ * whose last incrementally-persisted cursor landed a fraction of a second
+ * short of the true duration (rounding, a trailing silent frame) would show
+ * a "続きを解析" button that would resume for under a second before
+ * finishing anyway -- not wrong, just not worth surfacing as "partial."
+ */
+const RESUME_EPSILON_SEC = 1;
+
+/** Whether this row's quick-action button should offer to (re)start
+ * analysis at all -- true for a take never analyzed, and for one whose
+ * previous post-hoc analysis was cancelled partway through (see
+ * `runPostHocAnalysis`'s own doc comment on when `analyzedThroughSec` sits
+ * strictly between 0 and `durationSec`). A take that finished analyzing
+ * live (`refineRecording`, whose `analyzedThroughSec` always lands exactly
+ * on `durationSec`) has nothing left to offer here -- its only path back
+ * into analysis is `TranscriptToolbar`'s "再解析", a deliberate full redo. */
+function needsAnalysis(meta: RecordingHistoryMeta): boolean {
+  // Never analyzed: always offer it, regardless of duration -- the epsilon
+  // below only exists to guard the *resume* case, and a very short
+  // recording (well under RESUME_EPSILON_SEC) must not be mistaken for one.
+  if (meta.analyzedThroughSec <= 0) return true;
+  return meta.analyzedThroughSec < meta.durationSec - RESUME_EPSILON_SEC;
+}
+
 /** Feature badges are icon-only (no label) to keep each row to one line --
  * each carries its own `aria-label` rather than relying on a label learned
  * elsewhere. */
@@ -37,7 +63,6 @@ function FeatureIcons({ meta }: { meta: RecordingHistoryMeta }) {
   return (
     <span className="flex items-center gap-1 text-muted-foreground">
       {meta.usedDiarize && <Users className="h-3 w-3" aria-label="話者分離" />}
-      {meta.usedVad && <Wand2 className="h-3 w-3" aria-label="VAD" />}
       {meta.usedAudioEvents && (
         <AudioLines className="h-3 w-3" aria-label="音響イベント検出" />
       )}
@@ -186,15 +211,19 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             解析中止
           </Button>
         ) : (
-          !meta.transcribed &&
-          !isProcessing && (
+          !isProcessing &&
+          needsAnalysis(meta) && (
             <Button
               type="button"
               variant="outline"
               size="sm"
               className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100"
               disabled={!can.reanalyze}
-              title="この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+              title={
+                meta.analyzedThroughSec > 0
+                  ? "前回の続きから解析を再開します（音声認識モデルの読み込みが必要な場合があります）"
+                  : "この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+              }
               onClick={(e) => {
                 e.stopPropagation();
                 // Opens the entry first so the transcript panel switches to it
@@ -210,7 +239,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
               }}
             >
               <Wand2 className="h-3 w-3" />
-              解析
+              {meta.analyzedThroughSec > 0 ? "続きを解析" : "解析"}
             </Button>
           )
         )}

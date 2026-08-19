@@ -95,6 +95,16 @@ export class StreamingTranscriber {
        * `isNearSilent`. Defaults to `SILENCE_RMS`; overridable so this
        * mirrors the user's `HallucinationSettings.silenceRms`. */
       silenceRms?: number;
+      /** Checked between windows inside `drain`'s loop; once it returns
+       * `true`, no further window starts decoding (a window already in
+       * flight still finishes and commits). Unused by the live mic path,
+       * which is naturally paced by real-time audio arrival and rarely has
+       * more than one window buffered at a time -- it exists for
+       * `postHocTranscriber.ts`'s post-hoc driver, whose PCM can arrive from
+       * `read_wav_pcm` far faster than decoding can keep up, so without this
+       * hook a cancel request would have no point to actually interrupt the
+       * loop at. */
+      shouldStop?: () => boolean;
     } = {},
   ) {}
 
@@ -130,7 +140,10 @@ export class StreamingTranscriber {
 
   /** Process windows until drained (final) or below the window size (streaming). */
   private async drain(final: boolean): Promise<void> {
-    while (final ? this.pendingSamples > 0 : this.pendingSamples >= WINDOW_SEC * SR) {
+    while (
+      !(this.options.shouldStop?.() ?? false) &&
+      (final ? this.pendingSamples > 0 : this.pendingSamples >= WINDOW_SEC * SR)
+    ) {
       const before = this.pendingSamples;
       await this.processWindow(final);
       // Guard against any no-progress path: stop rather than re-transcribe the

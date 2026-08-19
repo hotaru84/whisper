@@ -139,7 +139,7 @@ export function selectCapabilities(s: CapabilityInputs): Capabilities {
     browseHistory: stopped,
     playback: stopped,
     // Deliberately not gated on `modelStatus`: this is the action that
-    // *causes* the model to load in record-only mode. `reanalyzeHistoryEntry`
+    // *causes* the model to load in record-only mode. `runPostHocAnalysis`
     // awaits `ensureModelReady` itself and reports a notice if it fails.
     reanalyze: stopped,
     editSettings: stopped,
