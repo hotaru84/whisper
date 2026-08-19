@@ -8,10 +8,12 @@
     "opener:default",
     "dialog:default",
     "fs:default",
-    {
-      "identifier": "fs:allow-write-text-file",
-      "allow": [{ "path": "**" }]
-    },
+    "fs:allow-write-text-file",
+    "fs:allow-read-file",
+    "fs:allow-read-dir",
+    "fs:allow-read-text-file",
+    "fs:allow-exists",
+    "fs:allow-remove",
     "opener:allow-reveal-item-in-dir",
     "fs:allow-appcache-read-recursive",
     "fs:allow-appcache-write-recursive",
