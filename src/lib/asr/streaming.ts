@@ -3,17 +3,19 @@ import type { TranscribeResult } from "./client";
 import { isNearSilent, SILENCE_RMS } from "./diagnostics";
 import { WHISPER_SAMPLE_RATE as SR } from "../audio/resample";
 
-// How much audio to accumulate before transcribing, which is also how long the
-// user waits before any text appears.
+// How much audio to accumulate before transcribing.
 //
 // Whisper always encodes a fixed 30s context and pads anything shorter with
-// silence, so a 15s window costs the same GPU time as a 30s one -- roughly 2s on
-// the Vulkan backend. Purely on throughput 30s would be the efficient choice,
-// but it means nothing shows up for the first half minute of a recording, and
-// short recordings produce nothing at all until stop. 15s halves that wait at
-// the cost of giving the model less surrounding context per pass; the
-// chunk-and-commit carry-over below still keeps sentences from being cut.
-const WINDOW_SEC = 15;
+// silence, so a 30s window costs the same GPU time as a 15s one -- roughly 2s
+// on the Vulkan backend (see WHISPER_PRIORITY_LIVE's own doc comment in
+// whisperQueue.ts). This used to be 15s specifically to halve the wait before
+// the first text appears, back when the live pass had to be responsive on its
+// own; now that windows are submitted through that priority queue instead of
+// called directly, sub-second turnaround is no longer a requirement (a window
+// may sit behind whatever single background job is currently using the
+// model), so there is nothing left to trade away by using the full 30s: fewer,
+// larger windows mean fewer sentences get cut at a window boundary, for free.
+const WINDOW_SEC = 30;
 
 // Upper bound on audio carried into the next window when whisper transcribes
 // less than the whole window.

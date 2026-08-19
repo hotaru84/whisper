@@ -21,7 +21,7 @@ import { useAppStore } from "../store/appStore";
  */
 export function TitleBarControls() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
-  const processing = useAppStore((s) => s.processing);
+  const recordingCloseOutPhase = useAppStore((s) => s.recordingCloseOutPhase);
   const segmentCount = useAppStore((s) => s.segments.length);
   const playbackRecordingId = useAppStore((s) => s.playback.recordingId);
   const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
@@ -32,7 +32,7 @@ export function TitleBarControls() {
   // own doc comment for why these three fields rather than
   // `viewedRecordingId`. Inverted here: this button is the complement of
   // that state.
-  const showingSomething = !(processing === null && segmentCount === 0 && playbackRecordingId == null);
+  const showingSomething = !(recordingCloseOutPhase === null && segmentCount === 0 && playbackRecordingId == null);
   if (!showingSomething) return null;
 
   return (

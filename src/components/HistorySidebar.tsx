@@ -21,7 +21,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { useConfirmClick } from "./useConfirmClick";
 import { ThemeToggle } from "./ThemeToggle";
 import { SettingsDialog } from "./SettingsDialog";
-import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
+import { useAppStore, selectCapabilities, effectiveRecordOnly, useAnalysisQueueStore } from "../store/appStore";
 import { loadRecording, openRecordingFolder } from "../lib/history";
 import type { RecordingHistoryMeta } from "../lib/history";
 import { combinedText, collapseDegenerateSegments } from "../lib/transcript";
@@ -62,20 +62,21 @@ function useHistoryRowActions(id: string) {
 
 function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   const viewedRecordingId = useAppStore((s) => s.viewedRecordingId);
-  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
+  // This row's own job, if it has one -- more than one recording can have
+  // analysis in flight at once now (see `src/store/analysisQueue.ts`), so
+  // "is *this* row processing" is answered per-row from here rather than
+  // from a single app-wide field.
+  const job = useAnalysisQueueStore((s) => s.jobs[meta.id]);
   const loadHistoryEntry = useAppStore((s) => s.loadHistoryEntry);
   const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const cancelAnalysis = useAppStore((s) => s.cancelAnalysis);
-  const refineProgress = useAppStore((s) => s.refineProgress);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
-  const processing = useAppStore((s) => s.processing);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const can = selectCapabilities({
     recordingPhase,
-    processing,
     modelStatus,
     recordOnly,
   });
@@ -83,19 +84,14 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
   // counter, so it is a stopped-only action -- the store enforces this too,
   // but a dead-looking click is worse than a disabled control.
   const browsable = recordingPhase === "stopped";
-  // This row specifically -- not just "some reanalysis is running somewhere"
-  // (that's `!can.reanalyze`, which already greys out every row's own 解析
-  // button) -- is the target of the accuracy pass right now. Shown
-  // unconditionally rather than only on hover (unlike the action buttons
-  // below) since this is the answer to "which one is it doing", not an
-  // action the user reaches for.
-  const isProcessing = processingRecordingId === meta.id;
+  // Shown unconditionally rather than only on hover (unlike the action
+  // buttons below) since this is the answer to "which one is it doing", not
+  // an action the user reaches for.
+  const isProcessing = job !== undefined;
   // Distinguishes "actively running, with progress to show and a pass that
   // can still be cancelled" from "cancel was already pressed and this is
-  // winding down" -- `can.cancelAnalysis` excludes `cancelling` for exactly
-  // this reason (see its own doc comment), so it doubles as the row's own
-  // refining/cancelling split once paired with `isProcessing`.
-  const isRefiningThis = isProcessing && can.cancelAnalysis;
+  // winding down".
+  const isRefiningThis = isProcessing && job.status !== "cancelling";
   const { confirming: confirmingDelete, onClick: onDeleteClick } =
     useConfirmClick(() => {
       void deleteHistoryEntry(meta.id);
@@ -133,9 +129,13 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           {isProcessing ? (
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden="true" />
-              {isRefiningThis
-                ? `解析中… ${Math.round(refineProgress ?? 0)}%`
-                : "中止中…"}
+              {!isRefiningThis
+                ? "中止中…"
+                : job.status === "queued"
+                  ? "待機中…"
+                  : job.status === "transcribing"
+                    ? `解析中… ${Math.round(job.progress ?? 0)}%`
+                    : "解析中…"}
             </span>
           ) : (
             <span className="font-mono text-xs tabular-nums text-muted-foreground">
@@ -143,11 +143,11 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             </span>
           )}
         </div>
-        {isRefiningThis && (
+        {isRefiningThis && job.status === "transcribing" && (
           <div className="h-1 overflow-hidden rounded-full bg-muted">
             <div
               className="h-full rounded-full bg-foreground transition-[width]"
-              style={{ width: `${Math.min(100, Math.max(0, refineProgress ?? 0))}%` }}
+              style={{ width: `${Math.min(100, Math.max(0, job.progress ?? 0))}%` }}
             />
           </div>
         )}
@@ -179,7 +179,7 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             title="解析を中止します。すでに表示されている文字起こしと録音ファイルはそのまま残ります"
             onClick={(e) => {
               e.stopPropagation();
-              void cancelAnalysis();
+              void cancelAnalysis(meta.id);
             }}
           >
             <XCircle className="h-3 w-3" />
@@ -258,10 +258,10 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
           size="sm"
           className="h-6 px-2 text-xs opacity-0 group-hover:opacity-100 data-[confirming=true]:opacity-100"
           data-confirming={confirmingDelete}
-          // Deleting the entry `rerunHistoryEntry` is currently working
-          // against would let its eventual `saveRecordingHistory` call
-          // silently recreate the sidecar JSON out from under the delete --
-          // see `isProcessing`'s own doc comment above.
+          // Deleting the entry a job is currently working against would let
+          // its eventual `saveRecordingHistory` call silently recreate the
+          // sidecar JSON out from under the delete -- `isProcessing` is this
+          // row's own job (see its declaration above), not any other row's.
           disabled={!browsable || isProcessing}
           onClick={onDeleteClick}
         >

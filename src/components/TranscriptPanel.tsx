@@ -4,7 +4,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { TranscriptToolbar } from "./TranscriptToolbar";
 import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
-import { useAppStore, selectCapabilities, effectiveRecordOnly } from "../store/appStore";
+import { useAppStore, selectCapabilities, effectiveRecordOnly, useAnalysisQueueStore, hasActiveJob, canCancelJob } from "../store/appStore";
 import { combinedText, collapseDegenerateSegments, type TranscriptSegment } from "../lib/transcript";
 import { openRecordingFolder } from "../lib/history";
 import { cn } from "../lib/utils";
@@ -12,7 +12,7 @@ import { cn } from "../lib/utils";
 export function TranscriptPanel() {
   const segments = useAppStore((s) => s.segments);
   const recordingPhase = useAppStore((s) => s.recordingPhase);
-  const processing = useAppStore((s) => s.processing);
+  const recordingCloseOutPhase = useAppStore((s) => s.recordingCloseOutPhase);
   const modelStatus = useAppStore((s) => s.modelStatus);
   const refineNotice = useAppStore((s) => s.refineNotice);
   const recordingHistory = useAppStore((s) => s.recordingHistory);
@@ -20,14 +20,12 @@ export function TranscriptPanel() {
   const deleteHistoryEntry = useAppStore((s) => s.deleteHistoryEntry);
   const rerunHistoryEntry = useAppStore((s) => s.rerunHistoryEntry);
   const cancelAnalysis = useAppStore((s) => s.cancelAnalysis);
-  const processingRecordingId = useAppStore((s) => s.processingRecordingId);
   const playback = useAppStore((s) => s.playback);
   const seekTo = useAppStore((s) => s.seekTo);
   const [copied, setCopied] = useState(false);
   const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
   const can = selectCapabilities({
     recordingPhase,
-    processing,
     modelStatus,
     recordOnly,
   });
@@ -40,6 +38,12 @@ export function TranscriptPanel() {
   // finishes (see `refineRecording`'s `loadPlayback` call), so this reanalyze
   // button is not gated on having gone through the history sidebar first.
   const currentRecordingId = playback.recordingId;
+  // This specific recording's own job, if it has one -- more than one
+  // recording can have analysis in flight at once now (see
+  // `src/store/analysisQueue.ts`), so this panel's own state has to be
+  // scoped to `currentRecordingId` rather than read off a single app-wide
+  // field.
+  const currentJob = useAnalysisQueueStore((s) => (currentRecordingId ? s.jobs[currentRecordingId] : undefined));
 
   const hasTranscript = segments.length > 0;
   // A rendering-only view of `segments`: folds a stalled decode's repeated
@@ -49,16 +53,15 @@ export function TranscriptPanel() {
   // uncollapsed.
   const displaySegments = collapseDegenerateSegments(segments);
   const text = combinedText(displaySegments);
-  const isRefining = processing === "refining";
-  // Whether the recording on screen is specifically the one the accuracy
-  // pass is running against -- `can.cancelAnalysis` alone doesn't say
-  // *which* recording, and offering to cancel a pass running against a
-  // different history entry than the one being viewed would cancel the
-  // wrong thing.
-  const isCancelable = can.cancelAnalysis && currentRecordingId === processingRecordingId;
+  const isRefining = currentJob !== undefined && currentJob.status !== "cancelling";
+  // Whether the recording on screen is specifically the one an accuracy pass
+  // is running against and that pass can still be cancelled -- excludes
+  // `cancelling` so the button disables itself the instant it's pressed.
+  const isCancelable = canCancelJob(currentJob);
   // "More text is still on its way": a take is open (recording or paused, since
-  // pausing flushes but does not end it), or the final flush is running.
-  const isLive = recordingPhase !== "stopped" || processing === "transcribing";
+  // pausing flushes but does not end it), or the final live-window flush right
+  // after stop is running.
+  const isLive = recordingPhase !== "stopped" || recordingCloseOutPhase === "transcribing";
 
   // Whether `segment` falls inside whatever recording is currently loaded for
   // playback -- see `PlaybackState.timelineOffsetSec`'s doc comment. Only
@@ -113,11 +116,17 @@ export function TranscriptPanel() {
         reanalyze={
           currentRecordingId
             ? isCancelable
-              ? { mode: "cancel", onClick: () => void cancelAnalysis(), disabled: false }
+              ? { mode: "cancel", onClick: () => void cancelAnalysis(currentRecordingId), disabled: false }
               : {
                   mode: "reanalyze",
                   onClick: () => void rerunHistoryEntry(currentRecordingId),
-                  disabled: !can.reanalyze,
+                  // `hasActiveJob` also covers `currentJob?.status === "cancelling"`:
+                  // a pass winding down still has to finish before a new one for
+                  // the same recording can start (see `enqueueReanalyze`'s doc
+                  // comment) -- `can.reanalyze` alone no longer captures that, now
+                  // that it's a per-recording state rather than a single app-wide
+                  // one.
+                  disabled: !can.reanalyze || hasActiveJob(currentRecordingId),
                 }
             : undefined
         }

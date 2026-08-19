@@ -234,13 +234,14 @@ pub const MODEL_UNAVAILABLE: &str = "__diarization_model_unavailable__";
 pub async fn diarize_recording(
     app: AppHandle,
     path: String,
+    job_id: String,
     chunks: Vec<(f32, f32)>,
     threshold: f32,
     num_speakers: i32,
     min_duration_on: f32,
     min_duration_off: f32,
 ) -> Result<Vec<Option<i32>>, String> {
-    let cancel = crate::cancel::flag(&app);
+    let cancel = crate::cancel::flag(&app, &job_id);
 
     tauri::async_runtime::spawn_blocking(move || {
         crate::cancel::check(&cancel)?;

@@ -16,8 +16,12 @@ export interface AsrClientHandlers {
   onDeviceInfo?: (device: AsrDevice) => void;
   onModelReady?: () => void;
   onError?: (message: string) => void;
-  /** 0-100, while the second pass re-reads a finished recording. */
-  onRefineProgress?: (percent: number) => void;
+  /** `percent` is 0-100, while the second pass re-reads a finished recording.
+   * `jobId` identifies which recording's pass this progress belongs to --
+   * more than one can be queued/running at once (`src/store/analysisQueue.ts`),
+   * so the event itself has to say which one it's for rather than the
+   * frontend inferring it from "the" pass currently running. */
+  onRefineProgress?: (jobId: string, percent: number) => void;
 }
 
 export interface TranscribeOptions {
@@ -203,6 +207,7 @@ interface AsrErrorPayload {
 }
 
 interface RefineProgressPayload {
+  jobId: string;
   percent: number;
 }
 
@@ -240,10 +245,11 @@ export class AsrClient {
   private handlers: AsrClientHandlers;
   private initialized = false;
   private unlisten: UnlistenFn[] = [];
-  // Mock-only (see ../env.ts): mirrors the backend's own begin/cancel flag
-  // (cancel.rs) closely enough that the 解析中止 UI has something real to
-  // exercise even without a backend.
-  private mockCancelled = false;
+  // Mock-only (see ../env.ts): mirrors the backend's own per-job cancel flags
+  // (cancel.rs's job_id-keyed map) closely enough that the 解析中止 UI has
+  // something real to exercise even without a backend, including cancelling
+  // one recording's mock pass without disturbing another's.
+  private mockCancelled = new Set<string>();
 
   constructor(handlers: AsrClientHandlers = {}) {
     this.handlers = handlers;
@@ -274,7 +280,7 @@ export class AsrClient {
         this.handlers.onError?.(event.payload.message);
       }),
       await listen<RefineProgressPayload>("asr:refine-progress", (event) => {
-        this.handlers.onRefineProgress?.(event.payload.percent);
+        this.handlers.onRefineProgress?.(event.payload.jobId, event.payload.percent);
       }),
     );
 
@@ -321,18 +327,20 @@ export class AsrClient {
    */
   async transcribeRecording(
     path: string,
+    jobId: string,
     options: TranscribeOptions = {},
     vad: VadSettings = DEFAULT_VAD_SETTINGS,
     hallucination: HallucinationSettings = DEFAULT_HALLUCINATION_SETTINGS,
   ): Promise<TranscribeResult> {
     if (useMockBackend) {
-      // A few ticks with a delay between each, so `refineProgress` (and the
-      // history row's progress bar / titlebar readout it drives) has
-      // something to visibly animate rather than jumping straight to 100.
+      // A few ticks with a delay between each, so this job's progress (and
+      // the history row's progress bar / titlebar readout it drives -- see
+      // `analysisQueue.ts`'s `setProgress`) has something to visibly animate
+      // rather than jumping straight to 100.
       for (const percent of [15, 35, 60, 85, 100]) {
         await wait(350);
-        if (this.mockCancelled) throw new Error(ANALYSIS_CANCELLED);
-        this.handlers.onRefineProgress?.(percent);
+        if (this.mockCancelled.has(jobId)) throw new Error(ANALYSIS_CANCELLED);
+        this.handlers.onRefineProgress?.(jobId, percent);
       }
       // Spread over the recording's real length, so the resulting segments
       // land at plausible timestamps and clicking one actually seeks
@@ -342,6 +350,7 @@ export class AsrClient {
 
     const result = await invoke<TranscribeResult>("transcribe_recording", {
       path,
+      jobId,
       language: options.language ?? null,
       task: options.task ?? null,
       prompt: options.glossary?.trim() ? options.glossary : null,
@@ -355,33 +364,49 @@ export class AsrClient {
   }
 
   /**
-   * Clears any leftover cancellation, at the head of an analysis pass.
+   * Clears any leftover cancellation for `jobId`, at the head of an analysis
+   * pass.
    *
    * Called by `runAccuracyPipeline` -- the single entry point both the
    * post-stop second pass and history re-analysis go through -- so a cancel
-   * that arrived too late to stop the previous pass cannot kill the next one
-   * on sight.
+   * that arrived too late to stop the previous pass for this job cannot kill
+   * the next one on sight. Other jobs' flags are untouched.
    */
-  async beginAnalysis(): Promise<void> {
+  async beginAnalysis(jobId: string): Promise<void> {
     if (useMockBackend) {
-      this.mockCancelled = false;
+      this.mockCancelled.delete(jobId);
       return;
     }
-    await invoke("begin_analysis");
+    await invoke("begin_analysis", { jobId });
   }
 
   /**
-   * Asks the running analysis pass to stop. Resolves as soon as the backend
-   * flag is set, *not* when the pass has actually wound down: the in-flight
-   * `transcribeRecording`/`diarizeRecording`/`detectAudioEvents` promise is
-   * what eventually rejects with `ANALYSIS_CANCELLED`.
+   * Asks `jobId`'s running analysis pass to stop. Resolves as soon as the
+   * backend flag is set, *not* when the pass has actually wound down: the
+   * in-flight `transcribeRecording`/`diarizeRecording`/`detectAudioEvents`
+   * promise is what eventually rejects with `ANALYSIS_CANCELLED`. Other jobs
+   * keep running unaffected.
    */
-  async cancelAnalysis(): Promise<void> {
+  async cancelAnalysis(jobId: string): Promise<void> {
     if (useMockBackend) {
-      this.mockCancelled = true;
+      this.mockCancelled.add(jobId);
       return;
     }
-    await invoke("cancel_analysis");
+    await invoke("cancel_analysis", { jobId });
+  }
+
+  /**
+   * Removes `jobId`'s cancellation flag once its analysis pass has fully
+   * wound down (success, failure, or cancellation) -- hygiene so the
+   * backend's job map does not grow for every recording ever analyzed over
+   * the app's lifetime. Called from `runAccuracyPipeline`'s own `finally`.
+   */
+  async endAnalysis(jobId: string): Promise<void> {
+    if (useMockBackend) {
+      this.mockCancelled.delete(jobId);
+      return;
+    }
+    await invoke("end_analysis", { jobId });
   }
 
   /**
@@ -400,6 +425,7 @@ export class AsrClient {
    */
   async diarizeRecording(
     path: string,
+    jobId: string,
     chunks: Array<[number, number]>,
     settings: DiarizeSettings,
   ): Promise<Array<number | null>> {
@@ -411,6 +437,7 @@ export class AsrClient {
     }
     return await invoke<Array<number | null>>("diarize_recording", {
       path,
+      jobId,
       chunks,
       threshold: settings.threshold,
       numSpeakers: settings.numSpeakers,
@@ -434,6 +461,7 @@ export class AsrClient {
    */
   async detectAudioEvents(
     path: string,
+    jobId: string,
     chunks: Array<[number, number]>,
     settings: AudioEventSettings,
   ): Promise<AudioEventResult> {
@@ -450,6 +478,7 @@ export class AsrClient {
     }
     return await invoke<AudioEventResult>("detect_audio_events", {
       path,
+      jobId,
       chunks,
       threshold: settings.threshold,
       topK: settings.topK,
