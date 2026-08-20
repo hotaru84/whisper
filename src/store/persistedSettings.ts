@@ -1,6 +1,6 @@
 /**
  * Every `settings-key -> localStorage` pair the app persists: decoding
- * settings, diarization, VAD, audio-event tagging, record-only mode, and the
+ * settings, diarization, audio-event tagging, record-only mode, and the
  * history sidebar's width/visibility. Each
  * one used to be its own copy-pasted `loadX`/`saveX` pair in `appStore.ts`;
  * `definePersistedSettings` is the one place that shape lives now, so a new
@@ -8,13 +8,11 @@
  */
 import {
   DEFAULT_DIARIZE_SETTINGS,
-  DEFAULT_VAD_SETTINGS,
   DEFAULT_AUDIO_EVENT_SETTINGS,
   DEFAULT_HALLUCINATION_SETTINGS,
 } from "../lib/asr";
 import type {
   DiarizeSettings,
-  VadSettings,
   AudioEventSettings,
   HallucinationSettings,
   TranscriptionTask,
@@ -159,13 +157,6 @@ const diarizeSettings = definePersistedSettings<DiarizeSettings>(
 );
 export const loadDiarizeSettings = diarizeSettings.load;
 export const saveDiarizeSettings = diarizeSettings.save;
-
-const vadSettings = definePersistedSettings<VadSettings>("vad-settings", DEFAULT_VAD_SETTINGS, (parsed, d) => ({
-  enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
-  threshold: typeof parsed.threshold === "number" ? parsed.threshold : d.threshold,
-}));
-export const loadVadSettings = vadSettings.load;
-export const saveVadSettings = vadSettings.save;
 
 /** Same persistence shape as the settings above. Ranges are sanity-clamped
  * rather than type-checked alone: a stray negative or zero value read back

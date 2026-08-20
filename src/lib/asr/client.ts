@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AsrDevice, TranscriptChunk, TranscriptionTask } from "./types";
 import { logPcmStats, logResultHealth } from "./diagnostics";
@@ -9,19 +9,12 @@ import {
   mockAudioEvents,
   mockDurationSec,
   mockIdFromPath,
-  mockRefinedResult,
 } from "../mock/fixtures";
 
 export interface AsrClientHandlers {
   onDeviceInfo?: (device: AsrDevice) => void;
   onModelReady?: () => void;
   onError?: (message: string) => void;
-  /** `percent` is 0-100, while the second pass re-reads a finished recording.
-   * `jobId` identifies which recording's pass this progress belongs to --
-   * more than one can be queued/running at once (`src/store/analysisQueue.ts`),
-   * so the event itself has to say which one it's for rather than the
-   * frontend inferring it from "the" pass currently running. */
-  onRefineProgress?: (jobId: string, percent: number) => void;
 }
 
 export interface TranscribeOptions {
@@ -64,10 +57,7 @@ export interface SilenceMark {
 export interface TranscribeResult {
   text: string;
   chunks: TranscriptChunk[];
-  /** True when VAD was requested but its model file was missing, so the pass
-   * ran without it. Only ever set by `transcribeRecording`. */
-  vadUnavailable?: boolean;
-  /** All-zero from `transcribeWindow`; filled in by `transcribeRecording`. */
+  /** All-zero from `transcribeWindow`; filled in by `finalizeTranscript`. */
   quality?: QualityReport;
   /** Parallel to `chunks` (same index, same length), from
    * `asr::mark_silent_segments`. Empty from `transcribeWindow`, which never
@@ -82,12 +72,10 @@ export interface TranscribeResult {
  * transcription, not a decoding parameter.
  */
 export interface DiarizeSettings {
-  /** On by default -- see `diarize::DiarizeSettings` for why. Relies on
-   * `collect_segments`'s `vad` parameter keeping cue timestamps off
-   * whisper.cpp's VAD-compressed timeline: diarization assigns speakers
-   * purely by overlapping these timestamps against diarizer segments, so a
-   * wrong timeline would produce confidently wrong labels, not just missing
-   * ones. */
+  /** On by default -- see `diarize::DiarizeSettings` for why. Diarization
+   * assigns speakers purely by overlapping whisper's own cue timestamps
+   * against diarizer segments, so a wrong timeline would produce confidently
+   * wrong labels, not just missing ones. */
   enabled: boolean;
   threshold: number;
   /** -1 = estimate the speaker count automatically. */
@@ -113,26 +101,6 @@ export const DEFAULT_DIARIZE_SETTINGS: DiarizeSettings = {
 export const DIARIZATION_MODEL_UNAVAILABLE = "__diarization_model_unavailable__";
 
 /**
- * Voice-activity-detection knobs for the second pass, mirroring the
- * `vad_*` fields of `asr::DecodeSettings` in Rust. Only ever applied to
- * `transcribeRecording`: the live pass already gates near-silent windows on
- * the frontend (see `diagnostics.isNearSilent`), so a second, heavier filter
- * there would mostly add model-load cost without much left to catch.
- */
-export interface VadSettings {
-  /** On by default: the whole-file second pass cannot skip silence on the way
-   * in (a meeting's pauses sit in the middle of audio it still has to decode
-   * as one piece), which is exactly the case VAD helps most. */
-  enabled: boolean;
-  threshold: number;
-}
-
-export const DEFAULT_VAD_SETTINGS: VadSettings = {
-  enabled: true,
-  threshold: 0.5,
-};
-
-/**
  * User-adjustable knobs for the two anti-hallucination gates documented in
  * the README ("反復ループ対策", "無音のウィンドウはモデルに渡さない"): raising
  * either trades some accuracy for fewer degenerate-loop/stock-phrase outputs
@@ -141,8 +109,8 @@ export const DEFAULT_VAD_SETTINGS: VadSettings = {
 export interface HallucinationSettings {
   /**
    * RMS amplitude below which audio is treated as silence. Mirrors
-   * `asr::SILENCE_RMS` in Rust and gates three places at once: the live pass
-   * skips a window outright (`diagnostics.isNearSilent`), the whole-file pass
+   * `asr::SILENCE_RMS` in Rust and gates three places at once: the streaming
+   * pass skips a window outright (`diagnostics.isNearSilent`), `finalize_transcript`
    * flags a segment as silent after decoding (`asr::mark_silent_segments`),
    * and it decides whether a gap between cues is worth re-decoding
    * (`asr::redecode_voiced_gaps`). Kept as one value rather than three so the
@@ -204,11 +172,6 @@ interface ModelReadyPayload {
 
 interface AsrErrorPayload {
   message: string;
-}
-
-interface RefineProgressPayload {
-  jobId: string;
-  percent: number;
 }
 
 // --- Mock backend (see ../env.ts) --------------------------------------
@@ -279,9 +242,6 @@ export class AsrClient {
       await listen<AsrErrorPayload>("asr:model-error", (event) => {
         this.handlers.onError?.(event.payload.message);
       }),
-      await listen<RefineProgressPayload>("asr:refine-progress", (event) => {
-        this.handlers.onRefineProgress?.(event.payload.jobId, event.payload.percent);
-      }),
     );
 
     try {
@@ -318,44 +278,37 @@ export class AsrClient {
   }
 
   /**
-   * Re-transcribes a finished recording in one pass over the whole file.
+   * Runs the repair/analysis tail (`redecode_degenerate_loops`,
+   * `redecode_voiced_gaps`, `mark_silent_segments`/`cues::analyze`) over a
+   * chunk list already produced by windowed decoding, plus the finished
+   * recording's own WAV -- see `asr::finalize_transcript`'s doc comment.
    *
-   * Slower than the live pass and worth it: the model sees the recording as one
-   * continuous piece instead of a series of 15-second windows, so sentences that
-   * straddled a window boundary are decoded intact. Progress arrives via
-   * `onRefineProgress`.
+   * `chunks` must already carry recording-absolute timestamps (0-based on
+   * the start of the WAV at `path`), not window- or segment-relative ones --
+   * see `flattenSegmentsToChunks` in `recordingPipeline.ts`.
    */
-  async transcribeRecording(
+  async finalizeTranscript(
     path: string,
     jobId: string,
+    chunks: TranscriptChunk[],
     options: TranscribeOptions = {},
-    vad: VadSettings = DEFAULT_VAD_SETTINGS,
     hallucination: HallucinationSettings = DEFAULT_HALLUCINATION_SETTINGS,
   ): Promise<TranscribeResult> {
     if (useMockBackend) {
-      // A few ticks with a delay between each, so this job's progress (and
-      // the history row's progress bar / titlebar readout it drives -- see
-      // `analysisQueue.ts`'s `setProgress`) has something to visibly animate
-      // rather than jumping straight to 100.
-      for (const percent of [15, 35, 60, 85, 100]) {
-        await wait(350);
-        if (this.mockCancelled.has(jobId)) throw new Error(ANALYSIS_CANCELLED);
-        this.handlers.onRefineProgress?.(jobId, percent);
-      }
-      // Spread over the recording's real length, so the resulting segments
-      // land at plausible timestamps and clicking one actually seeks
-      // somewhere -- see `mockRefinedResult`.
-      return mockRefinedResult(mockDurationSec(mockIdFromPath(path)));
+      await wait(300);
+      if (this.mockCancelled.has(jobId)) throw new Error(ANALYSIS_CANCELLED);
+      // No real repair to run in the mock backend -- pass the assembled
+      // chunks through unchanged so the caller's pipeline still behaves.
+      return { text: chunks.map((c) => c.text).join(""), chunks };
     }
 
-    const result = await invoke<TranscribeResult>("transcribe_recording", {
+    const result = await invoke<TranscribeResult>("finalize_transcript", {
       path,
       jobId,
+      chunks,
       language: options.language ?? null,
       task: options.task ?? null,
       prompt: options.glossary?.trim() ? options.glossary : null,
-      vad: vad.enabled,
-      vadThreshold: vad.threshold,
       entropyThold: options.entropyThold ?? hallucination.entropyThold,
       silenceRms: hallucination.silenceRms,
     });
@@ -364,13 +317,43 @@ export class AsrClient {
   }
 
   /**
+   * Streams a finished recording's PCM to the caller in bounded chunks, for
+   * `transcribeWavPostHoc` (`postHocTranscriber.ts`) to feed through the same
+   * windowed `StreamingTranscriber` the live pass uses. `fromSec` skips
+   * already-analyzed audio server-side, so resuming a cancelled pass does not
+   * re-cross the IPC boundary with audio the caller already has.
+   */
+  async readWavPcm(
+    path: string,
+    jobId: string,
+    fromSec: number,
+    onChunk: (chunk: Float32Array) => void,
+  ): Promise<void> {
+    if (useMockBackend) {
+      // Two short fabricated chunks are enough to exercise the driver's
+      // windowing/commit logic without a real WAV to read from.
+      await wait(100);
+      onChunk(new Float32Array(WHISPER_SAMPLE_RATE * 5));
+      await wait(100);
+      if (this.mockCancelled.has(jobId)) throw new Error(ANALYSIS_CANCELLED);
+      onChunk(new Float32Array(WHISPER_SAMPLE_RATE * 5));
+      return;
+    }
+
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (buffer) => onChunk(new Float32Array(buffer));
+    await invoke("read_wav_pcm", { path, jobId, fromSec, channel });
+  }
+
+  /**
    * Clears any leftover cancellation for `jobId`, at the head of an analysis
    * pass.
    *
-   * Called by `runAccuracyPipeline` -- the single entry point both the
-   * post-stop second pass and history re-analysis go through -- so a cancel
-   * that arrived too late to stop the previous pass for this job cannot kill
-   * the next one on sight. Other jobs' flags are untouched.
+   * Called at the head of every post-stop analysis pass (`refineRecording`
+   * for live "record and analyze" mode, `runPostHocAnalysis` for record-only
+   * deferred analysis and history re-analysis) so a cancel that arrived too
+   * late to stop the previous pass for this job cannot kill the next one on
+   * sight. Other jobs' flags are untouched.
    */
   async beginAnalysis(jobId: string): Promise<void> {
     if (useMockBackend) {
@@ -383,9 +366,9 @@ export class AsrClient {
   /**
    * Asks `jobId`'s running analysis pass to stop. Resolves as soon as the
    * backend flag is set, *not* when the pass has actually wound down: the
-   * in-flight `transcribeRecording`/`diarizeRecording`/`detectAudioEvents`
-   * promise is what eventually rejects with `ANALYSIS_CANCELLED`. Other jobs
-   * keep running unaffected.
+   * in-flight `readWavPcm`/`finalizeTranscript`/`diarizeRecording`/
+   * `detectAudioEvents` promise is what eventually rejects with
+   * `ANALYSIS_CANCELLED`. Other jobs keep running unaffected.
    */
   async cancelAnalysis(jobId: string): Promise<void> {
     if (useMockBackend) {
@@ -399,7 +382,8 @@ export class AsrClient {
    * Removes `jobId`'s cancellation flag once its analysis pass has fully
    * wound down (success, failure, or cancellation) -- hygiene so the
    * backend's job map does not grow for every recording ever analyzed over
-   * the app's lifetime. Called from `runAccuracyPipeline`'s own `finally`.
+   * the app's lifetime. Called from `refineRecording`'s/`runPostHocAnalysis`'s
+   * own `finally`.
    */
   async endAnalysis(jobId: string): Promise<void> {
     if (useMockBackend) {

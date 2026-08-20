@@ -1,7 +1,7 @@
 //! Minimal RIFF/WAVE I/O for 16 kHz mono audio.
 //!
 //! Deliberately dependency-free, and deliberately shared: the live capture
-//! writer, the second transcription pass, and the accuracy harness
+//! writer, the post-hoc transcription driver, and the accuracy harness
 //! (`examples/cer.rs`) all go through here. If the harness parsed WAVs
 //! differently from the app, a CER measured on a fixture would say nothing about
 //! what users actually get.
@@ -9,6 +9,9 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::AppHandle;
 
 pub const SAMPLE_RATE: u32 = 16_000;
 
@@ -122,6 +125,60 @@ pub fn read(path: &Path) -> Result<Vec<f32>, String> {
         .chunks_exact(n)
         .map(|frame| frame.iter().sum::<f32>() / n as f32)
         .collect())
+}
+
+/// How many samples (~1 minute of 16kHz mono) go into one streamed chunk of
+/// [`read_wav_pcm`]. Bounds any single IPC payload without adding meaningful
+/// round-trip overhead over an hour-long recording (~60 chunks).
+const STREAM_CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * 60;
+
+fn f32_to_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    bytes
+}
+
+/// Streams a WAV's samples to the frontend in bounded chunks, for the
+/// post-hoc transcription driver (`transcribeWavPostHoc` on the frontend) to
+/// feed through the same windowed decoding the live streaming pass uses.
+///
+/// Goes through [`read`] rather than a browser-side WAV/PCM decoder so this
+/// stays on the one code path this module's own doc comment requires --
+/// `read`'s salvage logic for a data chunk truncated mid-crash has no
+/// guaranteed equivalent in a generic decoder, and this app has already had
+/// to fix a real accuracy bug caused by exactly this kind of drift (see
+/// `571439d` in the project history).
+///
+/// `from_sec` skips already-analyzed audio server-side, so resuming a
+/// previously-cancelled pass on a long recording does not re-cross the IPC
+/// boundary with audio the caller already has. Follows the same
+/// `Channel<InvokeResponseBody>` streaming pattern as
+/// `appaudio::start_app_audio_capture`.
+#[tauri::command]
+pub async fn read_wav_pcm(
+    app: AppHandle,
+    path: String,
+    job_id: String,
+    from_sec: f32,
+    channel: Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    let cancel = crate::cancel::flag(&app, &job_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::cancel::check(&cancel)?;
+        let samples = read(Path::new(&path))?;
+        let from = (((from_sec.max(0.0)) * SAMPLE_RATE as f32) as usize).min(samples.len());
+        for chunk in samples[from..].chunks(STREAM_CHUNK_SAMPLES) {
+            crate::cancel::check(&cancel)?;
+            channel
+                .send(InvokeResponseBody::Raw(f32_to_le_bytes(chunk)))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// How long a WAV runs, read from its 44-byte header rather than its samples.

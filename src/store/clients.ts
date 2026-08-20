@@ -17,7 +17,6 @@ import { AppAudioClient, onAudioDeviceChange } from "../lib/audio";
 import { startSleepWatch } from "../lib/sleepWatch";
 import { watchPowerSource } from "../lib/power";
 import { useAppStore } from "./appStore";
-import { setProgress } from "./analysisQueue";
 
 // One instance shared by the app-list refresh and the actual capture start/stop:
 // listing apps touches neither the Channel nor the error listener the capture
@@ -27,10 +26,6 @@ export const appAudioClient = new AppAudioClient();
 export const asrClient = new AsrClient({
   onModelReady: () => useAppStore.setState({ modelStatus: "ready" }),
   onError: (message) => useAppStore.setState({ modelStatus: "error", errorMessage: message }),
-  // Routed straight to the job it belongs to -- see `analysisQueue.ts`'s
-  // `setProgress` for why a late/stray event for a job that has since moved
-  // on (or been removed) is safely ignored there rather than here.
-  onRefineProgress: (jobId, percent) => setProgress(jobId, percent),
 });
 
 // Keeps the settings dropdown in sync when a microphone is plugged or

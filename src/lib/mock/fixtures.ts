@@ -24,7 +24,6 @@
  */
 import type { AudioAppInfo } from "../audio/appAudio";
 import type { AudioEvent } from "../asr/client";
-import type { TranscriptChunk } from "../asr/types";
 import type { StoredRecording } from "../history";
 import type { TranscriptSegment } from "../transcript";
 
@@ -114,33 +113,6 @@ export const MOCK_NATIVE_FEATURE_UNAVAILABLE =
 export const MOCK_BADGE_TITLE =
   "バックエンド無しのブラウザプレビューです。文字起こし・再生音・保存は実際には行われません";
 
-// --- Transcription ------------------------------------------------------
-
-const MOCK_REFINED_SENTENCES = [
-  "（モック）精度向上パスが完了した想定の文字起こしです。",
-  "（モック）バックエンドに接続していないため、実際の音声内容は反映されていません。",
-  "（モック）行をクリックすると、その位置に再生がシークします。",
-  "（モック）話者分離を有効にすると、行ごとに話者ラベルが付きます。",
-];
-
-/**
- * A whole-recording result spread across `durationSec`, one chunk per
- * sentence.
- *
- * The single `[0, 3]` chunk this replaced made every take collapse to one
- * transcript line no matter how long it was, which left the parts of the UI
- * that key off chunk timestamps -- seeking from a line, the active-line
- * highlight, per-line speaker labels, SRT output -- with nothing to exercise.
- */
-export function mockRefinedResult(durationSec: number): { text: string; chunks: TranscriptChunk[] } {
-  const span = Math.max(1, durationSec) / MOCK_REFINED_SENTENCES.length;
-  const chunks = MOCK_REFINED_SENTENCES.map((text, i): TranscriptChunk => ({
-    text,
-    timestamp: [i * span, (i + 1) * span],
-  }));
-  return { text: MOCK_REFINED_SENTENCES.join(""), chunks };
-}
-
 // --- Audio events -------------------------------------------------------
 
 const MOCK_EVENT_NAMES = ["Speech", "Applause", "Typing", "Laughter"];
@@ -216,8 +188,8 @@ export function seedMockRecordings(): Array<[string, StoredRecording]> {
     language: "ja",
     transcribed: true,
     usedDiarize: true,
-    usedVad: true,
     usedAudioEvents: true,
+    analyzedThroughSec: analyzedDurationSec,
     segments: [
       segment(1, 0, 12, "（モック）週次定例を始めます。今週の進捗から共有してください。", 0),
       segment(2, 12, 18, "（モック）はい、先週の課題だった読み込み速度は改善済みです。", 1),
@@ -237,8 +209,8 @@ export function seedMockRecordings(): Array<[string, StoredRecording]> {
     // the sidebar's "未解析" badge and its 解析 button key off.
     transcribed: false,
     usedDiarize: false,
-    usedVad: false,
     usedAudioEvents: false,
+    analyzedThroughSec: 0,
     segments: [],
     audioEvents: [],
   };

@@ -70,7 +70,7 @@ Invoke-WebRequest -Uri "https://huggingface.co/ggerganov/whisper.cpp/resolve/mai
 計約2.6GB）が残っていることがある。** これは現在のバックエンドからは一切参照されない死んだファイルなので、
 削除してよい（`whisper-large-v3-turbo/` だけ残す）。`tauri.conf.json` の `bundle.resources` は
 `resources/models/whisper-large-v3-turbo/**/*` だけを明示的に指定しており、この配下に無いものはどのみち
-インストーラには入らない。**新しいモデル（VAD、話者分離、音響イベント検出など）を追加するときは、この
+インストーラには入らない。**新しいモデル（話者分離、音響イベント検出など）を追加するときは、この
 `bundle.resources` の配列にそのモデルのディレクトリを明示的に追記すること。** `resources/models/**/*` の
 ような広い glob に戻すと、リポジトリの手元に置いた不要なモデルまで気づかず同梱してしまう
 （実際に旧実装のモデルで3.2GBまで膨らんでいた）。
@@ -145,31 +145,6 @@ cmake --build . --config Release --target install
 （`scripts/win-build-env.bat` が設定されていれば表示するだけで、必須にはしていない — 通常のビルドは
 今までどおり CPU 版で問題なく動くため）。`scripts/copy-sherpa-dlls.ps1` は `DirectML.dll` が存在すれば
 追加でコピーする（無くてもエラーにはしない）。
-
-### VAD モデルの配置（任意機能・既定で有効）
-
-停止後の精度向上パスで無音区間を除く音声区間検出（VAD）に使う。**設定パネルでは既定オン**だが、モデルファイル
-が無くても文字起こし自体は失敗しない — 見つからない場合は VAD 無しで続行し、その旨を画面に表示する
-（`asr::transcribe_recording` の `vad_unavailable`）。
-
-```powershell
-$dest = "src-tauri/resources/models/vad"
-New-Item -ItemType Directory -Force $dest | Out-Null
-Invoke-WebRequest -Uri "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" -OutFile "$dest/ggml-silero-v5.1.2.bin"
-```
-
-- Silero VAD の ggml 移植版（約864KB）。whisper.cpp の `full()` 呼び出しに内蔵の VAD として統合されており、
-  非音声区間を除いた上でタイムスタンプの再マッピングまで面倒を見てくれる。自前で区間を切り出して繋ぎ直す
-  実装は不要。
-- **効果は実測で限定的だった。** 15秒の完全な無音に対しては、VAD の有無に関わらず `mark_silent_segments`
-  （音声のRMSで無音セグメントにフラグを立てる既存の仕組み）が同じ結果（全セグメントに無音フラグ）を返す。
-  一方、無音区間に合成的な広帯域ノイズ（音声ではないが完全な無音でもない）を混ぜたケースでは、VAD を
-  有効にしても「ご視聴ありがとうございました」という定番の幻覚が抑えられなかった（`mark_silent_segments`
-  も同様。RMS がしきい値を超えるため無音とは判定されない）。**確認できた効果は速度面**: 15秒の無音入力で
-  VAD無し 約11秒 → VAD有り 約1.8秒（デコード対象が大幅に短縮されるため）。実音声での精度への影響は
-  フィクスチャが無いため未測定。
-- **これは「音楽やノイズを除く」機能ではない。** VAD が対象にするのは「音声か非音声か」の判定であり、
-  雑音か音楽かといった種別の判定はしない（そちらは次の音響イベント検出の役割）。
 
 ### 音響イベント検出モデルの配置（任意機能）
 

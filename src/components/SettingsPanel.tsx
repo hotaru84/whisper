@@ -30,8 +30,8 @@ const GLOSSARY_LIMIT = 200;
  * A 0-1 threshold, shown as a slider and its numeric readout together --
  * the slider gives an immediate sense of range a bare number does not, the
  * number stays for anyone who wants to type an exact value. Reused across
- * VAD/diarization/audio-event thresholds, the three places this app asks for
- * a probability cutoff.
+ * diarization/audio-event thresholds, the places this app asks for a
+ * probability cutoff.
  */
 function ThresholdControl({
   id,
@@ -84,8 +84,6 @@ export function SettingsPanel() {
   const updateSettings = useAppStore((s) => s.updateSettings);
   const diarizeSettings = useAppStore((s) => s.diarizeSettings);
   const updateDiarizeSettings = useAppStore((s) => s.updateDiarizeSettings);
-  const vadSettings = useAppStore((s) => s.vadSettings);
-  const updateVadSettings = useAppStore((s) => s.updateVadSettings);
   const hallucinationSettings = useAppStore((s) => s.hallucinationSettings);
   const updateHallucinationSettings = useAppStore((s) => s.updateHallucinationSettings);
   const audioEventSettings = useAppStore((s) => s.audioEventSettings);
@@ -243,7 +241,7 @@ export function SettingsPanel() {
             <p className="text-xs text-muted-foreground">
               無音や低SNRのノイズに対して whisper が定型句を作文したり、同じ語句を繰り返す「幻覚」を起こす
               ことがあります。以下は事前の値をコンソールログ（<code>rms=</code>）で確認したうえで、
-              当て推量ではなく実測に基づいて調整してください。逐次パス・精度向上パスの両方に反映されます。
+              当て推量ではなく実測に基づいて調整してください。逐次パス・解析（停止後の仕上げ処理）の両方に反映されます。
             </p>
 
             <div className="flex flex-col gap-1.5">
@@ -251,7 +249,7 @@ export function SettingsPanel() {
                 <Label htmlFor="silence-rms-input">無音判定の RMS しきい値</Label>
                 <InfoTooltip>
                   この値を下回る音量の区間は「無音」として扱われ、逐次パスではモデルに渡さずスキップし、
-                  精度向上パスでは文字起こし後に無音フラグを付けます（削除はされません）。上げすぎると
+                  解析では文字起こし後に無音フラグを付けます（削除はされません）。上げすぎると
                   小さな声を無音側に倒してしまうため、静かな区間で実測した <code>rms=</code> の値のすぐ下まで
                   だけ上げるのが安全です（既定 0.001）。
                 </InfoTooltip>
@@ -303,38 +301,10 @@ export function SettingsPanel() {
       </AccordionItem>
 
       <AccordionItem value="accuracy">
-        <AccordionTrigger>精度向上パス</AccordionTrigger>
+        <AccordionTrigger>話者分離・音響イベント検出</AccordionTrigger>
         <AccordionContent>
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2">
-                <Switch
-                  id="vad-enabled"
-                  checked={vadSettings.enabled}
-                  onCheckedChange={(checked) => updateVadSettings({ enabled: checked })}
-                />
-                <Label htmlFor="vad-enabled">無音区間を検出して除く（VAD）</Label>
-                <InfoTooltip>
-                  録音停止後の精度向上パスにのみ効きます。会議中の「間」を音声区間検出で先に取り除いてから
-                  文字起こしすることで、無音での幻覚（架空の発言）を抑え、処理も速くなります。逐次表示中は
-                  別の仕組み（音量ベースの無音スキップ）が既に効いているため対象外です。
-                </InfoTooltip>
-              </div>
-
-              {vadSettings.enabled && (
-                <div className="pl-6">
-                  <ThresholdControl
-                    id="vad-threshold"
-                    label="検出の閾値"
-                    value={vadSettings.threshold}
-                    onChange={(threshold) => updateVadSettings({ threshold })}
-                    tooltip="高くするほど発話とみなす基準が厳しくなり、小さな声を無音側に倒しやすくなります（既定 0.5）。"
-                  />
-                </div>
-              )}
-            </div>
-
-            <div className="flex flex-col gap-2 border-t border-border pt-4">
               <div className="flex items-center gap-2">
                 <Switch
                   id="diarize-enabled"
@@ -343,7 +313,7 @@ export function SettingsPanel() {
                 />
                 <Label htmlFor="diarize-enabled">話者分離を行う</Label>
                 <InfoTooltip>
-                  録音停止後の精度向上パスに続けて、声の特徴から発言者を推定し「話者1」「話者2」のように
+                  録音停止後の解析で、声の特徴から発言者を推定し「話者1」「話者2」のように
                   ラベルを付けます。録音全体を見る必要があるため録音中には効きません。追加のモデル読み込みで
                   停止後の待ち時間が延びます。
                 </InfoTooltip>
@@ -438,7 +408,7 @@ export function SettingsPanel() {
                 />
                 <Label htmlFor="audio-event-enabled">音響イベントを検出する</Label>
                 <InfoTooltip>
-                  録音停止後の精度向上パスに続けて、音楽・拍手・ノイズなどを検出し、下の「音響イベント」欄に
+                  録音停止後の解析で、音楽・拍手・ノイズなどを検出し、下の「音響イベント」欄に
                   時刻付きで一覧表示します。文字起こし本文には反映されません。会話が検出されない区間は
                   文字起こしの対象から除外されます。
                 </InfoTooltip>

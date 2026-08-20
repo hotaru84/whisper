@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::{InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadParams};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 /// Holds the loaded whisper.cpp model for the lifetime of the app. `None` until
 /// `init_model` succeeds.
@@ -80,11 +80,6 @@ fn build_backend() -> &'static str {
 fn resolve_model_path(app: &AppHandle) -> Result<PathBuf, String> {
     let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
     Ok(resource_dir.join("resources/models/whisper-large-v3-turbo/model.gguf"))
-}
-
-fn resolve_vad_model_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
-    Ok(resource_dir.join("resources/models/vad/ggml-silero-v5.1.2.bin"))
 }
 
 /// Silences whisper.cpp's and ggml's own stdout/stderr logging.
@@ -184,7 +179,7 @@ pub async fn init_model(app: AppHandle) -> Result<(), String> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TranscribeChunk {
     pub text: String,
     pub timestamp: (f32, f32),
@@ -195,24 +190,18 @@ pub struct TranscribeChunk {
 pub struct TranscribeResult {
     pub text: String,
     pub chunks: Vec<TranscribeChunk>,
-    /// True when the caller asked for VAD but the model file was missing, so
-    /// decoding proceeded without it. Always `false` from `transcribe_window`,
-    /// which never requests VAD. Kept on the result rather than turned into an
-    /// error: VAD is an optional accuracy nudge, and its absence must not take
-    /// down the transcription it was supposed to improve.
-    #[serde(default)]
-    pub vad_unavailable: bool,
     /// Reference-free structural metrics (gaps, out-of-order cues) computed
     /// over `chunks`. `transcribe_window` leaves this at its all-zero default
-    /// since a 15s window is too short for the metrics to mean anything;
-    /// `transcribe_recording` fills it in. See `crate::cues` for what each
+    /// since a 30s window is too short for the metrics to mean anything;
+    /// `finalize_transcript` fills it in. See `crate::cues` for what each
     /// field catches.
     #[serde(default)]
     pub quality: crate::cues::QualityReport,
     /// Parallel to `chunks` (same index, same length once populated) --
     /// `silence[i]` describes whether `chunks[i]` was judged to hold no
     /// speech by `mark_silent_segments`. Empty from `transcribe_window`,
-    /// which never calls it. A parallel array rather than fields on
+    /// which never calls it; `finalize_transcript` fills it in. A parallel
+    /// array rather than fields on
     /// `TranscribeChunk` itself, matching how diarization speakers and
     /// audio-event exclusion also ride alongside `chunks` by index.
     #[serde(default)]
@@ -275,27 +264,6 @@ pub struct DecodeSettings {
     /// (WHISPER_HISTORY_CONDITIONING_TEMP_CUTOFF), so it stops helping exactly
     /// when decoding is already struggling.
     pub prompt: Option<String>,
-    /// Path to a Silero VAD ggml model. `None` disables VAD entirely -- and is
-    /// the only thing gating it: there is no separate `vad: bool`, because
-    /// whisper-rs's `enable_vad(true)` panics if no model path has been set
-    /// first, and folding the switch into this `Option` makes that call
-    /// impossible to reach.
-    ///
-    /// Left `None` by default (i.e. for the live pass, `transcribe_window`):
-    /// its windows are already gated on the frontend by an RMS silence check
-    /// before they ever reach here, so a second, heavier filter adds model-load
-    /// cost without much left to catch. The whole-file second pass is the
-    /// opposite case -- it cannot skip silence on the way in, since a meeting's
-    /// pauses sit in the middle of audio that still has to be decoded as one
-    /// piece -- so `transcribe_recording` fills this in by default. See
-    /// `mark_silent_segments` for the RMS-based safety net that stays regardless.
-    pub vad_model_path: Option<String>,
-    pub vad_threshold: f32,
-    pub vad_min_speech_duration_ms: i32,
-    pub vad_min_silence_duration_ms: i32,
-    pub vad_max_speech_duration_s: f32,
-    pub vad_speech_pad_ms: i32,
-    pub vad_samples_overlap: f32,
     /// whisper.cpp uses this threshold in two places that pull in opposite
     /// directions, both gated jointly with `logprob_thold`:
     ///
@@ -341,16 +309,6 @@ impl Default for DecodeSettings {
             suppress_nst: false,
             n_threads: default_n_threads(),
             prompt: None,
-            vad_model_path: None,
-            // Mirrors whisper_rs::WhisperVadParams::default() so a caller that
-            // only sets vad_model_path (the common case) gets whisper.cpp's own
-            // tuning, not silently different numbers.
-            vad_threshold: 0.5,
-            vad_min_speech_duration_ms: 250,
-            vad_min_silence_duration_ms: 100,
-            vad_max_speech_duration_s: f32::MAX,
-            vad_speech_pad_ms: 30,
-            vad_samples_overlap: 0.1,
             // whisper.cpp's own defaults (whisper.cpp:5955-5956) -- unchanged
             // until a run with a different value is measured to help (see the
             // field doc comments).
@@ -403,21 +361,6 @@ pub fn build_full_params(settings: &DecodeSettings) -> FullParams<'_, '_> {
             params.set_initial_prompt(prompt);
         }
     }
-    // Order matters: enable_vad(true) panics if no model path has been set yet,
-    // so the path always goes first. See the field doc on vad_model_path for
-    // why absence of a path is the only way VAD gets disabled here.
-    if let Some(vad_model_path) = settings.vad_model_path.as_deref() {
-        params.set_vad_model_path(Some(vad_model_path));
-        params.enable_vad(true);
-        let mut vad_params = WhisperVadParams::new();
-        vad_params.set_threshold(settings.vad_threshold);
-        vad_params.set_min_speech_duration(settings.vad_min_speech_duration_ms);
-        vad_params.set_min_silence_duration(settings.vad_min_silence_duration_ms);
-        vad_params.set_max_speech_duration(settings.vad_max_speech_duration_s);
-        vad_params.set_speech_pad(settings.vad_speech_pad_ms);
-        vad_params.set_samples_overlap(settings.vad_samples_overlap);
-        params.set_vad_params(vad_params);
-    }
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
@@ -465,7 +408,6 @@ pub fn collect_segments(state: &whisper_rs::WhisperState) -> Result<TranscribeRe
     Ok(TranscribeResult {
         text,
         chunks,
-        vad_unavailable: false,
         quality: crate::cues::QualityReport::default(),
         silence: Vec::new(),
     })
@@ -545,13 +487,6 @@ pub async fn transcribe_window(
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RefineProgressPayload {
-    job_id: String,
-    percent: i32,
 }
 
 /// RMS amplitude below which audio is treated as holding no speech.
@@ -804,14 +739,15 @@ fn find_degenerate_runs(chunks: &[TranscribeChunk]) -> Vec<std::ops::Range<usize
 /// Text-context budget for a degenerate-loop repair decode, in tokens
 /// (`whisper_full_params.n_max_text_ctx`).
 ///
-/// whisper.cpp's whole-file pass conditions each ~30s chunk on the previous
-/// chunk's decoded tokens (see `transcribe_recording`'s doc comment) --
-/// ordinarily the pass's whole advantage over the live pass, but its failure
-/// mode too: once a chunk decodes into a short repeated phrase, that phrase
-/// becomes the next chunk's own context, and self-similar context makes the
-/// decoder reproduce it again, filling the rolling context with copies of
-/// itself. A fresh `WhisperState` (as `redecode_voiced_gaps` already uses)
-/// removes that stale context once, but if a repaired span were long enough
+/// A degenerate run being repaired can itself span more than whisper's own
+/// ~30s internal chunk size, in which case the repair decode conditions its
+/// own later chunks on its own earlier ones (whisper.cpp's normal
+/// context-carrying behavior within one `full()` call): once a chunk decodes
+/// into a short repeated phrase, that phrase becomes the next chunk's own
+/// context, and self-similar context makes the decoder reproduce it again,
+/// filling the rolling context with copies of itself. A fresh `WhisperState`
+/// (as `redecode_voiced_gaps` already uses) removes stale context from
+/// *outside* the span once, but if a repaired span were long enough
 /// to itself span an internal 30s boundary, the same self-reinforcement could
 /// restart inside the repair decode. Capping the context budget low (64) keeps
 /// too little of any one internal chunk's output alive for it to dominate the
@@ -986,40 +922,37 @@ pub fn redecode_degenerate_loops(
     Ok(splice_repairs(chunks, &runs, repairs))
 }
 
-/// Re-transcribes a finished recording in one pass over the whole file.
+/// Runs the repair/analysis tail over a chunk list already produced by
+/// windowed decoding (either the live streaming pass or the post-hoc
+/// windowed driver), plus the finished recording's own WAV.
 ///
-/// This is the accuracy pass. The live pass has to show text while the user is
-/// still talking, so it decodes 15-second windows independently and can never
-/// see past the edges of one; every window boundary is a place a sentence can be
-/// cut in half and both halves guessed wrong. Here the recording is over, so the
-/// entire file goes into a single `full()` call: whisper.cpp splits it into its
-/// native 30-second chunks and carries the decoded token context from each chunk
-/// into the next, which is exactly the context the live pass cannot have.
+/// This used to be the tail end of a single whole-file `full()` call (the old
+/// "accuracy pass"). Splitting it out lets it apply identically no matter how
+/// `chunks` was decoded -- one call for a whole file, or many independent
+/// ~30s windows stitched together -- since none of `redecode_degenerate_loops`,
+/// `redecode_voiced_gaps`, or `mark_silent_segments` assume a single
+/// contiguous seek loop; they only need `chunks` sorted, non-overlapping, and
+/// on the same absolute timeline as `samples`.
 ///
-/// Cost is roughly 2 seconds of GPU time per 30 seconds of audio, so about four
-/// minutes for a one-hour meeting -- hence the progress events.
-///
-/// The glossary conditions the first chunk only; from there whisper's own
-/// decoded context takes over (whisper.cpp's `carry_initial_prompt` would extend
-/// it to every chunk, but whisper-rs does not expose it).
+/// `chunks` must already carry recording-absolute timestamps (0-based on the
+/// start of the WAV at `path`), not window-relative ones -- the caller is
+/// responsible for that rebasing (see `flattenSegmentsToChunks` on the
+/// frontend).
 #[tauri::command]
-pub async fn transcribe_recording(
+pub async fn finalize_transcript(
     app: AppHandle,
     path: String,
     job_id: String,
+    chunks: Vec<TranscribeChunk>,
     language: Option<String>,
     task: Option<String>,
     prompt: Option<String>,
-    vad: bool,
-    vad_threshold: f32,
     entropy_thold: f32,
     silence_rms: f32,
 ) -> Result<TranscribeResult, String> {
     let language = language.filter(|l| !l.is_empty() && l != "auto");
     let translate = task.as_deref() == Some("translate");
     let prompt = prompt.filter(|p| !p.trim().is_empty());
-    let app_for_progress = app.clone();
-    let job_id_for_progress = job_id.clone();
     let cancel = crate::cancel::flag(&app, &job_id);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -1028,8 +961,6 @@ pub async fn transcribe_recording(
         if samples.is_empty() {
             return Err(format!("{path} contains no audio"));
         }
-        // Reading an hour of WAV is not instant, and the lock below is not
-        // taken yet, so this is the cheapest possible place to give up.
         crate::cancel::check(&cancel)?;
 
         let state = app.state::<AsrState>();
@@ -1037,79 +968,15 @@ pub async fn transcribe_recording(
         let ctx = guard
             .as_ref()
             .ok_or_else(|| "model is not initialized".to_string())?;
-        let mut whisper_state = ctx.create_state().map_err(|e| e.to_string())?;
-
-        // Unlike diarization (a separate command call that can fail without
-        // touching the transcript already produced), VAD runs inside this same
-        // decode -- an error here would take the whole pass down. So a missing
-        // model degrades to "proceed without VAD" rather than failing outright;
-        // `vad_unavailable` on the result tells the frontend to say so.
-        let mut vad_unavailable = false;
-        let vad_model_path = if vad {
-            let path = resolve_vad_model_path(&app)?;
-            if path.exists() {
-                Some(path.display().to_string())
-            } else {
-                vad_unavailable = true;
-                None
-            }
-        } else {
-            None
-        };
 
         let settings = DecodeSettings {
             language,
             translate,
             prompt,
-            vad_model_path,
-            vad_threshold,
             entropy_thold,
             ..DecodeSettings::default()
         };
-        let mut params = build_full_params(&settings);
 
-        // whisper calls this far more often than once per percent; emitting only
-        // on change keeps a one-hour recording to ~100 events instead of thousands.
-        let mut last_percent = -1;
-        params.set_progress_callback_safe(move |percent: i32| {
-            if percent != last_percent {
-                last_percent = percent;
-                let _ = app_for_progress.emit(
-                    "asr:refine-progress",
-                    RefineProgressPayload {
-                        job_id: job_id_for_progress.clone(),
-                        percent,
-                    },
-                );
-            }
-        });
-
-        // whisper.cpp evaluates this after every encode and every decode step
-        // (whisper.cpp:7020/7146/7458), so a cancel lands in well under a
-        // second even on a long recording.
-        //
-        // The `Box<dyn FnMut() -> bool>` annotation is load-bearing, not
-        // stylistic: whisper-rs 0.16.0's `set_abort_callback_safe` stores a
-        // `*mut Box<dyn FnMut() -> bool>` as the user data but instantiates
-        // its trampoline as `trampoline::<F>` (whisper_params.rs:637-647).
-        // Handing it a bare closure would have the trampoline reinterpret the
-        // box's data/vtable words as that closure's captures. Type-erasing
-        // here makes `F` *be* the box type, so the two line up -- which is
-        // what the (correctly written) progress path above hardcodes.
-        let abort_flag = std::sync::Arc::clone(&cancel);
-        let abort: Box<dyn FnMut() -> bool> =
-            Box::new(move || abort_flag.load(std::sync::atomic::Ordering::Relaxed));
-        params.set_abort_callback_safe(abort);
-
-        if let Err(e) = whisper_state.full(params, &samples) {
-            // An abort surfaces as an ordinary decode failure (-6 from the
-            // encoder, -8 from the decoder), so without this the user's own
-            // cancel would be reported back to them as a crash.
-            crate::cancel::check(&cancel)?;
-            return Err(e.to_string());
-        }
-
-        let mut result = collect_segments(&whisper_state)?;
         // Loop repair runs before gap fill, not after: gap fill's own inserted
         // cues can split what would have been one longer degenerate run into
         // shorter ones that no longer clear find_degenerate_runs' two-chunk
@@ -1117,12 +984,17 @@ pub async fn transcribe_recording(
         // any gap a *replacement* span leaves behind (its content is genuine
         // speech now, not a stalled loop packed with no real pauses) still
         // gets a chance to be filled by the gap-fill pass that follows.
-        result.chunks = redecode_degenerate_loops(ctx, &settings, &cancel, result.chunks, &samples)?;
-        result.chunks = redecode_voiced_gaps(ctx, &settings, &cancel, result.chunks, &samples, silence_rms)?;
-        result.text = result.chunks.iter().map(|c| c.text.as_str()).collect();
+        let chunks = redecode_degenerate_loops(ctx, &settings, &cancel, chunks, &samples)?;
+        let chunks = redecode_voiced_gaps(ctx, &settings, &cancel, chunks, &samples, silence_rms)?;
+        let text = chunks.iter().map(|c| c.text.as_str()).collect();
 
+        let result = TranscribeResult {
+            text,
+            chunks,
+            quality: crate::cues::QualityReport::default(),
+            silence: Vec::new(),
+        };
         let (mut result, silence) = mark_silent_segments(result, &samples, silence_rms);
-        result.vad_unavailable = vad_unavailable;
         result.silence = silence;
         let duration_sec = samples.len() as f32 / crate::wav::SAMPLE_RATE as f32;
         result.quality = crate::cues::analyze(&result.chunks, duration_sec, &samples);
@@ -1187,7 +1059,6 @@ mod silence_tests {
         TranscribeResult {
             text: chunks.iter().map(|c| c.text.as_str()).collect(),
             chunks,
-            vad_unavailable: false,
             quality: crate::cues::QualityReport::default(),
             silence: Vec::new(),
         }
@@ -1544,33 +1415,6 @@ mod loop_repair_tests {
             // First run repaired, second (rejected -> None) kept as-is.
             assert_eq!(texts, vec!["さて", "中間", "あの", "あの", "末尾"]);
         }
-    }
-}
-
-#[cfg(test)]
-mod vad_default_tests {
-    use super::DecodeSettings;
-
-    #[test]
-    fn vad_is_disabled_by_default() {
-        // The live pass (transcribe_window) always uses DecodeSettings::default()
-        // unmodified, so this is what governs whether VAD runs there.
-        assert!(DecodeSettings::default().vad_model_path.is_none());
-    }
-
-    #[test]
-    fn vad_defaults_mirror_whisper_rs_own_tuning() {
-        // Pinned to whisper_rs::WhisperVadParams::default() (private fields, so
-        // this can't cross-check against it directly) -- if a future whisper-rs
-        // upgrade changes those defaults, this test won't catch it, but it does
-        // catch an accidental edit here silently drifting from what's documented.
-        let d = DecodeSettings::default();
-        assert_eq!(d.vad_threshold, 0.5);
-        assert_eq!(d.vad_min_speech_duration_ms, 250);
-        assert_eq!(d.vad_min_silence_duration_ms, 100);
-        assert_eq!(d.vad_max_speech_duration_s, f32::MAX);
-        assert_eq!(d.vad_speech_pad_ms, 30);
-        assert_eq!(d.vad_samples_overlap, 0.1);
     }
 }
 

@@ -1,18 +1,27 @@
 /**
- * The re-transcribe/diarize/audio-tag accuracy pass that runs after a
- * recording stops (`refineRecording`, `finishRecordOnly`'s record-only
- * counterpart, and the shared `runAccuracyPipeline` core also reused by
- * `reanalyzeHistoryEntry`), plus the live-streaming append helpers that feed
- * the same session timeline (`timeline.ts`) this pipeline rebases onto.
+ * The post-stop transcription/diarize/audio-tag pipeline, plus the
+ * live-streaming append helpers that feed the same session timeline
+ * (`timeline.ts`) this pipeline rebases onto.
+ *
+ * There is one transcription decode path, not two: `refineRecording` (live
+ * "record and analyze" mode) and `runPostHocAnalysis` (record-only's
+ * deferred "解析" and history "再解析") both eventually call the shared
+ * `finalizeAndEnrich` tail (repair/diarize/audio-tag), but only
+ * `runPostHocAnalysis` actually decodes anything -- `refineRecording`'s
+ * transcript was already fully produced live, by the time recording
+ * stopped, so it only has to flatten what's already on screen
+ * (`flattenSegmentsToChunks`) before handing it to the shared tail.
+ * `runPostHocAnalysis` is resumable: see its own doc comment.
  *
  * Ownership split with `src/store/analysisQueue.ts`: this module owns *what*
  * a job's steps are (model calls, timeline rebasing, history persistence);
  * `analysisQueue.ts` owns *when* a job runs (queueing, per-recording status,
  * cancellation requests) and is the only one of the two that imports the
  * other, so this module never needs to know a queue exists above it --
- * status updates go out through the `onStatus` callback parameters below,
- * and a job that was asked to stop is discovered through `wasCancelled`,
- * both supplied by the caller rather than read from any shared store here.
+ * status updates go out through the `onStatus`/`onProgress` callback
+ * parameters below, and a job that was asked to stop is discovered through
+ * `wasCancelled`, all supplied by the caller rather than read from any
+ * shared store here.
  *
  * `useAppStore` is only ever read via `.getState()`/`.setState()` inside
  * function bodies here, never at module top level -- same as `clients.ts`,
@@ -23,15 +32,21 @@ import type {
   StreamingSegment,
   AudioEvent,
   TranscribeResult,
+  TranscriptChunk,
   DiarizeSettings,
-  VadSettings,
   HallucinationSettings,
   AudioEventSettings,
 } from "../lib/asr";
-import { isCancelledError, DIARIZATION_MODEL_UNAVAILABLE, runWhisperTask, WHISPER_PRIORITY_BACKGROUND } from "../lib/asr";
+import {
+  isCancelledError,
+  DIARIZATION_MODEL_UNAVAILABLE,
+  runWhisperTask,
+  WHISPER_PRIORITY_BACKGROUND,
+  transcribeWavPostHoc,
+} from "../lib/asr";
 import type { TranscriptSegment } from "../lib/transcript";
 import { nonBlankChunks, projectOntoNonBlankChunks, segmentsFromResult } from "../lib/transcript";
-import { saveRecordingHistory, wavPath } from "../lib/history";
+import { saveRecordingHistory, wavPath, loadRecording } from "../lib/history";
 import { autoSaveTranscript } from "../lib/export/autoSave";
 import { toErrorMessage } from "../lib/errors";
 import type { AsrSettings } from "./persistedSettings";
@@ -83,10 +98,36 @@ export function appendLiveAudioEvents(events: AudioEvent[]): void {
   }));
 }
 
-/** What `runAccuracyPipeline` produces: the re-transcription, plus whatever
- * diarization/audio-tagging managed to add, plus any user-facing notices
- * about the parts that did not go perfectly (never a hard failure -- see the
- * function's own doc). */
+/**
+ * Flattens a run of already-transcribed `TranscriptSegment`s into one
+ * absolute-recording-timeline chunk list, for `finalizeAndEnrich`'s repair
+ * pass and for `diarizeRecording`/`detectAudioEvents`, both of which need
+ * `(start, end)` pairs on the recording's own 0-based timeline rather than
+ * per-segment-relative ones (`TranscriptSegment.chunks[].timestamp` is
+ * relative to that segment's own `startOffsetSec` -- see `transcript.ts`).
+ *
+ * `baseSec` is the session's global timeline offset the segments'
+ * `startOffsetSec` values already carry (see
+ * `PlaybackState.timelineOffsetSec`'s doc comment); subtracted back out so
+ * the result lands on the *recording's* own 0-based timeline. Pass `0` when
+ * `segments` are already recording-relative (as history sidecars always
+ * store them).
+ */
+export function flattenSegmentsToChunks(segments: TranscriptSegment[], baseSec: number): TranscriptChunk[] {
+  const chunks: TranscriptChunk[] = [];
+  for (const seg of segments) {
+    const segStart = seg.startOffsetSec - baseSec;
+    for (const c of seg.chunks) {
+      chunks.push({ text: c.text, timestamp: [c.timestamp[0] + segStart, c.timestamp[1] + segStart] });
+    }
+  }
+  return chunks;
+}
+
+/** What `finalizeAndEnrich` produces: the finalized transcript, plus
+ * whatever diarization/audio-tagging managed to add, plus any user-facing
+ * notices about the parts that did not go perfectly (never a hard failure --
+ * see the function's own doc). */
 interface AccuracyPipelineResult {
   result: TranscribeResult;
   speakers?: Array<number | null>;
@@ -95,39 +136,45 @@ interface AccuracyPipelineResult {
   notices: string[];
 }
 
-/** `runAccuracyPipeline`'s return: either a completed pass, or the fact that
+/** `finalizeAndEnrich`'s return: either a completed pass, or the fact that
  * the user cancelled it. A cancellation carries nothing else -- every partial
- * result is discarded, because what it is being weighed against is a
- * transcript the user already has on screen. */
+ * result from *this* call is discarded, because what it is being weighed
+ * against is a transcript the user already has (on screen, for
+ * `refineRecording`; already persisted incrementally, for
+ * `runPostHocAnalysis` -- see that function's own doc comment for why a
+ * cancellation there loses nothing despite this). */
 type AccuracyPipelineOutcome =
   | ({ cancelled: false } & AccuracyPipelineResult)
   | { cancelled: true };
 
-/** The two stages of `runAccuracyPipeline` worth reporting live: while the
- * whisper-touching transcription call is (queued, then) actually running,
- * and everything after it (diarization/audio-tagging, which run concurrently
- * with each other and don't touch the whisper model at all). Queued/done/
- * cancelled/error are the caller's (`analysisQueue.ts`'s) own bookkeeping,
- * not something this pipeline reports -- it only knows about its own two
- * internal stages. */
+/** The two stages of `finalizeAndEnrich` worth reporting live: while the
+ * whisper-touching `finalizeTranscript` call is (queued, then) actually
+ * running, and everything after it (diarization/audio-tagging, which run
+ * concurrently with each other and don't touch the whisper model at all).
+ * Queued/done/cancelled/error are the caller's (`analysisQueue.ts`'s) own
+ * bookkeeping, not something this pipeline reports -- it only knows about
+ * its own two internal stages. */
 export type AnalysisPipelineStatus = "transcribing" | "post-processing";
 
 /**
- * The re-transcribe/diarize/audio-tag sequence shared by `refineRecording`
- * (a just-finished live recording) and `reanalyzeHistoryEntry` (any past one,
- * typically after the user changed a setting). Everything here operates on
- * `path`'s own 0-based timeline; rebasing onto a session's global timeline
- * (if the caller even has one -- `reanalyzeHistoryEntry` does not) is the
- * caller's job, same as `nonBlankChunks`' doc comment already describes.
+ * Repair + diarize + audio-tag tail shared by `refineRecording` (live
+ * "record and analyze" mode, transcription already done live) and
+ * `runPostHocAnalysis` (record-only deferred analysis / history
+ * re-analysis, transcription just finished via `transcribeWavPostHoc`).
  *
- * `jobId` (the recording id) identifies this pass to the backend's per-job
- * cancel flag (`cancel.rs`) and whisper progress events, and to
- * `src/lib/asr/whisperQueue.ts`'s priority queue -- the actual
- * `transcribeRecording` call is submitted there at
- * `WHISPER_PRIORITY_BACKGROUND` rather than invoked directly, so it queues
- * behind (or, per the queue's priority rule, is jumped by) whatever else is
- * using the model rather than racing it. `onStatus` fires as this pass moves
- * between its two stages -- see `AnalysisPipelineStatus`.
+ * `chunks` must already be on the recording's own absolute 0-based timeline
+ * -- see `flattenSegmentsToChunks`. Runs `asrClient.finalizeTranscript` (the
+ * repair/analysis tail: degenerate-loop repair, voiced-gap redecode, silence
+ * marking, structural quality report -- see `asr::finalize_transcript`'s own
+ * doc comment for why this applies identically regardless of how `chunks`
+ * was originally decoded), then diarization and audio-tagging concurrently
+ * against the finalized result's non-blank chunks.
+ *
+ * The caller owns `beginAnalysis`/`endAnalysis` for the whole operation this
+ * is one step of -- this function does not touch the per-job cancel flag
+ * itself, so `runPostHocAnalysis` can call it as the second half of a single
+ * caller-owned cancellable window that starts with its own windowed-decode
+ * phase.
  *
  * Diarization/audio-tagging failures are collected as notices rather than
  * thrown: a transcript without speaker labels or event filtering is still
@@ -138,138 +185,115 @@ export type AnalysisPipelineStatus = "transcribing" | "post-processing";
  * remaining stages and returns `{ cancelled: true }`. Without that
  * distinction, one press of the cancel button would produce a "話者分離に失敗
  * した" and a "音響イベント検出に失敗しました" on the way out.
- *
- * Being the one entry point both callers share also makes this the right
- * place to clear the backend's cancel flag for this job at the start
- * (`beginAnalysis`) and release it once this pass is fully done
- * (`endAnalysis`, in `finally`) -- see `cancel.rs`'s per-job map.
  */
-export async function runAccuracyPipeline(
+async function finalizeAndEnrich(
   jobId: string,
   path: string,
+  chunks: TranscriptChunk[],
   settings: AsrSettings,
-  vadSettings: VadSettings,
   diarizeSettings: DiarizeSettings,
   audioEventSettings: AudioEventSettings,
   hallucinationSettings: HallucinationSettings,
   onStatus?: (status: AnalysisPipelineStatus) => void,
 ): Promise<AccuracyPipelineOutcome> {
-  await asrClient.beginAnalysis(jobId);
-
+  const notices: string[] = [];
+  let result: TranscribeResult;
   try {
-    const notices: string[] = [];
-    let result: TranscribeResult;
-    try {
-      result = await runWhisperTask(
-        WHISPER_PRIORITY_BACKGROUND,
-        () => asrClient.transcribeRecording(path, jobId, settings, vadSettings, hallucinationSettings),
-        () => onStatus?.("transcribing"),
-      ).promise;
-    } catch (err) {
-      // Only a cancellation is caught here -- a real failure still propagates,
-      // so the caller keeps its "the second pass broke, hold on to the live
-      // transcript" path exactly as before.
-      if (isCancelledError(err)) return { cancelled: true };
-      throw err;
-    }
-    onStatus?.("post-processing");
-    if (result.vadUnavailable) {
+    result = await runWhisperTask(
+      WHISPER_PRIORITY_BACKGROUND,
+      () => asrClient.finalizeTranscript(path, jobId, chunks, settings, hallucinationSettings),
+      () => onStatus?.("transcribing"),
+    ).promise;
+  } catch (err) {
+    // Only a cancellation is caught here -- a real failure still propagates,
+    // so the caller keeps its "keep whatever transcript already exists"
+    // path exactly as before.
+    if (isCancelledError(err)) return { cancelled: true };
+    throw err;
+  }
+  onStatus?.("post-processing");
+  // A regression signal, not an accuracy score (see QualityReport's doc
+  // comment): voicedGapSec is audio the RMS gate says holds speech but no
+  // cue covers, so a few seconds of it is worth surfacing even though the
+  // pipeline gave no error.
+  if ((result.quality?.voicedGapSec ?? 0) >= 1) {
+    notices.push(
+      `音声があるのに文字起こしされなかった区間が約${result.quality!.voicedGapSec.toFixed(1)}秒あります（無音以外の理由でスキップされた可能性があります）。`,
+    );
+  }
+  // mark_silent_segments flags rather than drops (see its doc comment), so
+  // this is purely informational -- the flagged chunks already render as a
+  // "無音" placeholder via segmentsFromResult's `silent` parameter.
+  if (result.silence && result.silence.length === result.chunks.length) {
+    const silentDurationSec = result.chunks.reduce((sum, c, i) => {
+      if (!result.silence![i].silent) return sum;
+      const end = c.timestamp[1] ?? c.timestamp[0];
+      return sum + Math.max(0, end - c.timestamp[0]);
+    }, 0);
+    const silentCount = result.silence.filter((m) => m.silent).length;
+    if (silentCount > 0) {
       notices.push(
-        "VAD 用のモデルファイルが見つからないため、VAD 無しで実行しました。README の手順でモデルを配置すると有効になります。",
+        `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${hallucinationSettings.silenceRms}）。`,
       );
-    }
-    // A regression signal, not an accuracy score (see QualityReport's doc
-    // comment): voicedGapSec is audio the RMS gate says holds speech but no
-    // cue covers, so a few seconds of it is worth surfacing even though the
-    // pipeline gave no error.
-    if ((result.quality?.voicedGapSec ?? 0) >= 1) {
-      notices.push(
-        `音声があるのに文字起こしされなかった区間が約${result.quality!.voicedGapSec.toFixed(1)}秒あります（無音以外の理由でスキップされた可能性があります）。`,
-      );
-    }
-    // mark_silent_segments flags rather than drops (see its doc comment), so
-    // this is purely informational -- the flagged chunks already render as a
-    // "無音" placeholder via segmentsFromResult's `silent` parameter.
-    if (result.silence && result.silence.length === result.chunks.length) {
-      const silentDurationSec = result.chunks.reduce((sum, c, i) => {
-        if (!result.silence![i].silent) return sum;
-        const end = c.timestamp[1] ?? c.timestamp[0];
-        return sum + Math.max(0, end - c.timestamp[0]);
-      }, 0);
-      const silentCount = result.silence.filter((m) => m.silent).length;
-      if (silentCount > 0) {
-        notices.push(
-          `無音と判定されて除外された区間が${silentCount}件、合計約${silentDurationSec.toFixed(1)}秒あります（RMS < ${hallucinationSettings.silenceRms}）。`,
-        );
-      }
-    }
-
-    // Diarization and audio tagging both read the same WAV on its own 0-based
-    // timeline, so they have to run on result.chunks *before* segmentsFromResult
-    // rebases anything -- see nonBlankChunks' doc comment.
-    const targets = nonBlankChunks(result).map((c) => c.timestamp);
-
-    // Independent Rust-side commands -- diarization is sherpa-onnx, audio
-    // tagging loads its own model per call (see events.rs's module doc), and
-    // neither touches the whisper model's mutex (or this queue) the way
-    // transcribeRecording above does -- so they're started together rather
-    // than one `await`ed before the other even begins, and can run alongside
-    // a *different* job's transcription too. Both invoke() calls fire before
-    // either is awaited, so the two spawn_blocking passes actually overlap
-    // instead of stacking their multi-minute runtimes back to back.
-    const diarizePromise =
-      diarizeSettings.enabled && targets.length > 0
-        ? asrClient.diarizeRecording(path, jobId, targets, diarizeSettings)
-        : undefined;
-    const audioEventsPromise =
-      audioEventSettings.enabled && targets.length > 0
-        ? asrClient.detectAudioEvents(path, jobId, targets, audioEventSettings)
-        : undefined;
-
-    let speakers: Array<number | null> | undefined;
-    if (diarizePromise) {
-      try {
-        speakers = await diarizePromise;
-      } catch (err) {
-        if (isCancelledError(err)) return { cancelled: true };
-        // Distinguished from a genuine failure so the common case -- diarization
-        // defaults on, but its model files are an opt-in download most installs
-        // never make -- reads the same as vadUnavailable's calm guidance rather
-        // than an alarming "failed" notice on every single recording.
-        notices.push(
-          String(err).includes(DIARIZATION_MODEL_UNAVAILABLE)
-            ? "話者分離用のモデルファイルが見つからないため、話者ラベルなしで実行しました。README の手順でモデルを配置すると有効になります。"
-            : `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-        );
-      }
-    }
-
-    let excluded: boolean[] | undefined;
-    let newEvents: AudioEvent[] = [];
-    if (audioEventsPromise) {
-      try {
-        const eventResult = await audioEventsPromise;
-        excluded = eventResult.exclude;
-        newEvents = eventResult.events;
-      } catch (err) {
-        if (isCancelledError(err)) return { cancelled: true };
-        notices.push(
-          `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
-        );
-      }
-    }
-
-    return { cancelled: false, result, speakers, excluded, newEvents, notices };
-  } finally {
-    // Best-effort hygiene: freeing this job's entry in the backend's cancel
-    // map costs nothing to skip on failure, and must never mask whatever
-    // outcome the `try` above already produced.
-    try {
-      await asrClient.endAnalysis(jobId);
-    } catch (err) {
-      console.warn(`[asr] failed to clear cancel state for job ${jobId}:`, err);
     }
   }
+
+  // Diarization and audio tagging both read the same WAV on its own 0-based
+  // timeline, so they have to run on result.chunks *before* segmentsFromResult
+  // rebases anything -- see nonBlankChunks' doc comment.
+  const targets = nonBlankChunks(result).map((c) => c.timestamp);
+
+  // Independent Rust-side commands -- diarization is sherpa-onnx, audio
+  // tagging loads its own model per call (see events.rs's module doc), and
+  // neither touches the whisper model's mutex (or this queue) the way
+  // finalizeTranscript above does -- so they're started together rather
+  // than one `await`ed before the other even begins, and can run alongside
+  // a *different* job's transcription too. Both invoke() calls fire before
+  // either is awaited, so the two spawn_blocking passes actually overlap
+  // instead of stacking their multi-minute runtimes back to back.
+  const diarizePromise =
+    diarizeSettings.enabled && targets.length > 0
+      ? asrClient.diarizeRecording(path, jobId, targets, diarizeSettings)
+      : undefined;
+  const audioEventsPromise =
+    audioEventSettings.enabled && targets.length > 0
+      ? asrClient.detectAudioEvents(path, jobId, targets, audioEventSettings)
+      : undefined;
+
+  let speakers: Array<number | null> | undefined;
+  if (diarizePromise) {
+    try {
+      speakers = await diarizePromise;
+    } catch (err) {
+      if (isCancelledError(err)) return { cancelled: true };
+      // Distinguished from a genuine failure so the common case -- diarization
+      // defaults on, but its model files are an opt-in download most installs
+      // never make -- reads the same as any other "optional model missing"
+      // guidance rather than an alarming "failed" notice on every recording.
+      notices.push(
+        String(err).includes(DIARIZATION_MODEL_UNAVAILABLE)
+          ? "話者分離用のモデルファイルが見つからないため、話者ラベルなしで実行しました。README の手順でモデルを配置すると有効になります。"
+          : `話者分離に失敗したため、話者ラベルは付きません（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+      );
+    }
+  }
+
+  let excluded: boolean[] | undefined;
+  let newEvents: AudioEvent[] = [];
+  if (audioEventsPromise) {
+    try {
+      const eventResult = await audioEventsPromise;
+      excluded = eventResult.exclude;
+      newEvents = eventResult.events;
+    } catch (err) {
+      if (isCancelledError(err)) return { cancelled: true };
+      notices.push(
+        `音響イベント検出に失敗しました（文字起こし自体はそのまま使えます）: ${toErrorMessage(err)}`,
+      );
+    }
+  }
+
+  return { cancelled: false, result, speakers, excluded, newEvents, notices };
 }
 
 /**
@@ -373,6 +397,13 @@ function liveTakeSnapshot(
  * recording's segments into this one's history entry -- so in that case the
  * already-filed provisional entry (missing only that one trailing window) is
  * left as-is rather than risk overwriting it with mixed data.
+ *
+ * `analyzedThroughSec` is always `recordingDurationSec` here, regardless of
+ * whether the cancelled pass had anything to show: the live streaming pass
+ * already transcribed the whole recording by the time this runs (see this
+ * module's own doc comment), so there is no windowed post-hoc decode left to
+ * resume -- a later "再解析" on a live-mode take is always a full redo via
+ * `runPostHocAnalysis`, never a resume.
  */
 async function finishCancelledTake(
   recordingId: string,
@@ -396,11 +427,10 @@ async function finishCancelledTake(
     // so is what puts the 解析 button on its history row -- the same door
     // record-only takes come through.
     transcribed: snapshot.hasText,
-    // None of the three ran to completion, so none of them describe what was
-    // saved.
+    // Neither ran to completion, so neither describes what was saved.
     usedDiarize: false,
-    usedVad: false,
     usedAudioEvents: false,
+    analyzedThroughSec: recordingDurationSec,
     segments: snapshot.segments,
     audioEvents: snapshot.audioEvents,
   });
@@ -469,8 +499,10 @@ export async function fileTakeProvisionally(
     language: useAppStore.getState().settings.language,
     transcribed: liveSnapshot.hasText,
     usedDiarize: false,
-    usedVad: false,
     usedAudioEvents: false,
+    // Provisional by construction -- `refineRecording` overwrites this
+    // within moments with `recordingDurationSec` once it actually finishes.
+    analyzedThroughSec: 0,
     segments: liveSnapshot.segments,
     audioEvents: liveSnapshot.audioEvents,
   });
@@ -479,14 +511,19 @@ export async function fileTakeProvisionally(
 }
 
 /**
- * Re-transcribes the finished recording as one continuous piece and swaps the
- * result in for the segments the live pass produced. Takes over from
- * `fileTakeProvisionally`, which `stopRecording` has already run (and which
- * already filed the take in history) by the time this is called.
+ * Runs the post-stop tail for a just-finished live "record and analyze"
+ * recording. Takes over from `fileTakeProvisionally`, which `stopRecording`
+ * has already run (and which already filed the take in history) by the time
+ * this is called.
  *
- * Every failure path here keeps the live transcript. The second pass is an
- * improvement on something the user already has; losing it costs accuracy, while
- * discarding the live result would cost them the meeting.
+ * There is no transcription left to do here: the live streaming pass
+ * already transcribed the whole recording in real time while it was
+ * running, so this flattens whatever's already on screen
+ * (`flattenSegmentsToChunks`) and hands it straight to `finalizeAndEnrich`
+ * for the repair/diarize/audio-tag tail. Every failure path here keeps the
+ * live transcript. The finalize pass is an improvement on something the
+ * user already has; losing it costs accuracy, while discarding the live
+ * result would cost them the meeting.
  *
  * `onStatus`/`wasCancelled` are supplied by the caller (`analysisQueue.ts`) --
  * see this module's own doc comment for why this stays free of any direct
@@ -509,14 +546,21 @@ export async function refineRecording(
   wasCancelled?: () => boolean,
 ): Promise<void> {
   const { recordingId, path, recordingDurationSec } = filing;
-  const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
-    useAppStore.getState();
+  const { settings, diarizeSettings, audioEventSettings, hallucinationSettings } = useAppStore.getState();
+  // Read synchronously, before any `await` below -- including
+  // `beginAnalysis`'s -- so this cannot race a *later* take starting and
+  // mutating `segments` out from under it. `enqueueRefine` calls this
+  // function in the same tick `stopRecording` finishes in, so nothing else
+  // can have run yet.
+  const liveChunks = flattenSegmentsToChunks(useAppStore.getState().segments.slice(keptSegments), baseSec);
+
+  await asrClient.beginAnalysis(recordingId);
   try {
-    const outcome = await runAccuracyPipeline(
+    const outcome = await finalizeAndEnrich(
       recordingId,
       path,
+      liveChunks,
       settings,
-      vadSettings,
       diarizeSettings,
       audioEventSettings,
       hallucinationSettings,
@@ -563,11 +607,11 @@ export async function refineRecording(
       consumeSegmentIds(refined.length);
     }
 
-    // An empty (or all-excluded-placeholder) second pass means something went
-    // wrong upstream, not that the meeting was silent -- the live pass
-    // already found speech in this audio. Checked by actual text rather than
-    // refined.length, since a recording audio-tagging excluded *everything*
-    // from now produces only placeholders, not an empty array.
+    // An empty (or all-excluded-placeholder) finalized result means
+    // something went wrong upstream, not that the meeting was silent -- the
+    // live pass already found speech in this audio. Checked by actual text
+    // rather than refined.length, since a recording audio-tagging excluded
+    // *everything* from now produces only placeholders, not an empty array.
     const secondPassUsable = refined.some((s) => s.text.trim() !== "");
 
     // Still this take's own recording on screen -- safe to touch `segments`/
@@ -577,7 +621,7 @@ export async function refineRecording(
 
     if (stillOnScreen) {
       // Audio-tagging is a separate call from transcription (detectAudioEvents,
-      // run against `targets` from this same result -- see runAccuracyPipeline)
+      // run against `targets` from this same result -- see finalizeAndEnrich)
       // that can fail or get skipped on its own: disabled in settings, nothing
       // to tag because `targets` came back empty, or the call itself threw.
       // `excluded` only comes back defined when it actually completed; when
@@ -608,21 +652,21 @@ export async function refineRecording(
     }
 
     // Whichever segments are now this take's authoritative record -- the
-    // second pass's, if it produced anything usable, otherwise the live
+    // finalized pass's, if it produced anything usable, otherwise the live
     // pass's -- always get saved. This used to be conditional on
-    // `secondPassUsable`, which meant an empty second pass made the take
+    // `secondPassUsable`, which meant an empty finalized result made the take
     // vanish from history for good: the WAV stayed valid on disk, but with
     // no sidecar `listRecordings` could never find it again -- exactly the
     // one thing `finishRecordOnly`'s own doc comment says this feature must
-        // never do to a take.
+    // never do to a take.
     //
     // The live-pass fallback (`liveSegments`/`liveHasText`) needs
     // `stillOnScreen` too: it's read back out of the *global* `segments`, and
     // once a later recording has taken over that array no longer describes
-    // this take alone (see this function's own doc comment). When the second
-    // pass isn't usable and this take is no longer on screen, the safest
-    // thing is to leave `fileTakeProvisionally`'s already-filed provisional
-    // entry alone rather than risk persisting a mixed snapshot.
+    // this take alone (see this function's own doc comment). When the
+    // finalized pass isn't usable and this take is no longer on screen, the
+    // safest thing is to leave `fileTakeProvisionally`'s already-filed
+    // provisional entry alone rather than risk persisting a mixed snapshot.
     if (!stillOnScreen && !secondPassUsable) return;
 
     const liveSegments = stillOnScreen ? useAppStore.getState().segments.slice(keptSegments) : [];
@@ -653,29 +697,42 @@ export async function refineRecording(
       durationSec: recordingDurationSec,
       language: settings.language,
       transcribed: true,
-      // Speaker labels and VAD-based exclusion only ever land on the
-      // second pass's own segments -- claiming them here when the live
-      // pass's segments are what actually got saved would describe data
-      // that isn't there.
+      // Speaker labels only ever land on the finalized pass's own segments --
+      // claiming them here when the live pass's segments are what actually
+      // got saved would describe data that isn't there.
       usedDiarize: secondPassUsable && diarizeSettings.enabled,
-      usedVad: secondPassUsable && vadSettings.enabled,
       usedAudioEvents: audioEventsUsable,
+      // The live pass already transcribed the whole recording by the time
+      // this runs -- see this module's own doc comment -- so this take is
+      // always "fully analyzed" regardless of whether the repair pass above
+      // found anything worth swapping in. A later "再解析" on it is always a
+      // full redo via `runPostHocAnalysis`, never a resume.
+      analyzedThroughSec: recordingDurationSec,
       segments: localSegments,
       audioEvents: localAudioEvents,
     });
     // Only worth surfacing when the live pass actually had something the
-    // second pass then lost -- a genuinely silent recording ending up with an
-    // empty transcript both times is not a failure worth reporting as one.
+    // finalized pass then lost -- a genuinely silent recording ending up with
+    // an empty transcript both times is not a failure worth reporting as one.
     if (saved && !secondPassUsable && liveHasText) {
       useAppStore.setState({
         refineNotice:
-          "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離・VAD は未適用です）。設定を確認のうえ「再解析」をお試しください。",
+          "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離は未適用です）。設定を確認のうえ「再解析」をお試しください。",
       });
     }
   } catch (err) {
     useAppStore.setState({
       refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
+  } finally {
+    // Best-effort hygiene: freeing this job's entry in the backend's cancel
+    // map costs nothing to skip on failure, and must never mask whatever
+    // outcome the `try` above already produced.
+    try {
+      await asrClient.endAnalysis(recordingId);
+    } catch (err) {
+      console.warn(`[asr] failed to clear cancel state for job ${recordingId}:`, err);
+    }
   }
 }
 
@@ -706,12 +763,12 @@ export async function finishRecordOnly(
       durationSec,
       language: useAppStore.getState().settings.language,
       transcribed: false,
-      // All three passes are part of the analysis this mode defers, so none of
-      // them describe this recording yet. They get their real values when the
-      // user runs `reanalyzeHistoryEntry` on it.
+      // Both passes are part of the analysis this mode defers, so neither
+      // describes this recording yet. They get their real values when the
+      // user runs `runPostHocAnalysis` on it.
       usedDiarize: false,
-      usedVad: false,
       usedAudioEvents: false,
+      analyzedThroughSec: 0,
       segments: [],
       audioEvents: [],
     });
@@ -733,19 +790,37 @@ export async function finishRecordOnly(
 }
 
 /**
- * Re-runs the accuracy pass (transcribe + diarize + audio-tag, per whatever
- * is currently enabled in settings) against a past recording's WAV and
- * overwrites its history entry -- e.g. after turning on diarization or
- * changing its threshold and wanting this recording relabeled with it.
+ * Transcribes (or resumes transcribing) a recording that was never fully
+ * transcribed live -- a record-only take's deferred "解析", or a past
+ * recording's "再解析" -- via the same windowed `StreamingTranscriber` the
+ * live pass uses, driven from the saved WAV instead of live mic frames
+ * (`transcribeWavPostHoc` in `postHocTranscriber.ts`). Once decoding
+ * reaches the end, runs `finalizeAndEnrich` over the fully assembled chunk
+ * list, exactly as `refineRecording` does for the live path.
  *
- * Moved out of `appStore.ts`'s `rerunHistoryEntry` action so the job body
- * lives next to `refineRecording`'s, both driven by `analysisQueue.ts`'s
- * `enqueueReanalyze`/`enqueueRefine` -- `appStore.ts` keeps only the thin
- * capability check and hand-off to the queue.
+ * **Resumable, but only when there is nothing to lose by resuming.**
+ * `alreadyComplete` (the entry was already fully transcribed by a previous
+ * run) decides everything below:
+ * - `alreadyComplete`: this is a full redo (glossary changed, language
+ *   changed, whatever prompted "再解析"). Nothing is persisted until the redo
+ *   actually finishes -- overwriting the existing complete transcript with a
+ *   same-run partial one would turn a cancel into data loss, which is a
+ *   worse outcome than the redo simply not having happened. Cancelling here
+ *   leaves the old sidecar completely untouched, exactly like before this
+ *   feature existed.
+ * - otherwise (never analyzed, or resuming a previously-cancelled run):
+ *   there is nothing yet to protect, so every committed window is persisted
+ *   to the sidecar immediately, serialized so writes cannot land out of
+ *   order (`persistProgress` below). This is what makes cancelling lose
+ *   nothing: by the time this function (or the user) can even notice a
+ *   cancel request, whatever was already committed is already on disk. A
+ *   later "解析"/"続きを解析" click resumes from `analyzedThroughSec`
+ *   instead of re-decoding from the start.
  */
-export async function reanalyzeHistoryEntry(
+export async function runPostHocAnalysis(
   id: string,
   onStatus?: (status: AnalysisPipelineStatus) => void,
+  onProgress?: (analyzedThroughSec: number, totalSec: number) => void,
   wasCancelled?: () => boolean,
 ): Promise<void> {
   // The one place the model gets loaded on demand: in record-only mode this
@@ -760,32 +835,99 @@ export async function reanalyzeHistoryEntry(
     return;
   }
 
-  const durationSec = useAppStore.getState().recordingHistory.find((r) => r.id === id)?.durationSec ?? 0;
+  const stored = await loadRecording(id);
+  const durationSec = stored.durationSec;
+  const alreadyComplete = stored.transcribed && stored.analyzedThroughSec >= durationSec;
+  const resuming = !alreadyComplete && stored.analyzedThroughSec > 0;
+  const fromSec = resuming ? stored.analyzedThroughSec : 0;
+  const existingSegments = resuming ? stored.segments : [];
   const path = await wavPath(id);
 
+  const { settings, diarizeSettings, audioEventSettings, hallucinationSettings } = useAppStore.getState();
+
+  // Chained rather than fire-and-forget: `saveRecordingHistory` is a full
+  // overwrite each time (see its own doc comment), so two writes landing out
+  // of order could let an earlier, less-complete write clobber a later,
+  // more-complete one. A no-op whenever `alreadyComplete` -- see this
+  // function's own doc comment for why a full redo must not touch the
+  // sidecar until it actually finishes.
+  let persistChain: Promise<void> = Promise.resolve();
+  const persistProgress = (segments: TranscriptSegment[], analyzedThroughSec: number) => {
+    if (alreadyComplete) return;
+    persistChain = persistChain
+      .then(() =>
+        saveRecordingHistory(id, {
+          durationSec,
+          language: settings.language,
+          transcribed: true,
+          // Neither has run yet at this point -- both only ever run once,
+          // inside finalizeAndEnrich, after decoding finishes.
+          usedDiarize: false,
+          usedAudioEvents: false,
+          analyzedThroughSec,
+          segments,
+          audioEvents: [],
+        }),
+      )
+      .catch((err) => {
+        console.warn(`[asr] failed to persist partial post-hoc analysis for ${id}:`, err);
+      });
+  };
+
+  const cancelledNotice = alreadyComplete
+    ? "解析をキャンセルしました（既存の履歴はそのまま残っています）。"
+    : "解析を一部完了した状態で中止しました。続きは「解析」で再開します。";
+
+  await asrClient.beginAnalysis(id);
   try {
-    const { settings, vadSettings, diarizeSettings, audioEventSettings, hallucinationSettings } =
-      useAppStore.getState();
-    const outcome = await runAccuracyPipeline(
+    const outcome = await transcribeWavPostHoc(
+      (audio) => {
+        const options = { ...settings, entropyThold: hallucinationSettings.entropyThold };
+        return runWhisperTask(WHISPER_PRIORITY_BACKGROUND, () => asrClient.transcribe(audio, options)).promise;
+      },
+      (from, onChunk) => asrClient.readWavPcm(path, id, from, onChunk),
+      fromSec,
+      durationSec,
+      existingSegments,
+      hallucinationSettings,
+      persistProgress,
+      onProgress,
+      wasCancelled,
+    );
+    // Make sure the last incremental write actually landed before deciding
+    // what to tell the user or what to show on screen -- otherwise a
+    // cancellation could report "kept" before it truly is.
+    await persistChain;
+
+    if (outcome.cancelled) {
+      useAppStore.setState({ refineNotice: cancelledNotice });
+      if (!alreadyComplete) {
+        await useAppStore.getState().refreshRecordingHistory();
+        if (useAppStore.getState().viewedRecordingId === id) {
+          useAppStore.setState({ segments: [...existingSegments, ...outcome.newSegments], audioEvents: [] });
+        }
+      }
+      return;
+    }
+
+    const decodedChunks = flattenSegmentsToChunks([...existingSegments, ...outcome.newSegments], 0);
+    const enrichOutcome = await finalizeAndEnrich(
       id,
       path,
+      decodedChunks,
       settings,
-      vadSettings,
       diarizeSettings,
       audioEventSettings,
       hallucinationSettings,
       onStatus,
     );
-    // Bailing out before `saveRecordingHistory` is the whole cancellation
-    // story here: the existing sidecar and the segments on screen are both
-    // left exactly as they were, so a cancelled re-analysis costs the user
-    // nothing but the time it ran. See `refineRecording` for why the job's
-    // own status is consulted alongside the outcome.
-    if (outcome.cancelled || wasCancelled?.()) {
-      useAppStore.setState({ refineNotice: "解析をキャンセルしました（既存の履歴はそのまま残っています）。" });
+
+    if (enrichOutcome.cancelled || wasCancelled?.()) {
+      useAppStore.setState({ refineNotice: cancelledNotice });
       return;
     }
-    const { result, speakers, excluded, newEvents, notices } = outcome;
+
+    const { result, speakers, excluded, newEvents, notices } = enrichOutcome;
 
     // Always the recording's own 0-based timeline with fresh sequential
     // ids -- this entry has no "session" of its own to rebase onto, and
@@ -814,15 +956,15 @@ export async function reanalyzeHistoryEntry(
       language: settings.language,
       transcribed: true,
       usedDiarize: diarizeSettings.enabled,
-      usedVad: vadSettings.enabled,
       usedAudioEvents: audioEventSettings.enabled,
+      analyzedThroughSec: durationSec,
       segments: localSegments,
       audioEvents: newEvents,
     });
     await useAppStore.getState().refreshRecordingHistory();
 
     // Refresh what's on screen too, if this is the recording currently
-    // shown. Unlike before recording/analysis ran in parallel, `reanalyze`
+    // shown. Unlike before recording/analysis ran in parallel, `再解析`
     // no longer implies nothing else can be live in the meantime -- another
     // recording (or a browse to a different entry) may have taken over
     // `segments` while this pass was running, so this check is load-bearing,
@@ -835,6 +977,12 @@ export async function reanalyzeHistoryEntry(
     }
   } catch (err) {
     useAppStore.setState({ refineNotice: `再実行に失敗しました（既存の履歴はそのまま残っています）: ${toErrorMessage(err)}` });
+  } finally {
+    try {
+      await asrClient.endAnalysis(id);
+    } catch (err) {
+      console.warn(`[asr] failed to clear cancel state for job ${id}:`, err);
+    }
   }
 }
 
@@ -846,7 +994,7 @@ export async function reanalyzeHistoryEntry(
  * waits on the state that event drives instead.
  *
  * Resolves `false` rather than throwing when the model cannot be loaded: the
- * one caller (`reanalyzeHistoryEntry`) reports that as a notice next to a
+ * one caller (`runPostHocAnalysis`) reports that as a notice next to a
  * history entry that is still perfectly intact, not as a failure of the app.
  */
 export async function ensureModelReady(): Promise<boolean> {

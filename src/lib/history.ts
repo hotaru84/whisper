@@ -39,8 +39,18 @@ export interface RecordingHistoryMeta {
    */
   transcribed: boolean;
   usedDiarize: boolean;
-  usedVad: boolean;
   usedAudioEvents: boolean;
+  /**
+   * How far post-hoc analysis has progressed, in absolute recording-seconds.
+   * `0` for a take never analyzed (record-only, freshly stopped) or a live
+   * "record and analyze" take (whose transcription always completes in one
+   * shot, so it goes straight from `0` to `durationSec` -- see
+   * `refineRecording`). Anywhere strictly between `0` and `durationSec` means
+   * a post-hoc analysis pass was cancelled partway through and can be
+   * resumed from here (`runPostHocAnalysis`); `>= durationSec` means fully
+   * analyzed, so a later "再解析" restarts from `0` rather than resuming.
+   */
+  analyzedThroughSec: number;
   /** First ~80 characters of the transcript, for the sidebar row. */
   preview: string;
 }
@@ -67,8 +77,15 @@ export interface StoredRecording {
    */
   transcribed?: boolean;
   usedDiarize: boolean;
-  usedVad: boolean;
   usedAudioEvents: boolean;
+  /** Optional on disk, required in memory: every sidecar written before
+   * resumable post-hoc analysis existed has no cursor of its own -- read as
+   * `stored.analyzedThroughSec ?? 0`, same reasoning as `transcribed`'s
+   * fallback. Defaulting to `0` rather than `durationSec` is deliberately the
+   * safe direction: it makes an old entry's next "再解析" restart from
+   * scratch (exactly what it always did before this field existed) instead
+   * of being mistaken for a cancelled-partway take with nothing left to add. */
+  analyzedThroughSec?: number;
   segments: TranscriptSegment[];
   audioEvents: AudioEvent[];
 }
@@ -99,10 +116,10 @@ async function jsonPath(id: string): Promise<string> {
 }
 
 /** Exported for `appStore.ts`'s `rerunHistoryEntry`, which needs the WAV
- * path to re-run the accuracy pass without a new Rust command -- the same
- * commands `refineRecording` already calls (`transcribeRecording` etc.) just
- * take a path string, so the frontend can point them at any past
- * recording's WAV, not only the one just finished. */
+ * path to re-run post-hoc analysis -- the same commands
+ * `runPostHocAnalysis`/`finalizeAndEnrich` already call (`readWavPcm`,
+ * `finalizeTranscript`, etc.) just take a path string, so the frontend can
+ * point them at any past recording's WAV, not only the one just finished. */
 export async function wavPath(id: string): Promise<string> {
   if (useMockBackend) return `mock-recordings/${id}.wav`;
   return join(await recordingsDir(), `${id}.wav`);
@@ -151,8 +168,8 @@ function metaFromStored(id: string, createdAt: Date, stored: StoredRecording): R
     language: stored.language,
     transcribed: stored.transcribed ?? true,
     usedDiarize: stored.usedDiarize,
-    usedVad: stored.usedVad,
     usedAudioEvents: stored.usedAudioEvents,
+    analyzedThroughSec: stored.analyzedThroughSec ?? 0,
     preview: previewFrom(stored.segments),
   };
 }
@@ -182,8 +199,8 @@ export async function saveRecordingHistory(
     language: entry.language,
     transcribed: entry.transcribed,
     usedDiarize: entry.usedDiarize,
-    usedVad: entry.usedVad,
     usedAudioEvents: entry.usedAudioEvents,
+    analyzedThroughSec: entry.analyzedThroughSec,
     segments: entry.segments,
     audioEvents: entry.audioEvents,
   };
@@ -308,8 +325,8 @@ export async function recoverInterruptedRecordings(language: string): Promise<st
         language,
         transcribed: false,
         usedDiarize: false,
-        usedVad: false,
         usedAudioEvents: false,
+        analyzedThroughSec: 0,
         segments: [],
         audioEvents: [],
       });

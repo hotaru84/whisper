@@ -7,9 +7,9 @@
  */
 
 /**
- * The exact error string the Rust side returns from `transcribe_recording`,
- * `diarize_recording` and `detect_audio_events` when it stopped because the
- * user cancelled rather than because anything failed.
+ * The exact error string the Rust side returns from `read_wav_pcm`,
+ * `finalize_transcript`, `diarize_recording` and `detect_audio_events` when
+ * it stopped because the user cancelled rather than because anything failed.
  *
  * Must stay identical to `cancel::CANCELLED` in `src-tauri/src/cancel.rs` --
  * that string equality is the whole contract, since a cancelled command comes

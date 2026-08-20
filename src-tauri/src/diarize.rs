@@ -28,12 +28,14 @@ pub struct DiarizeSettings {
     /// The extra model-loading + inference pass this adds after every
     /// recording is the cost of that.
     ///
-    /// Safe to default on only because `asr::collect_segments`'s `vad`
-    /// parameter keeps cue timestamps off whisper.cpp's VAD-compressed
-    /// timeline (see that function's doc comment) -- `assign_speakers` below
-    /// assigns speakers purely by overlapping these timestamps against
-    /// diarizer segments, so a wrong timeline would produce confidently wrong
-    /// labels, not just missing ones.
+    /// `assign_speakers` below assigns speakers purely by overlapping
+    /// `asr::collect_segments`'s cue timestamps against diarizer segments, so
+    /// a wrong timeline would produce confidently wrong labels, not just
+    /// missing ones. Those cue timestamps are whisper's own coarse
+    /// segment-level ones (DTW's tighter per-token timestamps were removed --
+    /// see `asr::init_model`'s doc comment -- and VAD, which would have
+    /// compressed the timeline it decoded against, no longer runs anywhere in
+    /// the app), so this stays safe without either of them.
     pub enabled: bool,
     /// Clustering distance threshold: lower splits speakers more readily,
     /// higher merges more readily. Matches sherpa-onnx's own default of 0.5.
@@ -213,11 +215,11 @@ fn resolve_embedding_model_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// state for any install that has not opted into that download, not a
 /// genuine failure. Distinguished from `diarize`'s own "model files exist but
 /// sherpa-onnx rejected them" error (a real misconfiguration worth surfacing
-/// as one) so the frontend can show calm, VAD-`vad_unavailable`-style
-/// guidance instead of an alarming "diarization failed" notice on every
-/// recording for the majority of installs that never downloaded these
-/// optional models -- now that diarization defaults to enabled
-/// (`DiarizeSettings::default`), that would otherwise fire every time.
+/// as one) so the frontend can show calm, missing-optional-model guidance
+/// instead of an alarming "diarization failed" notice on every recording for
+/// the majority of installs that never downloaded these optional models --
+/// now that diarization defaults to enabled (`DiarizeSettings::default`),
+/// that would otherwise fire every time.
 pub const MODEL_UNAVAILABLE: &str = "__diarization_model_unavailable__";
 
 /// Diarizes a finished recording and returns, for each `chunks` interval, the
