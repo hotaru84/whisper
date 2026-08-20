@@ -4,6 +4,14 @@ import { useAppStore } from "../store/appStore";
 // Typical speech RMS sits well under 1.0, so scale up for a readable meter.
 const LEVEL_SCALE = 400;
 const BAR_COUNT = 28;
+/** How often the history advances by one sample, decoupled from the display's
+ * refresh rate -- shifting on every animation frame (~16.7ms) replaced the
+ * whole 28-bar buffer in under half a second, reading as a fast blur rather
+ * than a legible waveform. At this interval the buffer turns over in
+ * ~2.2s (28 * 80ms), long enough to read as a waveform (roughly one spoken
+ * phrase) while the newest bar still lags the live level by less than the
+ * ~100-150ms threshold where updates start to feel delayed. */
+const SHIFT_INTERVAL_MS = 80;
 /** Fraction of the bar's max height above which it reads as "hot" (near
  * clipping) rather than a normal speaking level -- the one place this meter
  * changes color, so it stays meaningful rather than merely decorative. */
@@ -20,11 +28,12 @@ const idleHistory = () => Array.from({ length: BAR_COUNT }, () => 0);
  * a glance tells you both "is it picking anything up" and "is it about to
  * clip" -- the two things a level meter is actually for.
  *
- * Reads `getLevel()` on every animation frame and writes bar heights via
- * direct DOM refs rather than React state, the same approach the single-bar
- * version used -- a waveform redraws every frame while recording, and a
- * `setState` per frame would mean a full React re-render at 60fps for no
- * benefit over mutating a handful of already-mounted `<div>`s.
+ * Reads `getLevel()` every `SHIFT_INTERVAL_MS` (throttled inside an
+ * animation-frame loop, not on every frame -- see that constant) and writes
+ * bar heights via direct DOM refs rather than React state, the same approach
+ * the single-bar version used -- a `setState` per update would mean a full
+ * React re-render for no benefit over mutating a handful of already-mounted
+ * `<div>`s.
  */
 export function LevelMeter() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
@@ -50,17 +59,21 @@ export function LevelMeter() {
     }
 
     let raf: number;
-    const tick = () => {
-      const level = useAppStore.getState().levelMeter?.getLevel() ?? 0;
-      const value = Math.min(1, (level * LEVEL_SCALE) / 100);
-      history.current = [...history.current.slice(1), value];
+    let lastShift = 0;
+    const tick = (timestamp: number) => {
+      if (timestamp - lastShift >= SHIFT_INTERVAL_MS) {
+        lastShift = timestamp;
+        const level = useAppStore.getState().levelMeter?.getLevel() ?? 0;
+        const value = Math.min(1, (level * LEVEL_SCALE) / 100);
+        history.current = [...history.current.slice(1), value];
 
-      history.current.forEach((v, i) => {
-        const bar = barRefs.current[i];
-        if (!bar) return;
-        bar.style.height = `${Math.max(MIN_HEIGHT_PERCENT, Math.round(v * 100))}%`;
-        bar.style.backgroundColor = v >= HOT_THRESHOLD ? "var(--signal)" : "var(--trace)";
-      });
+        history.current.forEach((v, i) => {
+          const bar = barRefs.current[i];
+          if (!bar) return;
+          bar.style.height = `${Math.max(MIN_HEIGHT_PERCENT, Math.round(v * 100))}%`;
+          bar.style.backgroundColor = v >= HOT_THRESHOLD ? "var(--signal)" : "var(--trace)";
+        });
+      }
 
       raf = requestAnimationFrame(tick);
     };
@@ -77,7 +90,7 @@ export function LevelMeter() {
           ref={(el) => {
             barRefs.current[i] = el;
           }}
-          className="flex-1 rounded-sm transition-[height] duration-75 motion-reduce:transition-none"
+          className="flex-1 rounded-sm transition-[height] duration-100 motion-reduce:transition-none"
           style={{ height: `${MIN_HEIGHT_PERCENT}%`, backgroundColor: "var(--border)" }}
         />
       ))}
