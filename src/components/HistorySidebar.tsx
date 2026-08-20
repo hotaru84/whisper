@@ -9,6 +9,8 @@ import {
   FileAudio,
   Loader2,
   XCircle,
+  CircleCheck,
+  CircleDashed,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -151,12 +153,24 @@ function HistoryRow({ meta }: { meta: RecordingHistoryMeta }) {
             />
           </div>
         )}
-        {meta.transcribed ? (
+        {action === null ? (
           meta.preview && (
-            <p className="line-clamp-2 text-xs text-foreground">
-              {meta.preview}
-            </p>
+            <div className="flex items-start gap-1">
+              <CircleCheck
+                className="mt-0.5 h-3 w-3 shrink-0 text-trace"
+                aria-label="解析完了"
+              />
+              <p className="line-clamp-2 text-xs text-foreground">
+                {meta.preview}
+              </p>
+            </div>
           )
+        ) : action === "resume" ? (
+          <p className="flex items-center gap-1 text-xs text-amber">
+            <CircleDashed className="h-3 w-3 shrink-0" aria-hidden="true" />
+            {Math.round((meta.analyzedThroughSec / meta.durationSec) * 100)}
+            %まで解析済み・続きから再開できます
+          </p>
         ) : (
           <p className="flex items-center gap-1 text-xs text-muted-foreground">
             <FileAudio className="h-3 w-3" aria-hidden="true" />
