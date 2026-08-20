@@ -3,7 +3,7 @@ import {
   Check,
   FolderOpen,
   Trash2,
-  RotateCw,
+  Wand2,
   XCircle,
 } from "lucide-react";
 import { Button } from "./ui/button";
@@ -43,38 +43,41 @@ function DeleteHistoryButton({
 
 /**
  * The transcript's action row: copy (always available once there's text),
- * and three history-only actions (open folder, reanalyze, delete) that only
+ * and three history-only actions (open folder, analyze, delete) that only
  * make sense once there is a recording behind what's on screen.
- * `openFolder`/`reanalyze`/`deleteHistory` are left `undefined` by the
+ * `openFolder`/`analyze`/`deleteHistory` are left `undefined` by the
  * caller (`TranscriptPanel`) exactly when that recording doesn't exist yet --
  * a plain presentational split, so this component never has to know why a
  * button might not apply. WAV/transcript files themselves are written
  * automatically (see `AutoSaveSettings`), so there is no manual save/export
  * button here any more.
  *
- * `reanalyze.mode` doubles this one button as the accuracy pass's cancel
- * control: while the recording currently on screen is the one being
- * refined, `TranscriptPanel` switches it to `"cancel"` instead of rendering
- * a separate cancel button next to it -- there is only ever one thing to do
- * with this button at a time, so there is no need for two.
+ * `analyze.mode` mirrors the history sidebar's own per-row quick action
+ * (`analysisAction` in `lib/history.ts`): `"start"` for a take never
+ * analyzed, `"resume"` for one whose post-hoc pass was cancelled partway
+ * through, and `"cancel"` while the recording currently on screen is the one
+ * being analyzed right now -- `TranscriptPanel` switches to that mode
+ * instead of rendering a separate cancel button next to it. Once analysis
+ * has fully completed, `TranscriptPanel` passes `undefined` here: analysis
+ * is one-shot, there is no re-running it.
  */
 export function TranscriptToolbar({
   hasTranscript,
   copied,
   onCopy,
   openFolder,
-  reanalyze,
+  analyze,
   deleteHistory,
 }: {
   hasTranscript: boolean;
   copied: boolean;
   onCopy: () => void;
   /** Undefined exactly when there is no recording behind what's on screen
-   * yet to open a folder for -- same condition `reanalyze`/`deleteHistory`
+   * yet to open a folder for -- same condition `analyze`/`deleteHistory`
    * use, see this component's own doc comment. */
   openFolder?: { onClick: () => void; disabled: boolean };
-  reanalyze?: {
-    mode: "reanalyze" | "cancel";
+  analyze?: {
+    mode: "start" | "resume" | "cancel";
     onClick: () => void;
     disabled: boolean;
   };
@@ -108,14 +111,14 @@ export function TranscriptToolbar({
           フォルダを開く
         </Button>
       )}
-      {reanalyze &&
-        (reanalyze.mode === "cancel" ? (
+      {analyze &&
+        (analyze.mode === "cancel" ? (
           <Button
             type="button"
             variant="outline"
             size="sm"
-            onClick={reanalyze.onClick}
-            disabled={reanalyze.disabled}
+            onClick={analyze.onClick}
+            disabled={analyze.disabled}
             title="解析を中止します。すでに表示されている文字起こしと録音ファイルはそのまま残ります"
           >
             <XCircle className="h-4 w-4" />
@@ -126,12 +129,16 @@ export function TranscriptToolbar({
             type="button"
             variant="outline"
             size="sm"
-            onClick={reanalyze.onClick}
-            disabled={reanalyze.disabled}
-            title="現在の設定（話者分離・音響イベント）でこの録音を解析し直し、履歴を上書きします"
+            onClick={analyze.onClick}
+            disabled={analyze.disabled}
+            title={
+              analyze.mode === "resume"
+                ? "前回の続きから解析を再開します（音声認識モデルの読み込みが必要な場合があります）"
+                : "この録音を文字起こしします（音声認識モデルの読み込みが必要な場合があります）"
+            }
           >
-            <RotateCw className="h-4 w-4" />
-            再解析
+            <Wand2 className="h-4 w-4" />
+            {analyze.mode === "resume" ? "続きを解析" : "解析"}
           </Button>
         ))}
       {deleteHistory && (

@@ -6,7 +6,7 @@ import { SegmentRow, ExcludedGapRow, PendingRow } from "./TranscriptRows";
 import { useTranscriptScrollTracking } from "./useTranscriptScrollTracking";
 import { useAppStore, selectCapabilities, effectiveRecordOnly, useAnalysisQueueStore, hasActiveJob, canCancelJob } from "../store/appStore";
 import { combinedText, collapseDegenerateSegments, type TranscriptSegment } from "../lib/transcript";
-import { openRecordingFolder } from "../lib/history";
+import { openRecordingFolder, analysisAction } from "../lib/history";
 import { cn } from "../lib/utils";
 
 export function TranscriptPanel() {
@@ -44,6 +44,10 @@ export function TranscriptPanel() {
   // scoped to `currentRecordingId` rather than read off a single app-wide
   // field.
   const currentJob = useAnalysisQueueStore((s) => (currentRecordingId ? s.jobs[currentRecordingId] : undefined));
+  // Meta for whatever recording is loaded, so the toolbar's analyze button
+  // can offer the right action for *this* recording's own progress -- same
+  // lookup the history sidebar's row does, see `analysisAction`.
+  const currentMeta = recordingHistory.find((r) => r.id === currentRecordingId);
 
   const hasTranscript = segments.length > 0;
   // A rendering-only view of `segments`: folds a stalled decode's repeated
@@ -113,21 +117,25 @@ export function TranscriptPanel() {
             ? { onClick: () => void openRecordingFolder(currentRecordingId), disabled: false }
             : undefined
         }
-        reanalyze={
+        analyze={
           currentRecordingId
             ? isCancelable
               ? { mode: "cancel", onClick: () => void cancelAnalysis(currentRecordingId), disabled: false }
-              : {
-                  mode: "reanalyze",
-                  onClick: () => void rerunHistoryEntry(currentRecordingId),
-                  // `hasActiveJob` also covers `currentJob?.status === "cancelling"`:
-                  // a pass winding down still has to finish before a new one for
-                  // the same recording can start (see `enqueueReanalyze`'s doc
-                  // comment) -- `can.reanalyze` alone no longer captures that, now
-                  // that it's a per-recording state rather than a single app-wide
-                  // one.
-                  disabled: !can.reanalyze || hasActiveJob(currentRecordingId),
-                }
+              : currentMeta && analysisAction(currentMeta)
+                ? {
+                    // Non-null asserted: the ternary above already excludes
+                    // the `null` ("fully analyzed, nothing to offer") case.
+                    mode: analysisAction(currentMeta)!,
+                    onClick: () => void rerunHistoryEntry(currentRecordingId),
+                    // `hasActiveJob` also covers `currentJob?.status === "cancelling"`:
+                    // a pass winding down still has to finish before a new one for
+                    // the same recording can start (see `enqueueReanalyze`'s doc
+                    // comment) -- `can.reanalyze` alone no longer captures that, now
+                    // that it's a per-recording state rather than a single app-wide
+                    // one.
+                    disabled: !can.reanalyze || hasActiveJob(currentRecordingId),
+                  }
+                : undefined
             : undefined
         }
         deleteHistory={
