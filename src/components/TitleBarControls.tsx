@@ -18,6 +18,13 @@ import { useAppStore } from "../store/appStore";
  * `TranscriptPanel`'s row-reclick shortcut already made, just given a
  * far more visible, always-in-the-same-place home in the titlebar instead
  * of a small icon easy to miss inside the panel.
+ *
+ * Also hidden through `recordingCloseOutPhase`'s brief post-stop window,
+ * mirroring `App.tsx`'s `isActive` -- `recordingPhase` alone flips to
+ * "stopped" synchronously the instant stop is pressed, before the take just
+ * finished has a `viewedRecordingId` to leave (that lands later, once
+ * `markRecordingViewed` runs). Without this, the button could appear and,
+ * for however long closeout takes, do nothing when clicked.
  */
 export function TitleBarControls() {
   const recordingPhase = useAppStore((s) => s.recordingPhase);
@@ -26,13 +33,14 @@ export function TitleBarControls() {
   const playbackRecordingId = useAppStore((s) => s.playback.recordingId);
   const deselectHistoryEntry = useAppStore((s) => s.deselectHistoryEntry);
 
-  if (recordingPhase !== "stopped") return null;
+  if (recordingPhase !== "stopped" || recordingCloseOutPhase !== null) return null;
 
   // Mirrors App.tsx's `showRecordStart` (Home's empty/CTA state) -- see its
-  // own doc comment for why these three fields rather than
-  // `viewedRecordingId`. Inverted here: this button is the complement of
-  // that state.
-  const showingSomething = !(recordingCloseOutPhase === null && segmentCount === 0 && playbackRecordingId == null);
+  // own doc comment for why these two fields rather than `viewedRecordingId`.
+  // Inverted here: this button is the complement of that state.
+  // `recordingCloseOutPhase` is already `null` by construction (the early
+  // return above), same as `showRecordStart`'s own simplification.
+  const showingSomething = !(segmentCount === 0 && playbackRecordingId == null);
   if (!showingSomething) return null;
 
   return (
