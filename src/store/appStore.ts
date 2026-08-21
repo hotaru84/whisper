@@ -779,7 +779,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               onWindowDropped: () => {
                 set({
                   refineNotice:
-                    "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の精度向上パスで文字起こしされます）。",
+                    "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の解析で文字起こしされます）。",
                 });
               },
               silenceRms: get().hallucinationSettings.silenceRms,
@@ -880,7 +880,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // settings dropdown stops showing "マイク N" placeholders.
       void get().refreshAudioInputDevices();
       const notices = [
-        captureStarted ? null : "録音を保存できないため、停止後の精度向上パスは行われません。",
+        captureStarted ? null : "録音を保存できないため、停止後の解析は行われません。",
         controller.usedFallbackDevice
           ? "選択したマイクが見つからないため、既定のマイクで録音しています。"
           : null,

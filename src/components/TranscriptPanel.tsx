@@ -185,7 +185,7 @@ export function TranscriptPanel() {
         // Cancelling happens via the toolbar's 解析中止 button above rather
         // than a second button here -- see `isCancelable`.
         <p className="text-xs text-muted-foreground">
-          録音全体を通しで読み直して精度を上げています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
+          文字起こしの仕上げ解析を実行しています。完了すると下の文字起こしが差し替わります。今の内容もそのまま使えます。
         </p>
       )}
 
