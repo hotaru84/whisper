@@ -159,10 +159,10 @@ export function TitleBarStatus() {
               <span className="font-mono tabular-nums">
                 {headlineTargetTime.day} {headlineTargetTime.time}
               </span>
-              ）を精度向上パス実行中…
+              ）を文字起こし処理中…
             </>
           ) : (
-            "精度向上パス実行中…"
+            "文字起こし処理中…"
           )}
           {headlineJob.status === "transcribing" && (
             <span className="font-mono tabular-nums">

@@ -4,7 +4,7 @@
 //! Diarization cannot run per-window the way live transcription does: telling
 //! the voice at minute 1 and the voice at minute 30 apart from each other, or
 //! recognizing they're the same speaker, needs a view of the whole recording.
-//! So like the second transcription pass (`asr::transcribe_recording`), this
+//! So like the post-stop finalize/repair pass (`asr::finalize_transcript`), this
 //! only ever runs on the finished recording's WAV file after the user stops.
 
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ pub struct SpeakerSegment {
 
 /// Runs offline speaker diarization over a whole recording.
 ///
-/// `samples` must be 16 kHz mono, the same audio `transcribe_recording` reads
+/// `samples` must be 16 kHz mono, the same audio `finalize_transcript` reads
 /// via `wav::read`. `segmentation_model` and `embedding_model` are paths to the
 /// pyannote segmentation ONNX file and the speaker embedding ONNX file
 /// respectively (see README for where to obtain them).
@@ -228,7 +228,7 @@ pub const MODEL_UNAVAILABLE: &str = "__diarization_model_unavailable__";
 /// transcript segments it built from the same recording.
 ///
 /// `chunks` must be on the recording's own timeline (seconds from its start),
-/// matching what `transcribe_recording` returns and *before* the frontend
+/// matching what `finalize_transcript` returns and *before* the frontend
 /// rebases them onto the session's global timeline
 /// (`transcript::segmentsFromResult`) -- diarization runs on that same 0-based
 /// WAV file, so mixing timelines here would silently misassign every speaker.

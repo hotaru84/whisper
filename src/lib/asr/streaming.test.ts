@@ -301,4 +301,80 @@ describe("StreamingTranscriber", () => {
       expect(calls).toBe(1);
     });
   });
+
+  // The post-hoc driver (postHocTranscriber.ts) never paces frames like
+  // feed() does above -- read_wav_pcm hands back ~60s IPC chunks, so a single
+  // pushFrame call can already exceed WINDOW_SEC before any window has been
+  // processed. This block exercises that shape directly instead of relying
+  // on many small per-second frames.
+  describe("when a single pushFrame delivers more than one window's worth", () => {
+    function pushSeconds(t: StreamingTranscriber, seconds: number): void {
+      const samples = seconds * SR;
+      const frame = new Float32Array(samples);
+      for (let i = 0; i < samples; i++) frame[i] = i / SR;
+      t.pushFrame(frame);
+    }
+
+    it("does not lose audio across the resulting backlog", async () => {
+      const segments: StreamingSegment[] = [];
+      const t = new StreamingTranscriber(wordsMock, (s) => segments.push(s));
+
+      pushSeconds(t, 90);
+      const { exhausted } = await t.finish();
+
+      expect(exhausted).toBe(true);
+      const words = segments.flatMap((s) => s.chunks.map((c) => c.text.trim()));
+      expect(words).toEqual(Array.from({ length: 90 }, (_, s) => `w${s}`));
+    });
+
+    it("still caps every processWindow call at WINDOW_SEC seconds", async () => {
+      const windowLens: number[] = [];
+      const recorder = (audio: Float32Array): Promise<TranscribeResult> => {
+        windowLens.push(audio.length);
+        return wordsMock(audio);
+      };
+      const t = new StreamingTranscriber(recorder, () => {});
+
+      pushSeconds(t, 90);
+      await t.finish();
+
+      expect(windowLens.length).toBeGreaterThan(1);
+      for (const len of windowLens) expect(len).toBeLessThanOrEqual(30 * SR);
+    });
+
+    // Regression for the bug this fix addresses directly: a post-hoc run
+    // pushes every frame up front, then calls finish() exactly once with no
+    // further pushFrame to hang a retry off of -- so drain(true) itself must
+    // retry a transient failure rather than aborting on the first one.
+    it("retries a transient failure during finish() instead of aborting immediately", async () => {
+      let calls = 0;
+      const flaky = (audio: Float32Array): Promise<TranscribeResult> => {
+        calls++;
+        if (calls === 1) return Promise.reject(new Error("transient"));
+        return wordsMock(audio);
+      };
+      const segments: StreamingSegment[] = [];
+      const t = new StreamingTranscriber(flaky, (s) => segments.push(s), { retryBackoffMs: 0 });
+
+      // Under WINDOW_SEC, so maybeProcess never fires drain(false) on its
+      // own -- finish() is the only drain call, mirroring postHocTranscriber's
+      // single-shot flush after all PCM has already been pushed.
+      await feed(t, 25);
+      const { exhausted } = await t.finish();
+
+      expect(exhausted).toBe(true);
+      expect(calls).toBeGreaterThan(1);
+      const words = segments.flatMap((s) => s.chunks.map((c) => c.text.trim()));
+      expect(words).toEqual(Array.from({ length: 25 }, (_, s) => `w${s}`));
+    });
+
+    it("finish() reports exhausted: false when cut short by shouldStop", async () => {
+      const t = new StreamingTranscriber(wordsMock, () => {}, { shouldStop: () => true });
+
+      await feed(t, 25);
+      const { exhausted } = await t.finish();
+
+      expect(exhausted).toBe(false);
+    });
+  });
 });

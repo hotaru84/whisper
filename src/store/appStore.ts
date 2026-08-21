@@ -31,7 +31,7 @@ import {
   AudioMixer,
   WHISPER_SAMPLE_RATE,
 } from "../lib/audio";
-import type { PcmRecorderController, AudioLevelMeter, AudioInputDevice, AudioAppInfo } from "../lib/audio";
+import type { PcmRecorderController, AudioLevelMeter, AudioInputDevice } from "../lib/audio";
 import { asrClient, appAudioClient } from "./clients";
 import { loadPlayback, unloadPlayback, togglePlayback, seekTo, skip, setPlaybackRate, IDLE_PLAYBACK } from "./playback";
 import type { PlaybackState } from "./playback";
@@ -58,6 +58,8 @@ import {
   clampSidebarWidth,
   loadAutoSaveSettings,
   saveAutoSaveSettings,
+  loadAppAudioSettings,
+  saveAppAudioSettings,
 } from "./persistedSettings";
 import type {
   AsrSettings,
@@ -65,6 +67,7 @@ import type {
   RecordingModeChoice,
   SidebarSettings,
   AutoSaveSettings,
+  AppAudioSettings,
 } from "./persistedSettings";
 import { setRecordingDirectory } from "../lib/recordingLocation";
 import {
@@ -206,18 +209,13 @@ interface AppState {
   /** Available microphones, for the settings dropdown. Labels are placeholders
    * ("マイク N") until the first successful getUserMedia call in this session. */
   audioInputDevices: AudioInputDevice[];
-  /** Apps with an active audio session right now, for the app-audio target
-   * picker. Only ever populated by an explicit refresh (see its doc comment
-   * on why this can't just be kept fresh automatically). */
-  appAudioApps: AudioAppInfo[];
-  /** The app-audio target for the *next* recording, and the sole switch for
-   * whether app-audio capture is used at all -- `null` means mic-only, no
-   * separate enabled flag needed. Not persisted: a PID from a previous
-   * session almost certainly does not refer to the same process next time,
-   * so the picker always starts unselected and the user re-picks from a
-   * freshly listed set of currently-active sessions. Unrelated to whether a
-   * recording is currently capturing it -- that is internal to `startRecording`. */
-  appAudioTargetPid: number | null;
+  /** Whether the next recording also captures the default output device's
+   * audio (Teams/Zoom/etc, or anything else sharing it) alongside the
+   * microphone. Persisted -- see `AppAudioSettings`'s doc comment for why
+   * this is safe to remember across sessions unlike the old per-process
+   * target it replaced. Unrelated to whether a recording is currently
+   * capturing it -- that is internal to `startRecording`. */
+  appAudioSettings: AppAudioSettings;
   /** Playback of a finished recording's WAV -- either the one just recorded
    * (loaded once `refineRecording` has a path) or a past one selected from
    * history (loaded by `loadHistoryEntry`). `recordingId` is the same id
@@ -258,9 +256,8 @@ interface AppState {
    * on release via `persistSidebarSettings`. */
   setSidebarWidth: (width: number) => void;
   persistSidebarSettings: () => void;
-  setAppAudioTarget: (processId: number | null) => void;
+  setAppAudioEnabled: (enabled: boolean) => void;
   refreshAudioInputDevices: () => Promise<void>;
-  refreshAppAudioApps: () => Promise<void>;
   refreshRecordingHistory: () => Promise<void>;
   /** Files any recording whose take never got to stop -- see
    * `recoverInterruptedRecordings` in `history.ts` for what leaves one behind.
@@ -545,8 +542,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   sidebar: loadSidebarSettings(),
   levelMeter: null,
   audioInputDevices: [],
-  appAudioApps: [],
-  appAudioTargetPid: null,
+  appAudioSettings: loadAppAudioSettings(),
   playback: IDLE_PLAYBACK,
 
   initModel: async () => {
@@ -572,24 +568,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  refreshAppAudioApps: async () => {
-    try {
-      const apps = await appAudioClient.listApps();
-      set((s) => ({
-        appAudioApps: apps,
-        // A previously picked target that dropped off the (now refreshed)
-        // active-session list is no longer capturable -- clear it rather than
-        // silently keep a selection startRecording would fail on.
-        appAudioTargetPid: apps.some((a) => a.processId === s.appAudioTargetPid)
-          ? s.appAudioTargetPid
-          : null,
-      }));
-    } catch (err) {
-      console.warn("[app-audio] failed to list apps:", err);
-    }
+  setAppAudioEnabled: (enabled) => {
+    const appAudioSettings: AppAudioSettings = { enabled };
+    saveAppAudioSettings(appAudioSettings);
+    set({ appAudioSettings });
   },
-
-  setAppAudioTarget: (processId) => set({ appAudioTargetPid: processId }),
 
   refreshRecordingHistory: async () => {
     try {
@@ -779,7 +762,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               onWindowDropped: () => {
                 set({
                   refineNotice:
-                    "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の精度向上パスで文字起こしされます）。",
+                    "ライブ字幕を生成できない状態が続いています（録音は継続中です。停止後の後処理で文字起こしされます）。",
                 });
               },
               silenceRms: get().hallucinationSettings.silenceRms,
@@ -817,17 +800,17 @@ export const useAppStore = create<AppState>((set, get) => ({
         console.warn("[capture] disabled for this recording:", err);
       }
 
-      // App audio (Teams/Zoom/...) is optional and additive: if it fails to
-      // start, or no target was picked, recording proceeds mic-only exactly
-      // as before -- the mixer is simply never engaged.
-      const { appAudioTargetPid } = get();
+      // App audio (Teams/Zoom/... or anything else on the default output
+      // device) is optional and additive: if it fails to start, or the
+      // toggle is off, recording proceeds mic-only exactly as before -- the
+      // mixer is simply never engaged.
+      const { appAudioSettings } = get();
       const mixer = new AudioMixer();
       appAudioActive = false;
       let appAudioNotice: string | null = null;
-      if (appAudioTargetPid != null) {
+      if (appAudioSettings.enabled) {
         try {
           await appAudioClient.startCapture(
-            appAudioTargetPid,
             // Gated by the same pause flag as the mic. The Rust side is
             // wall-clock driven (see `capture_loop` in appaudio.rs) and keeps
             // emitting chunks -- silence-padded when the app is quiet -- for
@@ -841,10 +824,10 @@ export const useAppStore = create<AppState>((set, get) => ({
               if (!recordingPaused) mixer.pushAppAudio(frame);
             },
             (message) => {
-              // Fires if capture dies mid-recording (most commonly: the
-              // target app closed). Recording keeps going mic-only; the
-              // mixer just stops receiving app-audio frames and pads with
-              // silence for the rest of the take (see AudioMixer's own doc).
+              // Fires if capture dies mid-recording. Recording keeps going
+              // mic-only; the mixer just stops receiving app-audio frames and
+              // pads with silence for the rest of the take (see AudioMixer's
+              // own doc).
               useAppStore.setState({
                 refineNotice: `アプリ音声の取得が中断されたため、以降はマイクのみで録音しています: ${message}`,
               });
@@ -880,7 +863,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // settings dropdown stops showing "マイク N" placeholders.
       void get().refreshAudioInputDevices();
       const notices = [
-        captureStarted ? null : "録音を保存できないため、停止後の精度向上パスは行われません。",
+        captureStarted ? null : "録音を保存できないため、停止後の後処理は行われません。",
         controller.usedFallbackDevice
           ? "選択したマイクが見つからないため、既定のマイクで録音しています。"
           : null,

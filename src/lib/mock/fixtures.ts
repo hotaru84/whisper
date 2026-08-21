@@ -22,7 +22,6 @@
  *   `ended` behave exactly as they do with a real recording. The only
  *   difference the user perceives is that nothing comes out of the speakers.
  */
-import type { AudioAppInfo } from "../audio/appAudio";
 import type { AudioEvent } from "../asr/client";
 import type { StoredRecording } from "../history";
 import type { TranscriptSegment } from "../transcript";
@@ -89,17 +88,6 @@ export function silentWavBytes(durationSec: number): Uint8Array<ArrayBuffer> {
 
   return bytes;
 }
-
-// --- App audio ----------------------------------------------------------
-
-/** Stand-ins for the WASAPI process-loopback list, so the target-app picker
- * (`RecordStartPanel`) has something to select and clear. No icons: those are
- * extracted from the real executables, and a fake data URI would only make
- * the mock harder to tell apart from the real thing. */
-export const MOCK_AUDIO_APPS: AudioAppInfo[] = [
-  { processId: 4242, name: "Microsoft Teams (モック)", icon: null },
-  { processId: 5150, name: "Zoom Meetings (モック)", icon: null },
-];
 
 // --- User-facing copy ---------------------------------------------------
 

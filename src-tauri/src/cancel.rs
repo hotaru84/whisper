@@ -1,5 +1,5 @@
 //! Cooperative cancellation for the post-stop analysis pipeline
-//! (`transcribe_recording` -> `diarize_recording` -> `detect_audio_events`).
+//! (`finalize_transcript` -> `diarize_recording` -> `detect_audio_events`).
 //!
 //! One `Arc<AtomicBool>` per job (keyed by recording id) in Tauri's managed
 //! state, which each of those commands polls wherever it happens to be able

@@ -24,7 +24,7 @@ export const runningInTauri = isTauri();
  *   refuses (no native file manager)
  * - `audio/playback.ts` -- a synthesized *silent* WAV, so the timeline,
  *   seeking and follow-along all work; nothing is audible
- * - `audio/appAudio.ts` -- a fake WASAPI process list, capture is a no-op
+ * - `audio/appAudio.ts` -- endpoint-loopback capture is a no-op
  * - `export/autoSave.ts` -- the folder picker and the transcript auto-write
  *   both refuse (no native dialog / no filesystem access outside the
  *   sandbox); the settings panel's folder-picker button is disabled to match

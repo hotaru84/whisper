@@ -49,7 +49,6 @@ function useSidebarDrag(): (e: React.PointerEvent) => void {
 function App() {
   const initModel = useAppStore((s) => s.initModel);
   const refreshAudioInputDevices = useAppStore((s) => s.refreshAudioInputDevices);
-  const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
   const refreshRecordingHistory = useAppStore((s) => s.refreshRecordingHistory);
   const recoverInterruptedRecordings = useAppStore((s) => s.recoverInterruptedRecordings);
   const errorMessage = useAppStore((s) => s.errorMessage);
@@ -96,10 +95,6 @@ function App() {
     // Listable (with placeholder labels) even before microphone permission is
     // granted, so the settings dropdown isn't empty on a first visit.
     void refreshAudioInputDevices();
-    // Titlebar dropdown also refreshes itself on open (see TitleBarControls.tsx), but
-    // this fills it in for the case where the user never opens it before
-    // hitting record with a target already in mind.
-    void refreshAppAudioApps();
     void refreshRecordingHistory();
     // Startup is the only safe moment for this (a live take's WAV looks the
     // same on disk), and it refreshes the list itself when it finds anything.
@@ -111,13 +106,7 @@ function App() {
       __debugStreamTranscribe: debugStreamTranscribeUrl,
       __store: useAppStore,
     });
-  }, [
-    initModel,
-    refreshAudioInputDevices,
-    refreshAppAudioApps,
-    refreshRecordingHistory,
-    recoverInterruptedRecordings,
-  ]);
+  }, [initModel, refreshAudioInputDevices, refreshRecordingHistory, recoverInterruptedRecordings]);
 
   return (
     <TooltipProvider>

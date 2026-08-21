@@ -247,3 +247,25 @@ const autoSaveSettings = definePersistedSettings<AutoSaveSettings>(
 );
 export const loadAutoSaveSettings = autoSaveSettings.load;
 export const saveAutoSaveSettings = autoSaveSettings.save;
+
+/**
+ * Whether to include the default output device's audio (Teams/Zoom/etc, or
+ * anything else playing through it) alongside the microphone. Unlike the old
+ * per-process target picker this replaced, there is no PID to go stale
+ * between sessions, so a plain persisted preference is worth keeping.
+ */
+export interface AppAudioSettings {
+  enabled: boolean;
+}
+
+export const DEFAULT_APP_AUDIO_SETTINGS: AppAudioSettings = { enabled: false };
+
+const appAudioSettings = definePersistedSettings<AppAudioSettings>(
+  "app-audio-settings",
+  DEFAULT_APP_AUDIO_SETTINGS,
+  (parsed, d) => ({
+    enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : d.enabled,
+  }),
+);
+export const loadAppAudioSettings = appAudioSettings.load;
+export const saveAppAudioSettings = appAudioSettings.save;

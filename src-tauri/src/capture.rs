@@ -1,12 +1,13 @@
 //! Retains the whole recording on disk while it is being made.
 //!
-//! The live transcription pass only ever keeps ~one 15-second window in memory,
+//! The live transcription pass only ever keeps ~one 30-second window in memory,
 //! which is what makes it cheap but also what caps its accuracy: it can never
 //! look at a sentence that straddles a window boundary, and it has no context
-//! from a minute ago. Keeping the audio lets a second pass re-read the whole
-//! recording once the user stops (see `asr::transcribe_recording`), and speaker
-//! diarization needs it too -- deciding that the voice at 00:01 and the voice at
-//! 30:00 are the same person is not something a 15-second window can do.
+//! from a minute ago. Keeping the audio lets the post-stop finalize/repair pass
+//! re-read the whole recording once the user stops (see `asr::finalize_transcript`),
+//! and speaker diarization needs it too -- deciding that the voice at 00:01 and
+//! the voice at 30:00 are the same person is not something a 30-second window
+//! can do.
 //!
 //! Audio goes to a file rather than a `Vec`: an hour of 16 kHz f32 is ~230 MB,
 //! and meetings run longer than an hour. Streaming it out keeps memory flat.

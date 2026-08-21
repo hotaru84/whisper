@@ -297,6 +297,32 @@ async function finalizeAndEnrich(
 }
 
 /**
+ * Auto-saves a transcript to the configured folder, best-effort: a failure
+ * here loses only this take's auto-saved copy, not anything already on
+ * screen or already filed in history, so it is logged rather than surfaced
+ * as a notice. Shared by `persistTake` (a fresh take finishing) and
+ * `runPostHocAnalysis` (record-only's deferred "解析" and history's
+ * "再解析" completing) -- the two places a fully-transcribed entry's
+ * segments are ready to export, including any speaker labels diarization
+ * attached. Skipped for anything not actually transcribed yet (record-only's
+ * initial empty save) or with nothing to write.
+ */
+async function autoSaveIfConfigured(
+  recordingId: string,
+  transcribed: boolean,
+  segments: TranscriptSegment[],
+): Promise<void> {
+  if (!transcribed || segments.length === 0) return;
+  const { autoSaveSettings } = useAppStore.getState();
+  if (!autoSaveSettings.directory) return;
+  try {
+    await autoSaveTranscript(segments, recordingId, autoSaveSettings.directory);
+  } catch (err) {
+    console.warn(`[autosave] failed to write transcript for ${recordingId}:`, err);
+  }
+}
+
+/**
  * Files a take in history: the sidecar, then the list refresh the sidebar
  * reads, then `markRecordingViewed`. Shared by `refineRecording`'s completed
  * and cancelled paths, which differ only in what goes into the entry.
@@ -322,19 +348,7 @@ async function persistTake(
     await saveRecordingHistory(recordingId, entry);
     await useAppStore.getState().refreshRecordingHistory();
     markRecordingViewed(recordingId);
-    // Best-effort, same as the history write above: a failure here loses
-    // only this take's auto-saved copy, not anything already on screen or
-    // already filed in history.
-    if (entry.transcribed && entry.segments.length > 0) {
-      const { autoSaveSettings } = useAppStore.getState();
-      if (autoSaveSettings.directory) {
-        try {
-          await autoSaveTranscript(entry.segments, recordingId, autoSaveSettings.directory);
-        } catch (err) {
-          console.warn(`[autosave] failed to write transcript for ${recordingId}:`, err);
-        }
-      }
-    }
+    await autoSaveIfConfigured(recordingId, entry.transcribed, entry.segments);
     return true;
   } catch (err) {
     useAppStore.setState({
@@ -479,7 +493,7 @@ export async function fileTakeProvisionally(
     recordingDurationSec = info.durationSec;
   } catch (err) {
     useAppStore.setState({
-      refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+      refineNotice: `録音ファイルの保存に失敗したため、停止後の後処理は省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
     return null;
   }
@@ -699,8 +713,10 @@ export async function refineRecording(
       transcribed: true,
       // Speaker labels only ever land on the finalized pass's own segments --
       // claiming them here when the live pass's segments are what actually
-      // got saved would describe data that isn't there.
-      usedDiarize: secondPassUsable && diarizeSettings.enabled,
+      // got saved would describe data that isn't there. Reflects whether
+      // diarization actually produced a result (see runPostHocAnalysis's
+      // matching fix), not just whether the setting was on.
+      usedDiarize: secondPassUsable && speakers !== undefined,
       usedAudioEvents: audioEventsUsable,
       // The live pass already transcribed the whole recording by the time
       // this runs -- see this module's own doc comment -- so this take is
@@ -717,12 +733,12 @@ export async function refineRecording(
     if (saved && !secondPassUsable && liveHasText) {
       useAppStore.setState({
         refineNotice:
-          "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離は未適用です）。設定を確認のうえ「再解析」をお試しください。",
+          "停止後の後処理の結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離は未適用です）。設定を確認のうえ「再解析」をお試しください。",
       });
     }
   } catch (err) {
     useAppStore.setState({
-      refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+      refineNotice: `停止後の後処理に失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
   } finally {
     // Best-effort hygiene: freeing this job's entry in the backend's cancel
@@ -877,6 +893,11 @@ export async function runPostHocAnalysis(
   const cancelledNotice = alreadyComplete
     ? "解析をキャンセルしました（既存の履歴はそのまま残っています）。"
     : "解析を一部完了した状態で中止しました。続きは「解析」で再開します。";
+  // Distinct from cancellation: the user did not ask to stop, but drain
+  // could not reach the end of the recording (see PostHocOutcome's "stalled"
+  // status). Same resumability as a cancel, different message so the user
+  // isn't told they cancelled something they didn't.
+  const stalledNotice = "解析が完了する前に中断しました。続きは「解析」で再開します。";
 
   await asrClient.beginAnalysis(id);
   try {
@@ -899,8 +920,10 @@ export async function runPostHocAnalysis(
     // cancellation could report "kept" before it truly is.
     await persistChain;
 
-    if (outcome.cancelled) {
-      useAppStore.setState({ refineNotice: cancelledNotice });
+    if (outcome.status !== "complete") {
+      useAppStore.setState({
+        refineNotice: outcome.status === "cancelled" ? cancelledNotice : stalledNotice,
+      });
       if (!alreadyComplete) {
         await useAppStore.getState().refreshRecordingHistory();
         if (useAppStore.getState().viewedRecordingId === id) {
@@ -955,13 +978,26 @@ export async function runPostHocAnalysis(
       durationSec,
       language: settings.language,
       transcribed: true,
-      usedDiarize: diarizeSettings.enabled,
-      usedAudioEvents: audioEventSettings.enabled,
+      // Reflects whether diarization/audio-tagging actually produced a
+      // result, not just whether the setting was on -- a failed or skipped
+      // pass (missing model files, targets.length === 0, a thrown error
+      // finalizeAndEnrich caught) must not claim credit it didn't earn, since
+      // the history sidebar's speaker-diarization badge reads this field
+      // directly (see HistorySidebar.tsx).
+      usedDiarize: speakers !== undefined,
+      usedAudioEvents: excluded !== undefined,
       analyzedThroughSec: durationSec,
       segments: localSegments,
       audioEvents: newEvents,
     });
     await useAppStore.getState().refreshRecordingHistory();
+    // Unlike a fresh take (persistTake), this path never went through
+    // saveRecordingHistory before with `transcribed: false` -- record-only's
+    // initial save already skipped auto-saving empty content (see
+    // finishRecordOnly), so this is the first point an export makes sense,
+    // and the only point for a history "再解析" that overwrites an existing
+    // transcript (including its speaker labels) with a fresh one.
+    await autoSaveIfConfigured(id, true, localSegments);
 
     // Refresh what's on screen too, if this is the recording currently
     // shown. Unlike before recording/analysis ran in parallel, `再解析`

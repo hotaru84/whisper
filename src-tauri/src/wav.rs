@@ -129,7 +129,8 @@ pub fn read(path: &Path) -> Result<Vec<f32>, String> {
 
 /// How many samples (~1 minute of 16kHz mono) go into one streamed chunk of
 /// [`read_wav_pcm`]. Bounds any single IPC payload without adding meaningful
-/// round-trip overhead over an hour-long recording (~60 chunks).
+/// round-trip overhead over an hour-long recording (~60 chunks), and doubles
+/// as the read size passed to [`read_range`] per iteration.
 const STREAM_CHUNK_SAMPLES: usize = SAMPLE_RATE as usize * 60;
 
 fn f32_to_le_bytes(samples: &[f32]) -> Vec<u8> {
@@ -140,16 +141,83 @@ fn f32_to_le_bytes(samples: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// Reads up to `max_samples` samples starting at `from_sec`, straight off
+/// disk, without materializing anything before `from_sec` or decoding the
+/// whole file the way [`read`] does.
+///
+/// Unlike `read`, this assumes the canonical format [`Writer`] itself always
+/// produces (PCM, mono, 16-bit, `SAMPLE_RATE`, 44-byte header) rather than
+/// walking a general chunk list -- acceptable because its only caller,
+/// [`read_wav_pcm`], only ever points it at this app's own recordings. Follows
+/// [`duration_sec`]'s header-only-read-plus-on-disk-clamp pattern, extended to
+/// also seek and decode the requested sample range.
+///
+/// `from_sec` at or past the end of the file returns an empty (not an error)
+/// result. A file truncated mid-write (crash, power cut) is clamped to
+/// whatever is actually on disk, same as `duration_sec`.
+pub fn read_range(path: &Path, from_sec: f32, max_samples: usize) -> Result<Vec<f32>, String> {
+    let mut file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut header = [0u8; HEADER_LEN as usize];
+    file.read_exact(&mut header).map_err(|e| format!("{}: {e}", path.display()))?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" || &header[12..16] != b"fmt " {
+        return Err(format!("{}: not a canonical RIFF/WAVE header", path.display()));
+    }
+
+    let u16_at = |o: usize| u16::from_le_bytes([header[o], header[o + 1]]) as u32;
+    let u32_at = |o: usize| {
+        u32::from_le_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]])
+    };
+
+    let fmt = u16_at(20);
+    let channels = u16_at(22);
+    let rate = u32_at(24);
+    let bits = u16_at(34);
+    if fmt != 1 || channels != 1 || bits != 16 || rate != SAMPLE_RATE {
+        return Err(format!(
+            "{}: not the canonical PCM/mono/16-bit/{SAMPLE_RATE}Hz format this app writes",
+            path.display()
+        ));
+    }
+
+    let on_disk_bytes = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len()
+        .saturating_sub(HEADER_LEN);
+    let declared_bytes = u32_at(DATA_SIZE_OFFSET as usize) as u64;
+    let total_samples = declared_bytes.min(on_disk_bytes) / 2;
+
+    let from_sample = ((from_sec.max(0.0)) * SAMPLE_RATE as f32) as u64;
+    if from_sample >= total_samples {
+        return Ok(Vec::new());
+    }
+    let want = (max_samples as u64).min(total_samples - from_sample);
+
+    file.seek(SeekFrom::Start(HEADER_LEN + from_sample * 2))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = vec![0u8; (want * 2) as usize];
+    let mut got = 0usize;
+    loop {
+        match file.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Ok(buf[..got - (got % 2)]
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+        .collect())
+}
+
 /// Streams a WAV's samples to the frontend in bounded chunks, for the
 /// post-hoc transcription driver (`transcribeWavPostHoc` on the frontend) to
 /// feed through the same windowed decoding the live streaming pass uses.
 ///
-/// Goes through [`read`] rather than a browser-side WAV/PCM decoder so this
-/// stays on the one code path this module's own doc comment requires --
-/// `read`'s salvage logic for a data chunk truncated mid-crash has no
-/// guaranteed equivalent in a generic decoder, and this app has already had
-/// to fix a real accuracy bug caused by exactly this kind of drift (see
-/// `571439d` in the project history).
+/// Reads via [`read_range`] one chunk at a time rather than [`read`] plus a
+/// slice, so a resumed job (`from_sec` well into a long recording) never
+/// decodes -- or holds in memory -- audio before its resume point, and at
+/// most one chunk's worth of decoded samples is ever resident at once.
 ///
 /// `from_sec` skips already-analyzed audio server-side, so resuming a
 /// previously-cancelled pass on a long recording does not re-cross the IPC
@@ -166,14 +234,17 @@ pub async fn read_wav_pcm(
 ) -> Result<(), String> {
     let cancel = crate::cancel::flag(&app, &job_id);
     tauri::async_runtime::spawn_blocking(move || {
-        crate::cancel::check(&cancel)?;
-        let samples = read(Path::new(&path))?;
-        let from = (((from_sec.max(0.0)) * SAMPLE_RATE as f32) as usize).min(samples.len());
-        for chunk in samples[from..].chunks(STREAM_CHUNK_SAMPLES) {
+        let mut cursor_sec = from_sec.max(0.0);
+        loop {
             crate::cancel::check(&cancel)?;
+            let chunk = read_range(Path::new(&path), cursor_sec, STREAM_CHUNK_SAMPLES)?;
+            if chunk.is_empty() {
+                break;
+            }
             channel
-                .send(InvokeResponseBody::Raw(f32_to_le_bytes(chunk)))
+                .send(InvokeResponseBody::Raw(f32_to_le_bytes(&chunk)))
                 .map_err(|e| e.to_string())?;
+            cursor_sec += chunk.len() as f32 / SAMPLE_RATE as f32;
         }
         Ok(())
     })
@@ -501,6 +572,49 @@ mod tests {
         std::fs::write(&path, b"not a wav file, but long enough to fill a header buffer!!")
             .expect("write");
         assert!(duration_sec(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_range_reads_the_requested_slice_from_the_middle_of_a_file() {
+        let path = temp_path("range-middle");
+        let mut w = Writer::create(&path).expect("create");
+        w.append(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).expect("append");
+        w.finish().expect("finish");
+
+        let got = read_range(&path, 2.0 / SAMPLE_RATE as f32, 3).expect("read_range");
+        assert_eq!(got.len(), 3);
+        for (got, want) in got.iter().zip([0.3, 0.4, 0.5]) {
+            assert!((got - want).abs() < QUANT_TOLERANCE, "{got} vs {want}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_range_from_sec_past_the_end_returns_empty() {
+        let path = temp_path("range-past-end");
+        let mut w = Writer::create(&path).expect("create");
+        w.append(&[0.1, 0.2]).expect("append");
+        w.finish().expect("finish");
+
+        let got = read_range(&path, 10.0, 100).expect("read_range");
+        assert!(got.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_range_on_a_crash_truncated_file_returns_only_what_is_on_disk() {
+        let path = temp_path("range-truncated");
+        let mut w = Writer::create(&path).expect("create");
+        w.append(&[0.1, 0.2, 0.3, 0.4]).expect("append");
+        w.finish().expect("finish");
+
+        let mut bytes = std::fs::read(&path).expect("read raw");
+        bytes.truncate(bytes.len() - 4); // lose the last two samples, header still claims 4
+        std::fs::write(&path, &bytes).expect("rewrite");
+
+        let got = read_range(&path, 0.0, 100).expect("read_range");
+        assert_eq!(got.len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 }

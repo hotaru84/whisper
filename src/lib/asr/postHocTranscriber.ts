@@ -24,13 +24,17 @@ import { StreamingTranscriber } from "./streaming";
 import type { TranscriptSegment } from "../transcript";
 
 export interface PostHocOutcome {
-  /** Whether this run stopped early because the caller's `wasCancelled`
-   * check (or `readWavPcm` itself) reported a cancellation. `false` means
-   * every window from `fromSec` to the end of the recording was decoded. */
-  cancelled: boolean;
+  /** "complete": every window from `fromSec` to `totalSec` was committed or
+   * explicitly dropped after retries -- `analyzedThroughSec` equals
+   * `totalSec`. "cancelled": the caller's `wasCancelled` check (or
+   * `readWavPcm` itself) reported an explicit cancellation. "stalled":
+   * draining stopped before the end for some other reason (not expected in
+   * practice -- `StreamingTranscriber.drain` retries transient failures
+   * itself now -- but must never be mistaken for "complete"). */
+  status: "complete" | "cancelled" | "stalled";
   /** New resume cursor, in absolute recording-seconds -- pass this back as
-   * the next call's `fromSec` if `cancelled` is `true`. Equals the
-   * recording's own `totalSec` when `cancelled` is `false`. */
+   * the next call's `fromSec` unless `status` is `"complete"`. Equals the
+   * recording's own `totalSec` only when `status` is `"complete"`. */
   analyzedThroughSec: number;
   /** Freshly committed segments, numbered starting at
    * `existingSegments.length + 1`. Does not include `existingSegments`
@@ -113,10 +117,15 @@ export async function transcribeWavPostHoc(
   // Always flush: if cancellation was noticed, shouldStop makes this a
   // near no-op (nothing further gets decoded) rather than force-draining
   // whatever PCM arrived before the cancel was seen.
-  await streamer.finish();
+  const { exhausted } = await streamer.finish();
 
-  const cancelled = wasCancelled?.() ?? false;
-  if (!cancelled) analyzedThroughSec = totalSec;
+  // analyzedThroughSec only ever jumps to totalSec when drain genuinely
+  // reached the end (exhausted) -- otherwise the resume cursor stays at
+  // wherever the last committed window actually left it, whether that was
+  // an explicit cancel or (defensively) something drain could not resolve.
+  const cancelled = !exhausted && (wasCancelled?.() ?? false);
+  if (exhausted) analyzedThroughSec = totalSec;
+  const status: PostHocOutcome["status"] = exhausted ? "complete" : cancelled ? "cancelled" : "stalled";
 
-  return { cancelled, analyzedThroughSec, newSegments };
+  return { status, analyzedThroughSec, newSegments };
 }

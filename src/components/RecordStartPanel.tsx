@@ -14,8 +14,6 @@ import {
   type RecordingModeChoice,
 } from "../store/appStore";
 
-const NO_APP_TARGET = "__none__";
-
 /** Trigger icon, button label, and menu description for each of the three
  * `RecordingModeChoice` values, in the order they're offered -- one place so
  * `RecordingModePicker`'s trigger and menu can't drift out of sync with each
@@ -43,7 +41,7 @@ const RECORDING_MODE_OPTIONS: {
     value: "analyze",
     icon: Captions,
     label: "録音と解析",
-    description: "録音しながら文字起こしし、停止後に精度向上パスを実行します。",
+    description: "録音しながら文字起こしし、停止後に話者分離や音響イベント検出などの後処理を実行します。",
   },
 ];
 
@@ -112,86 +110,36 @@ function MicPicker() {
   );
 }
 
-/** Icon-only app-audio target picker. Selected state is drawn two ways at
- * once: the trigger swaps to the target app's own icon (falling back to
- * `Cast` when none is picked), and the button face turns `secondary` -- the
- * tooltip carries the name neither of those can. Opening the menu refreshes
- * the list itself, so there is no separate refresh control to remember.
- * Same relocation note as `MicPicker` above -- no `locked` guard needed here
- * either. */
-function TargetAppPicker() {
-  const appAudioApps = useAppStore((s) => s.appAudioApps);
-  const appAudioTargetPid = useAppStore((s) => s.appAudioTargetPid);
-  const setAppAudioTarget = useAppStore((s) => s.setAppAudioTarget);
-  const refreshAppAudioApps = useAppStore((s) => s.refreshAppAudioApps);
+/** Plain on/off toggle for capturing the default output device's audio
+ * (Teams/Zoom/etc, or anything else playing through it) alongside the
+ * microphone. Used to be a per-process target picker, but capture switched
+ * to WASAPI endpoint loopback (see `appaudio.rs`'s doc comment) after
+ * process-scoped capture was confirmed to drop audio during real calls --
+ * there is no longer a process to choose, so this is a single labelled
+ * toggle rather than a dropdown. Labelled, not icon-only, for the same
+ * reason as `RecordingModePicker` below: its effect is an absence (nothing
+ * from the system audio) that no icon conveys on its own. Same relocation
+ * note as `MicPicker` above -- no `locked` guard needed here either. */
+function AppAudioToggle() {
+  const enabled = useAppStore((s) => s.appAudioSettings.enabled);
+  const setAppAudioEnabled = useAppStore((s) => s.setAppAudioEnabled);
 
-  const currentValue =
-    appAudioTargetPid != null ? String(appAudioTargetPid) : NO_APP_TARGET;
-  const currentApp = appAudioApps.find(
-    (a) => a.processId === appAudioTargetPid,
-  );
-  const label = currentApp
-    ? `対象アプリ: ${currentApp.name}`
-    : "対象アプリなし（マイクのみ）";
+  const label = enabled
+    ? "システム音声を含める: オン（相手の声も録音）"
+    : "システム音声を含める: オフ（マイクのみ）";
 
   return (
-    <DropdownMenu
-      onOpenChange={(open) => {
-        if (open) void refreshAppAudioApps();
-      }}
+    <Button
+      type="button"
+      variant={enabled ? "secondary" : "ghost"}
+      size="sm"
+      aria-pressed={enabled}
+      title={label}
+      onClick={() => setAppAudioEnabled(!enabled)}
     >
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant={appAudioTargetPid != null ? "secondary" : "ghost"}
-          size="sm"
-          aria-label={label}
-          title={label}
-        >
-          {currentApp?.icon ? (
-            <img
-              src={currentApp.icon}
-              alt=""
-              className="h-3.5 w-3.5 shrink-0"
-            />
-          ) : (
-            <Cast className="h-3.5 w-3.5" />
-          )}
-          {label}
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="start"
-        collisionPadding={8}
-        className="w-auto min-w-56 max-w-96"
-      >
-        <DropdownMenuRadioGroup
-          value={currentValue}
-          onValueChange={(v) =>
-            setAppAudioTarget(v === NO_APP_TARGET ? null : Number(v))
-          }
-        >
-          <DropdownMenuRadioItem value={NO_APP_TARGET}>
-            対象アプリなし（マイクのみ）
-          </DropdownMenuRadioItem>
-          {appAudioApps.map((a) => (
-            <DropdownMenuRadioItem
-              key={a.processId}
-              value={String(a.processId)}
-            >
-              <span className="flex items-center gap-1.5 whitespace-normal break-words">
-                {a.icon ? (
-                  <img src={a.icon} alt="" className="h-4 w-4 shrink-0" />
-                ) : (
-                  <Cast className="h-4 w-4 shrink-0 text-muted-foreground" />
-                )}
-                {a.name}
-              </span>
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
+      <Cast className="h-3.5 w-3.5" />
+      {enabled ? "システム音声を含める" : "システム音声を含めない"}
+    </Button>
   );
 }
 
@@ -291,7 +239,7 @@ export function RecordStartPanel() {
       </p>
       <div className="flex flex-col gap-2">
         <MicPicker />
-        <TargetAppPicker />
+        <AppAudioToggle />
         <RecordingModePicker />
       </div>
     </div>

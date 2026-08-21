@@ -115,12 +115,21 @@ export class StreamingTranscriber {
     void this.maybeProcess();
   }
 
-  /** Flush all remaining audio into final segments. Await after stopping the recorder. */
-  async finish(): Promise<void> {
+  /**
+   * Flush all remaining audio into final segments. Await after stopping the
+   * recorder.
+   *
+   * Returns whether draining actually reached the end (`exhausted: true`) or
+   * was cut short by `shouldStop`/an unrecoverable non-progress case
+   * (`exhausted: false`) -- callers that treat "finished flushing" as "fully
+   * analyzed" (`postHocTranscriber.ts`) must check this rather than assuming
+   * every call reaches the end.
+   */
+  async finish(): Promise<{ exhausted: boolean }> {
     while (this.processing) await delay(50);
     this.processing = true;
     try {
-      await this.drain(true);
+      return { exhausted: await this.drain(true) };
     } finally {
       this.processing = false;
     }
@@ -138,35 +147,59 @@ export class StreamingTranscriber {
     }
   }
 
-  /** Process windows until drained (final) or below the window size (streaming). */
-  private async drain(final: boolean): Promise<void> {
-    while (
-      !(this.options.shouldStop?.() ?? false) &&
-      (final ? this.pendingSamples > 0 : this.pendingSamples >= WINDOW_SEC * SR)
-    ) {
+  /**
+   * Process windows until drained (final) or below the window size
+   * (streaming). Returns whether the loop reached its natural end.
+   *
+   * A transient per-window failure normally relies on a *future* `pushFrame`
+   * call to retry (see `processWindow`) -- true for the live mic path, but
+   * `final` drains (`finish()`) never get another `pushFrame`: all audio was
+   * already pushed before `finish()` was called (see `postHocTranscriber.ts`).
+   * So for `final` drains, a failure that left the retry budget
+   * (`MAX_WINDOW_FAILURES`) unexhausted is retried right here, synchronously,
+   * honoring the same backoff `maybeProcess` would have waited out.
+   */
+  private async drain(final: boolean): Promise<boolean> {
+    while (true) {
+      if (this.options.shouldStop?.() ?? false) return false;
+      if (final ? this.pendingSamples === 0 : this.pendingSamples < WINDOW_SEC * SR) return true;
       const before = this.pendingSamples;
       await this.processWindow(final);
-      // Guard against any no-progress path: stop rather than re-transcribe the
-      // same audio forever (the next pushFrame will retry once more audio lands).
-      if (this.pendingSamples >= before) break;
+      if (this.pendingSamples >= before) {
+        if (final && this.failures > 0) {
+          await delay(this.options.retryBackoffMs ?? RETRY_BACKOFF_MS);
+          continue;
+        }
+        // Not a retriable failure and no progress was made: nothing further
+        // this loop can do (mirrors the old guard against spinning forever).
+        return false;
+      }
     }
   }
 
-  private concatPending(): Float32Array {
-    const out = new Float32Array(this.pendingSamples);
+  private concatPending(maxSamples: number): Float32Array {
+    const n = Math.min(maxSamples, this.pendingSamples);
+    const out = new Float32Array(n);
     let offset = 0;
     for (const frame of this.frames) {
-      out.set(frame, offset);
-      offset += frame.length;
+      if (offset >= n) break;
+      const take = Math.min(frame.length, n - offset);
+      out.set(frame.subarray(0, take), offset);
+      offset += take;
     }
     return out;
   }
 
   private async processWindow(final: boolean): Promise<void> {
-    const windowLen = this.pendingSamples;
+    // Capped at WINDOW_SEC: whisper's encoder context is a fixed 30s, and
+    // without this cap a backlog (post-hoc PCM can arrive faster than
+    // decoding keeps up) would hand whisper more audio than it can use, and
+    // would block `shouldStop` from being checked until an arbitrarily large
+    // window finishes decoding.
+    const windowLen = Math.min(this.pendingSamples, WINDOW_SEC * SR);
     if (windowLen === 0) return;
 
-    const audio = this.concatPending();
+    const audio = this.concatPending(windowLen);
     const windowSec = windowLen / SR;
 
     // Never hand whisper a window with no speech in it. Doing so is the main way

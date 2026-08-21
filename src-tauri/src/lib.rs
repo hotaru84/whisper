@@ -49,7 +49,6 @@ pub fn run() {
             diarize::diarize_recording,
             events::detect_audio_events,
             events::detect_events_window,
-            appaudio::list_audio_apps,
             appaudio::start_app_audio_capture,
             appaudio::stop_app_audio_capture,
             cancel::begin_analysis,

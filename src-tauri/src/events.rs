@@ -321,7 +321,7 @@ pub struct AudioEventResult {
 
 /// Detects audio events on a finished recording and classifies each of
 /// `chunks` for exclusion. `chunks` must be on the recording's own timeline,
-/// matching what `transcribe_recording` returns and *before* the frontend
+/// matching what `finalize_transcript` returns and *before* the frontend
 /// rebases them onto the session's global timeline -- see
 /// `diarize::diarize_recording`'s doc comment for the same concern.
 #[tauri::command]
