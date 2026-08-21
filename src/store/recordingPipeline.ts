@@ -479,7 +479,7 @@ export async function fileTakeProvisionally(
     recordingDurationSec = info.durationSec;
   } catch (err) {
     useAppStore.setState({
-      refineNotice: `録音ファイルの保存に失敗したため、精度向上パスは省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+      refineNotice: `録音ファイルの保存に失敗したため、解析は省略しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
     return null;
   }
@@ -717,12 +717,12 @@ export async function refineRecording(
     if (saved && !secondPassUsable && liveHasText) {
       useAppStore.setState({
         refineNotice:
-          "精度向上パスの結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離は未適用です）。設定を確認のうえ「再解析」をお試しください。",
+          "解析の結果が空だったため、ライブの文字起こしをそのまま履歴に保存しました（話者分離は未適用です）。設定を確認のうえ「再解析」をお試しください。",
       });
     }
   } catch (err) {
     useAppStore.setState({
-      refineNotice: `精度向上パスに失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
+      refineNotice: `解析に失敗しました（表示中の文字起こしはそのまま使えます）: ${toErrorMessage(err)}`,
     });
   } finally {
     // Best-effort hygiene: freeing this job's entry in the backend's cancel

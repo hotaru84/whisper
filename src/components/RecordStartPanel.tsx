@@ -43,7 +43,7 @@ const RECORDING_MODE_OPTIONS: {
     value: "analyze",
     icon: Captions,
     label: "録音と解析",
-    description: "録音しながら文字起こしし、停止後に精度向上パスを実行します。",
+    description: "録音しながら文字起こしし、停止後に仕上げの解析を行います。",
   },
 ];
 

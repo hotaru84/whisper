@@ -1,13 +1,18 @@
-import { useAppStore } from "../store/appStore";
+import { useAppStore, effectiveRecordOnly } from "../store/appStore";
 
 export function ModelLoadingOverlay() {
   const modelStatus = useAppStore((s) => s.modelStatus);
   const errorMessage = useAppStore((s) => s.errorMessage);
+  const recordOnly = useAppStore((s) => effectiveRecordOnly(s.recordingMode, s.powerSource));
 
   // "idle" is the model not being loaded on purpose -- record-only mode never
   // asks for it, and a session that starts there must not be greeted by a
   // blocking overlay for a load that is never going to happen.
   if (modelStatus === "ready" || modelStatus === "idle") return null;
+  // A record-only take never needs the model either -- a load triggered by a
+  // background 解析/reanalyze job (or a mode-switch warm-up) must not swallow
+  // clicks on a fresh record-only recording while it runs.
+  if (recordOnly) return null;
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-background/90 backdrop-blur-sm">
