@@ -48,7 +48,7 @@ export interface RecordingHistoryMeta {
    * `refineRecording`). Anywhere strictly between `0` and `durationSec` means
    * a post-hoc analysis pass was cancelled partway through and can be
    * resumed from here (`runPostHocAnalysis`); `>= durationSec` means fully
-   * analyzed, so a later "再解析" restarts from `0` rather than resuming.
+   * analyzed -- see `analysisAction` below for what that means for the UI.
    */
   analyzedThroughSec: number;
   /** First ~80 characters of the transcript, for the sidebar row. */
@@ -58,6 +58,33 @@ export interface RecordingHistoryMeta {
 export interface RecordingHistoryEntry extends RecordingHistoryMeta {
   segments: TranscriptSegment[];
   audioEvents: AudioEvent[];
+}
+
+/**
+ * How close `analyzedThroughSec` must sit to `durationSec` to count as
+ * "fully analyzed". Without this, a take whose last incrementally-persisted
+ * cursor landed a fraction of a second short of the true duration (rounding,
+ * a trailing silent frame) would read as "partial" and offer a pointless
+ * sub-second resume.
+ */
+const RESUME_EPSILON_SEC = 1;
+
+/**
+ * What the analyze quick-action button should offer for this recording, or
+ * `null` once analysis has fully completed -- there is deliberately no way
+ * to re-run a finished analysis (whether it finished live via
+ * `refineRecording`, whose `analyzedThroughSec` always lands exactly on
+ * `durationSec`, or post-hoc via `runPostHocAnalysis`): analysis is a
+ * one-shot pass here, not a redo-on-demand.
+ *
+ * `"resume"` picks up a post-hoc pass that was cancelled partway through
+ * (`analyzedThroughSec` strictly between `0` and `durationSec`); `"start"`
+ * covers everything never analyzed at all, record-only takes included.
+ */
+export function analysisAction(meta: RecordingHistoryMeta): "start" | "resume" | null {
+  if (meta.analyzedThroughSec <= 0) return "start";
+  if (meta.analyzedThroughSec < meta.durationSec - RESUME_EPSILON_SEC) return "resume";
+  return null;
 }
 
 /** On-disk JSON shape. Kept separate from `RecordingHistoryEntry` because

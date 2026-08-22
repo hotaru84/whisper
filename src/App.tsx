@@ -63,9 +63,17 @@ function App() {
   // The Active screen (record transport, no sidebar) replaces the whole Home
   // layout for as long as a take is open -- including the async setup window
   // before `recordingPhase` itself has flipped away from "stopped" (see
-  // `startingRecording`'s own doc comment in appStore.ts). This is the one
+  // `startingRecording`'s own doc comment in appStore.ts) *and* the closeout
+  // window right after stop, before `recordingCloseOutPhase` has flipped back
+  // to `null` (see its own doc comment in appStore.ts). Without the latter,
+  // `recordingPhase` alone flips to "stopped" synchronously the instant stop
+  // is pressed -- well before the WAV is actually closed and the take filed
+  // -- so this screen (and everything gated on it: the sidebar, the titlebar's
+  // "戻る" button) would swap back to Home while the take is still being wound
+  // down, making the record button look inexplicably stuck and "戻る" look
+  // unresponsive (nothing is selected yet for it to leave). This is the one
   // discriminant every top-level branch below keys off.
-  const isActive = recordingPhase !== "stopped" || startingRecording;
+  const isActive = recordingPhase !== "stopped" || startingRecording || recordingCloseOutPhase !== null;
   // Home only: nothing recorded and nothing selected, so the record-start CTA
   // owns the whole panel instead of sitting above an empty transcript box.
   // Note this is *not* the same as "no recording currently viewed"
@@ -73,13 +81,10 @@ function App() {
   // just-finished take once its post-stop pipeline resolves (see
   // `markRecordingViewed`), so checking it here instead would flash the CTA
   // back in for the gap while `segments`/`playback.recordingId` are already
-  // populated but the entry isn't "viewed" yet. `recordingCloseOutPhase`
-  // (not background analysis, which runs independently -- see its own doc
-  // comment in appStore.ts) covers the same brief closeout gap for a
-  // record-only take that ends up with nothing transcribed and no playback
-  // loaded yet.
-  const showRecordStart =
-    !isActive && recordingCloseOutPhase === null && segmentCount === 0 && playbackRecordingId == null;
+  // populated but the entry isn't "viewed" yet. `recordingCloseOutPhase` is
+  // folded into `isActive` above now, so `!isActive` already guarantees it's
+  // `null` here.
+  const showRecordStart = !isActive && segmentCount === 0 && playbackRecordingId == null;
 
   useEffect(() => {
     // Skipped entirely in (effective) record-only mode -- loading the model is
